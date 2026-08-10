@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Docusign Rooms Bulk Downloader",
+  "version": "2.0.0",
+  "description": "Bulk downloads Docusign Rooms documents, saves each room in its own folder, supports pause/resume/stop, and creates a download report.",
+  "permissions": [
+    "downloads",
+    "tabs",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://rooms.docusign.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://rooms.docusign.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Docusign Rooms Bulk Downloader"
+  }
+}
