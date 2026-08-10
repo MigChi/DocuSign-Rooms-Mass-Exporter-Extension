@@ -10,8 +10,8 @@
  * this file cares what page you're processing, only the list page.
  **************************************************************/
 
-const SCAN_DATE_START = new Date("2020-01-01");
-const SCAN_DATE_END = new Date("2021-01-01");
+const SCAN_DATE_START = new Date("2020-02-01");
+const SCAN_DATE_END = new Date("2020-04-30");
 
 /**
  * Confirmed (via DevTools computed-style check, 2026-08) that this page
@@ -34,6 +34,46 @@ function getScrollContainer() {
  */
 function getSortLabel() {
   return document.querySelector('[data-qa="filter-sort-drop-down-button"] span[title]')?.getAttribute("title") || null;
+}
+
+/**
+ * The Rooms page has two view modes toggled by button[data-qa="grid"] /
+ * button[data-qa="list"] (data-selected="true" on whichever is active).
+ * getRoomCardsAndLinks() only knows how to read the List View markup
+ * (tr[data-qa="room-list-row"]) - Grid View uses a completely different
+ * card layout (div[data-qa="room-card"]) with none of those rows, which
+ * is why a scan run in Grid View silently found 0 rooms. Rather than
+ * maintain two parallel sets of selectors, force List View before every
+ * scan.
+ */
+function ensureListView() {
+  const listButton = document.querySelector('button[data-qa="list"]');
+  if (!listButton || listButton.getAttribute("data-selected") === "true") return;
+  listButton.click();
+}
+
+/**
+ * The sort control isn't a native <select> - it's a button that opens a
+ * portal-rendered div[role="listbox"] of button[data-qa="option-<label>"]
+ * options (confirmed via the opened-menu markup, 2026-08). Setting the
+ * value takes a click to open it, then a click on the matching option.
+ * Polls briefly for the option to appear since the popover renders after
+ * the click, not synchronously with it.
+ */
+async function ensureOldestSort() {
+  if (getSortLabel() === "Created (Oldest)") return;
+
+  const trigger = document.querySelector('[data-qa="filter-sort-drop-down-button"]');
+  if (!trigger) return;
+  trigger.click();
+
+  let option = null;
+  for (let i = 0; i < 10 && !option; i++) {
+    await sleep(200);
+    option = document.querySelector('[data-qa="option-Created (Oldest)"]');
+  }
+  option?.click();
+  await sleep(300);
 }
 
 /**
@@ -81,9 +121,14 @@ function getRoomCardsAndLinks() {
 
 /**
  * Entry point for scanning - called from content.js's injectPanel() when
- * Start is clicked. Refuses to run (returns []) unless the list is
- * confirmed sorted "Created (Oldest)" via getSortLabel() - see that
- * function for why this can't be assumed. Otherwise repeatedly scrolls
+ * Start is clicked. Forces List View via ensureListView() first (Grid
+ * View has no readable rows for getRoomCardsAndLinks()), then attempts to
+ * set the sort to "Created (Oldest)" via ensureOldestSort(). Still
+ * refuses to run (returns []) if that didn't stick - checked via
+ * getSortLabel() - since the whole skip/collect/stop algorithm below
+ * depends on ascending order and a UI change could silently break the
+ * auto-select without breaking the safety check. Otherwise repeatedly
+ * scrolls
  * the container found by getScrollContainer() and re-runs
  * getRoomCardsAndLinks() until either: no new rooms appear for several
  * tries (noNewRoomAttempts), a hard scroll cap is hit (totalScrolls), or
@@ -93,6 +138,11 @@ function getRoomCardsAndLinks() {
  * [SCAN_DATE_START, SCAN_DATE_END].
  */
 async function autoScrollAndCollectRooms(updateStatus) {
+    ensureListView();
+    await sleep(500);
+
+    await ensureOldestSort();
+
     const sortLabel = getSortLabel();
 
     if (sortLabel !== "Created (Oldest)") {

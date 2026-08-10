@@ -143,10 +143,102 @@ Done so far:
     through the status line instead of returning wrong results - unless
     it reads exactly "Created (Oldest)".
 
-**Before running a real scan:** manually set the Rooms list's sort
-dropdown to "Created (Oldest)" first. The extension will now refuse to
-scan and tell you why if you forget, rather than silently returning
-nothing.
+  - **Fixed a second scan bug found during real-account testing:** the
+    Rooms list has two view modes (Grid/gallery and List), toggled by
+    `button[data-qa="grid"]` / `button[data-qa="list"]`. All along,
+    `getRoomCardsAndLinks()` only knew how to read List View's markup
+    (`tr[data-qa="room-list-row"]`) - Grid View uses an entirely
+    different card layout with no matching rows, so scanning while in
+    Grid View silently returned 0 rooms. `content/scan.js` now calls
+    `ensureListView()` at the start of every scan, which clicks List
+    View if it isn't already active.
+  - Also added `ensureOldestSort()`, which automatically opens the sort
+    dropdown (a custom `role="listbox"` popover, not a native `<select>`)
+    and clicks "Created (Oldest)" if it isn't already selected, using
+    selectors confirmed against the opened dropdown's real markup. The
+    manual instruction below is now a fallback only - the existing
+    `getSortLabel()` guard still refuses to scan and reports why if the
+    auto-select doesn't stick for any reason.
+  - **Fixed the actual blocker on single-room downloads:** every live test
+    was failing with "Bulk download button was not found," which looked
+    like a selector problem but wasn't - `button[data-qa="Download"]
+    [data-dd-action-name="Bulk Action - Download"]` was already correct
+    and confirmed against captured markup. Console logging added to
+    `selectAllDocuments()` showed the real cause: calling
+    `checkbox.click()` on the Select All input left `checkbox.checked`
+    at `false` and left every per-document checkbox unchecked, so the
+    bulk-actions toolbar (which only renders once something is selected)
+    never appeared - `findBulkDownloadButton`/the wait for it wasn't
+    broken, it was correctly waiting for a button that could never show
+    up. Root cause: the page cancels the checkbox's default toggle on
+    click, most likely because `.click()` produces a synthetic
+    (`isTrusted: false`) event and the site's custom checkbox component
+    only applies the change for real user clicks. `selectAllDocuments()`
+    is now `async` and tries three interaction strategies in order -
+    the native checkbox `.click()`, clicking the associated
+    `<label data-qa="select-all-docs-label">`, and a manually dispatched
+    `MouseEvent` - verifying success after each attempt by checking
+    whether any `input[data-qa="document-checkbox"]` actually shows as
+    checked in the DOM, rather than assuming success just because a
+    checkbox element existed and `.click()` didn't throw. This was also
+    a bug in the original code independent of the click-trust issue: it
+    returned `true` unconditionally whenever it found the checkbox,
+    never confirming the click had any real effect.
+
+**Before running a real scan:** the extension now auto-switches to List
+View and auto-selects "Created (Oldest)" sort for you. It will still
+refuse to scan and tell you why if either one doesn't take effect for
+some reason, rather than silently returning nothing.
+
+- **Sped up per-room processing, confirmed faster in live testing:**
+  - `selectAllDocuments()` trimmed to try the confirmed-working strategy
+    first (`label.click()`) instead of always wasting ~400ms on the
+    native checkbox click that's confirmed to never work on this page,
+    saving that time on every single room.
+  - Replaced the three fixed sleeps in `background.js`'s `runQueue()`
+    with real signals/shorter buffers: the flat `sleep(3500)` before
+    processing a room dropped to `sleep(500)` (`processCurrentRoom()`
+    already polls for the page being ready itself, so this was pure
+    double-guessing on top of a real wait); the flat `sleep(4500)` after
+    processing replaced with `waitForDownloadStart()`, which polls
+    `STATE.downloads` - populated by the real
+    `chrome.downloads.onDeterminingFilename` event - instead of always
+    paying the full guessed delay; the `sleep(2000)` pacing gap between
+    rooms dropped to `sleep(500)`. Roughly 7-9 seconds of pure guessed
+    waiting removed per successful room. This is the "Real event-based
+    waits" item from the Planned list below, now done.
+- **Fixed Stop/Pause only being checked once per room instead of during
+  it:** `STATE.stopped`/`STATE.paused` were only checked at the very top
+  of the room loop - clicking Stop mid-room did nothing until that
+  room's *entire* pipeline finished (tab load + the content script's own
+  waits + the download-start wait, up to roughly a minute worst case),
+  which read as "the Stop button doesn't work." Added checks right after
+  the tab-load wait and right after a room's processing response comes
+  back, so Stop/Pause take effect within a room instead of only between
+  rooms. (Genuine remaining limit: while `processCurrentRoom()` is
+  actually running inside the room tab, `background.js` is blocked on
+  that one message call and can't interrupt it mid-flight - Stop still
+  waits for that single response, just not the rest of the pipeline
+  after it.)
+- **System check requested after the Stop/Pause fix turned up three more
+  bugs**, none of them visible without tracing the logic:
+  - The progress counter (`X / Y` in the panel) used the raw loop index,
+    which a `break` (from the new Stop checks) skips incrementing -
+    undercounting completed rooms by one specifically on an interrupted
+    run. Fixed by driving the display off `results.length` (ground
+    truth: rooms actually recorded) instead of the loop index.
+  - `STATE.downloads` was never reset between runs - Stop, then Start
+    again over a list containing an already-processed room, could make
+    `waitForDownloadStart()` match a stale entry from the *previous* run
+    and report a download as started when this run's hadn't begun yet.
+    Now reset in the `DS_START_QUEUE` handler alongside the other state.
+  - The completion desktop notification (`chrome.notifications.create`)
+    silently never fired: `"notifications"` was never declared in
+    `manifest.json`'s permissions, and the `icon.png` it referenced
+    didn't exist anywhere in the extension folder either. Removed rather
+    than added a placeholder icon - the panel's own "Done." status
+    message already covers this. Also removed the `"scripting"`
+    permission, which was declared but never used anywhere in the code.
 
 **Authorship note:** the scanning and date-range-filtering logic above
 was written and debugged by hand. The CSV export and manifest wiring
@@ -162,8 +254,6 @@ Planned (in progress):
   not just a manual pause/resume within one session.
 - Per-room status tracking through its full lifecycle (queued, in
   progress, done, failed, empty) shown live in the panel, per worker tab.
-- Real event-based waits (Chrome's download-started event, short polling
-  for UI state) replacing fixed delays, cutting dead time per room.
 - A suggested worker-tab count based on measured average time-per-room,
   within safe min/max bounds.
 

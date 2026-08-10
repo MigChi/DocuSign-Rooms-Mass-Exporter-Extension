@@ -155,6 +155,21 @@ async function createReport() {
   return filename;
 }
 
+// Real signal for "this room's download has started," instead of guessing
+// with a flat sleep - chrome.downloads.onDeterminingFilename (below)
+// populates STATE.downloads the moment Chrome registers a new download.
+async function waitForDownloadStart(roomId, timeoutMs = 15000) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    const started = Object.values(STATE.downloads).some(d => d.roomId === roomId);
+    if (started) return true;
+    await sleep(300);
+  }
+
+  return false;
+}
+
 async function waitIfPausedOrStopped() {
   while (STATE.paused && !STATE.stopped) {
     await broadcastStatus();
@@ -204,6 +219,14 @@ async function runQueue() {
       await chrome.tabs.update(worker.id, { url: documentsUrl, active: true });
       const loaded = await waitForTabLoaded(worker.id, 60000);
 
+      // Stop/Pause were previously only checked once per room, at the top
+      // of this loop - clicking Stop mid-room did nothing until that
+      // room's entire pipeline finished (up to ~75s: tab load + the
+      // content script's own internal waits + the download-start wait).
+      // Re-checking here (the single longest wait) makes Stop/Pause take
+      // effect right after the page load instead of only between rooms.
+      if (!(await waitIfPausedOrStopped())) break;
+
       if (!loaded) {
         result.reason = "Room Documents page did not finish loading";
         STATE.results.push(result);
@@ -211,7 +234,11 @@ async function runQueue() {
         continue;
       }
 
-      await sleep(3500);
+      // Only a short buffer, not a "wait for the page to be ready" delay -
+      // processCurrentRoom() already polls for [data-qa="group-name"] itself
+      // (up to 45s). This just covers the gap between document_idle firing
+      // and the content script's onMessage listener actually being attached.
+      await sleep(500);
 
       const response = await chrome.tabs.sendMessage(worker.id, {
         type: "DS_PROCESS_ROOM",
@@ -231,8 +258,16 @@ async function runQueue() {
 
       STATE.results.push(result);
 
-      await sleep(4500);
+      // Real signal instead of a flat guess: wait for
+      // chrome.downloads.onDeterminingFilename to actually fire for this
+      // room (up to 15s) rather than always paying a fixed 4.5s.
+      if (response?.ok && !STATE.stopped) {
+        await waitForDownloadStart(roomId, 15000);
+      }
+
       await broadcastStatus();
+
+      if (STATE.stopped) break;
     } catch (error) {
       result.reason = error.message || "Unknown error";
       result.time = new Date().toISOString();
@@ -240,13 +275,13 @@ async function runQueue() {
       await broadcastStatus();
     }
 
-    await sleep(2000);
+    await sleep(500);
   }
 
   STATE.running = false;
   STATE.currentRoom = null;
 
-  const reportName = await createReport().catch(() => "");
+  await createReport().catch(() => "");
   await broadcastStatus();
 
   try {
@@ -255,13 +290,6 @@ async function runQueue() {
       await chrome.tabs.update(STATE.workerTabId, { active: true }).catch(() => {});
     }
   } catch (e) {}
-
-  chrome.notifications?.create?.({
-    type: "basic",
-    iconUrl: "icon.png",
-    title: "Docusign Rooms Bulk Downloader",
-    message: reportName ? `Done. Report saved: ${reportName}` : "Done. Check Downloads folder."
-  });
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -294,6 +322,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       STATE.paused = false;
       STATE.stopped = false;
       STATE.currentRoom = null;
+      // Without this, a stale entry from a previous run (e.g. Stop, then
+      // Start again over a list that includes an already-processed room)
+      // could make waitForDownloadStart() match against that old download
+      // and report "started" instantly for a room whose download in this
+      // run hasn't actually begun yet.
+      STATE.downloads = {};
 
       sendResponse({ ok: true, total: STATE.queue.length });
 

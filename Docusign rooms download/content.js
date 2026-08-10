@@ -30,7 +30,20 @@
     }
   }
 
-  function selectAllDocuments() {
+  function anyDocumentChecked() {
+    return document.querySelectorAll('input[data-qa="document-checkbox"]:checked').length > 0;
+  }
+
+  // Confirmed live (twice): clicking the native <input> directly is
+  // reverted by the page every time (checked stays false) - the label and
+  // input are siblings in the markup (not label-wraps-input), and the
+  // app's real click handler is bound to the <label>, not the input, so a
+  // click dispatched straight at the input never reaches it. label.click()
+  // is confirmed working and tried first; the manually dispatched
+  // MouseEvent on the checkbox remains as a fallback for any room where
+  // the label isn't found. Verifies against the actual document
+  // checkboxes instead of assuming success.
+  async function selectAllDocuments() {
     const checkbox = document.querySelector('input[data-qa="select-all-docs"]');
 
     if (!checkbox) {
@@ -39,16 +52,21 @@
     }
 
     checkbox.scrollIntoView({ block: "center" });
-    checkbox.click();
 
-    return true;
-  }
+    const label = document.querySelector('label[data-qa="select-all-docs-label"]');
+    label?.click();
+    await sleep(400);
+    if (anyDocumentChecked()) return true;
 
-  function findBulkDownloadButton() {
-    return (
-      document.querySelector('button[data-qa="Download"][data-dd-action-name="Bulk Action - Download"]') ||
-      document.querySelector('button[data-qa="Download"]')
-    );
+    checkbox.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      detail: 1
+    }));
+    await sleep(400);
+
+    return anyDocumentChecked();
   }
 
   async function waitForSelector(selector, timeoutMs = 45000) {
@@ -98,7 +116,8 @@
       };
     }
 
-    const selected = selectAllDocuments();
+    const selected = await selectAllDocuments();
+    console.log("[DSBD] selectAllDocuments() succeeded:", selected);
 
     if (!selected) {
       return {
@@ -109,9 +128,14 @@
       };
     }
 
-    await sleep(2500);
-
-    const downloadButton = findBulkDownloadButton();
+    // Confirmed via captured markup: the bulk-actions toolbar (with the
+    // Download button) only renders after the selection state updates -
+    // not synchronously with the Select All click - so this polls for it
+    // instead of guessing a fixed delay.
+    const downloadButton = await waitForSelector(
+      'button[data-qa="Download"][data-dd-action-name="Bulk Action - Download"]',
+      10000
+    );
 
     if (!downloadButton) {
       return {
@@ -333,7 +357,13 @@
       if (!message || message.type !== "DS_BULK_STATUS") return;
 
       const s = message.state;
-      const currentIndex = Math.min((s.index || 0) + (s.running ? 1 : 0), s.total || 0);
+      // Uses results.length (ground truth: rooms actually recorded so
+      // far), not the raw loop index - a Stop mid-room exits via `break`,
+      // which skips the for-loop's own increment, so the index alone
+      // undercounts by one in that case even though the room's result
+      // was already pushed.
+      const completed = s.results?.length || 0;
+      const currentIndex = Math.min(completed + (s.running ? 1 : 0), s.total || 0);
       progressEl.textContent = `${currentIndex} / ${s.total || 0}`;
 
       if (s.paused) {
@@ -350,7 +380,7 @@
     chrome.runtime.sendMessage({ type: "DS_GET_STATUS" }, response => {
       const s = response?.state;
       if (!s) return;
-      progressEl.textContent = `${s.index || 0} / ${s.total || 0}`;
+      progressEl.textContent = `${s.results?.length || 0} / ${s.total || 0}`;
       if (s.running && s.currentRoom) setStatus(`Running: ${s.currentRoom.roomName || s.currentRoom.roomId}`);
       else if (s.paused) setStatus("Paused.");
     });
