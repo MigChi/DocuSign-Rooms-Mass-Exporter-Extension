@@ -341,6 +341,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
+    if (message.type === "DS_EXPORT_SCAN_LIST") {
+      const rooms = Array.isArray(message.rooms) ? message.rooms : [];
+
+      const rows = [
+        ["Room #", "Room Name", "Room ID", "Documents URL", "Created Date"]
+      ];
+
+      rooms.forEach((r, idx) => {
+        rows.push([
+          idx + 1,
+          r.roomName || "",
+          r.roomId || "",
+          r.documentsUrl || "",
+          String(r.createdDate || "").slice(0, 10)
+        ]);
+      });
+
+      const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
+      const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+      const filename = `Docusign Rooms/_Scan Lists/Scan List ${nowStamp()}.csv`;
+
+      try {
+        await chrome.downloads.download({
+          url: dataUrl,
+          filename,
+          saveAs: false,
+          conflictAction: "uniquify"
+        });
+        sendResponse({ ok: true, filename, total: rooms.length });
+      } catch (error) {
+        sendResponse({ ok: false, reason: error.message || "CSV export failed" });
+      }
+      return;
+    }
+
     if (message.type === "DS_ROOM_PAGE_INFO") {
       const tabId = sender.tab?.id;
       if (tabId === STATE.workerTabId && STATE.currentRoom) {

@@ -10,170 +10,6 @@
 
   const PANEL_ID = "ds-bulk-downloader-panel";
 
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  function cleanName(name) {
-    return String(name || "Unnamed Room")
-      .replace(/[\\/:*?"<>|]/g, "-")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 120) || "Unnamed Room";
-  }
-
-  function normalizeText(text) {
-    return (text || "").replace(/\s+/g, " ").trim().toLowerCase();
-  }
-
-  function getRoomIdFromUrl(url = window.location.href) {
-    const match = String(url || "").match(/\/rooms\/(\d+)/i);
-    return match ? match[1] : "";
-  }
-
-  function roomUrlToDocumentsUrl(url) {
-    try {
-      const parsed = new URL(url, window.location.origin);
-      const match = parsed.pathname.match(/\/rooms\/(\d+)/i);
-      if (!match) return null;
-      return `${parsed.origin}/rooms/${match[1]}/documents`;
-    } catch (e) {
-      return null;
-    }
-  }
-
-  function getRoomNameFromPage() {
-    const selectors = [
-      "[data-qa*='room-name']",
-      "[data-qa*='room-title']",
-      "h1",
-      "[class*='room'][class*='title']",
-      "[class*='Room'][class*='Title']",
-      "[class*='title']"
-    ];
-
-    for (const selector of selectors) {
-      const el = document.querySelector(selector);
-      const text = el?.innerText?.trim();
-      if (
-        text &&
-        text.length > 1 &&
-        !normalizeText(text).includes("documents") &&
-        !normalizeText(text).includes("rooms")
-      ) {
-        return cleanName(text);
-      }
-    }
-
-    const title = document.title
-      ?.replace(/docusign/gi, "")
-      ?.replace(/rooms/gi, "")
-      ?.replace(/\|/g, "")
-      ?.trim();
-
-    if (title && title.length > 1) return cleanName(title);
-
-    const roomId = getRoomIdFromUrl();
-    return cleanName(`Docusign Room ${roomId}`);
-  }
-
-  function findBestScrollContainer() {
-    const candidates = [...document.querySelectorAll("div, main, section, body, html")];
-
-    let best = document.scrollingElement || document.documentElement;
-    let bestScrollableAmount = 0;
-
-    for (const el of candidates) {
-      const scrollableAmount = el.scrollHeight - el.clientHeight;
-      if (scrollableAmount > bestScrollableAmount) {
-        bestScrollableAmount = scrollableAmount;
-        best = el;
-      }
-    }
-
-    return best;
-  }
-
-  function getRoomCardsAndLinks() {
-    const allLinks = [...document.querySelectorAll("a[href]")];
-
-    const rooms = allLinks
-      .map(a => {
-        const documentsUrl = roomUrlToDocumentsUrl(a.href);
-        if (!documentsUrl) return null;
-
-        const row =
-          a.closest("[data-qa]") ||
-          a.closest("article") ||
-          a.closest("section") ||
-          a.closest("li") ||
-          a.closest("tr") ||
-          a.closest("div");
-
-        const rawText = (row?.innerText || a.innerText || "").trim();
-        const firstLine = rawText.split("\n").map(x => x.trim()).filter(Boolean)[0];
-        const roomId = getRoomIdFromUrl(documentsUrl);
-
-        return {
-          roomId,
-          roomName: cleanName(firstLine || `Docusign Room ${roomId}`),
-          documentsUrl
-        };
-      })
-      .filter(Boolean);
-
-    const unique = [];
-    const seen = new Set();
-
-    for (const room of rooms) {
-      if (!seen.has(room.documentsUrl)) {
-        seen.add(room.documentsUrl);
-        unique.push(room);
-      }
-    }
-
-    return unique;
-  }
-
-  async function autoScrollAndCollectRooms(updateStatus) {
-    const scrollContainer = findBestScrollContainer();
-
-    let lastCount = 0;
-    let noNewRoomAttempts = 0;
-    let totalScrolls = 0;
-
-    while (noNewRoomAttempts < 7 && totalScrolls < 400) {
-      const rooms = getRoomCardsAndLinks();
-      const currentCount = rooms.length;
-
-      updateStatus?.(`Loading rooms... found ${currentCount}`);
-
-      if (currentCount > lastCount) {
-        lastCount = currentCount;
-        noNewRoomAttempts = 0;
-      } else {
-        noNewRoomAttempts++;
-      }
-
-      try {
-        scrollContainer.scrollTo({
-          top: scrollContainer.scrollHeight,
-          behavior: "smooth"
-        });
-      } catch (e) {
-        window.scrollTo({
-          top: document.body.scrollHeight,
-          behavior: "smooth"
-        });
-      }
-
-      await sleep(1500);
-      totalScrolls++;
-    }
-
-    return getRoomCardsAndLinks();
-  }
-
   function clickElement(el, label) {
     if (!el) {
       console.warn(`Could not find: ${label}`);
@@ -195,38 +31,15 @@
   }
 
   function selectAllDocuments() {
-    const label = document.querySelector('[data-qa="select-all-docs-label-text"]');
+    const checkbox = document.querySelector('input[data-qa="select-all-docs"]');
 
-    if (!label) {
-      console.error("Select All label not found.");
+    if (!checkbox) {
+      console.error("Select All checkbox not found.");
       return false;
     }
 
-    const row =
-      label.closest("label") ||
-      label.closest("[class*='select']") ||
-      label.parentElement?.parentElement?.parentElement ||
-      label.parentElement?.parentElement ||
-      label.parentElement;
-
-    console.log("Likely Select All row:", row);
-
-    const clickable =
-      row?.querySelector("input[type='checkbox']") ||
-      row?.querySelector("[role='checkbox']") ||
-      row?.querySelector("[aria-checked]") ||
-      row?.querySelector("button") ||
-      row;
-
-    console.log("Clicking likely checkbox/control:", clickable);
-
-    if (!clickable) {
-      console.error("No clickable Select All control found.");
-      return false;
-    }
-
-    clickable.scrollIntoView({ block: "center" });
-    clickable.click();
+    checkbox.scrollIntoView({ block: "center" });
+    checkbox.click();
 
     return true;
   }
@@ -235,16 +48,6 @@
     return (
       document.querySelector('button[data-qa="Download"][data-dd-action-name="Bulk Action - Download"]') ||
       document.querySelector('button[data-qa="Download"]')
-    );
-  }
-
-  function findFinalDownloadButton() {
-    const buttons = [...document.querySelectorAll("button, [role='button'], a")]
-      .filter(el => el.offsetParent !== null);
-
-    return (
-      buttons.find(btn => normalizeText(btn.innerText) === "download") ||
-      buttons.find(btn => normalizeText(btn.innerText).includes("download"))
     );
   }
 
@@ -260,6 +63,12 @@
     return null;
   }
 
+  function getDocumentCount() {
+    const groupName = document.querySelector('[data-qa="group-name"]');
+    const match = groupName?.textContent.match(/\((\d+)\)/);
+    return match ? parseInt(match[1], 10) : null;
+  }
+
   async function processCurrentRoom(message) {
     const roomId = message.roomId || getRoomIdFromUrl();
     let roomName = getRoomNameFromPage();
@@ -271,9 +80,23 @@
       url: window.location.href
     }).catch(() => {});
 
-    await waitForSelector('[data-qa="select-all-docs-label-text"]', 45000);
+    // "group-name" is present whether the room is empty or not, unlike the
+    // Select All checkbox, which never renders at all for an empty room -
+    // waiting on it instead avoids a wasted 45s timeout on every empty room.
+    await waitForSelector('[data-qa="group-name"]', 45000);
 
     roomName = getRoomNameFromPage();
+
+    const documentCount = getDocumentCount();
+
+    if (documentCount === 0) {
+      return {
+        ok: false,
+        roomId,
+        roomName,
+        reason: "Room is empty (0 documents)"
+      };
+    }
 
     const selected = selectAllDocuments();
 
@@ -310,9 +133,7 @@
       };
     }
 
-    await sleep(3500);
-
-    const finalDownload = findFinalDownloadButton();
+    const finalDownload = await waitForSelector('#formDownloadDocuments button[type="submit"]', 10000);
 
     if (finalDownload) {
       clickElement(finalDownload, "Final Download button");
@@ -336,6 +157,7 @@
       <div class="dsbd-title">Docusign Bulk Downloader</div>
       <div class="dsbd-status" id="dsbd-status">Ready</div>
       <div class="dsbd-progress" id="dsbd-progress">0 / 0</div>
+      <button id="dsbd-scan-export" class="dsbd-secondary">Scan &amp; Export List (CSV)</button>
       <div class="dsbd-buttons">
         <button id="dsbd-start">Start</button>
         <button id="dsbd-pause">Pause</button>
@@ -381,6 +203,18 @@
         color: #ddd;
         margin-bottom: 10px;
       }
+      #${PANEL_ID} .dsbd-secondary {
+        display: block;
+        width: 100%;
+        border: none;
+        border-radius: 8px;
+        padding: 9px;
+        cursor: pointer;
+        font-weight: 700;
+        background: #333;
+        color: #fff;
+        margin-bottom: 7px;
+      }
       #${PANEL_ID} .dsbd-buttons {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -423,6 +257,29 @@
     const setStatus = text => {
       statusEl.textContent = text;
     };
+
+    panel.querySelector("#dsbd-scan-export").addEventListener("click", async () => {
+      setStatus("Auto-scrolling and collecting room links...");
+      const rooms = await autoScrollAndCollectRooms(setStatus);
+
+      if (!rooms.length) {
+        setStatus("No rooms found in the configured date range.");
+        return;
+      }
+
+      setStatus(`Found ${rooms.length} rooms in range. Exporting CSV...`);
+
+      chrome.runtime.sendMessage({
+        type: "DS_EXPORT_SCAN_LIST",
+        rooms
+      }, response => {
+        if (response?.ok) {
+          setStatus(`Exported ${rooms.length} rooms to: ${response.filename}`);
+        } else {
+          setStatus(response?.reason || "Could not export CSV.");
+        }
+      });
+    });
 
     panel.querySelector("#dsbd-start").addEventListener("click", async () => {
       setStatus("Auto-scrolling and collecting room links...");

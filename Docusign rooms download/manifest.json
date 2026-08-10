@@ -21,6 +21,9 @@
         "https://rooms.docusign.com/*"
       ],
       "js": [
+        "content/utils.js",
+        "content/scan.js",
+        "content/room.js",
         "content.js"
       ],
       "run_at": "document_idle"
