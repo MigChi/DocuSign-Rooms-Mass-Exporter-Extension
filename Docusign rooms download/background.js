@@ -1,8 +1,20 @@
 /**************************************************************
- * Docusign Rooms Bulk Downloader - background.js
+ * Docusign Rooms Mass Exporter - background.js
  * Handles queue, worker tab, pause/resume/stop, filename routing,
  * and the final CSV report.
+ *
+ * Service workers and content scripts run in separate JS contexts -
+ * background.js can't reference content/utils.js's globals the way
+ * scan.js/room.js/content.js do just by manifest load order, so it
+ * loads the same file directly via importScripts(). utils.js is plain
+ * global function declarations (no export/import), so it works
+ * unmodified here - getRoomIdFromUrl's window.location.href default and
+ * roomUrlToDocumentsUrl's window.location.origin fallback are both only
+ * reached if called with no/a relative URL, which never happens from
+ * this file (every call site here passes an already-absolute URL).
  **************************************************************/
+
+importScripts("content/utils.js");
 
 const STATE = {
   running: false,
@@ -18,16 +30,40 @@ const STATE = {
   finishedAt: null
 };
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+const PERSIST_KEY = "dsJob";
+
+// MV3 service workers are ephemeral - Chrome can and will kill this one
+// mid-run, wiping everything above since it's just an in-memory object.
+// Snapshotting the resumable fields to chrome.storage.local at natural
+// checkpoints (run start, per-room completion, pause/resume) means the
+// startup check at the bottom of this file can pick a run back up
+// instead of losing it outright. Not called from broadcastStatus() (that
+// fires ~once/second while paused) to avoid writing on every tick -
+// only at points that actually change resumable state.
+async function persistJob(resumeIndex) {
+  if (!STATE.queue.length) {
+    await clearPersistedJob();
+    return;
+  }
+
+  await chrome.storage.local.set({
+    [PERSIST_KEY]: {
+      queue: STATE.queue,
+      // STATE.index still points at whichever room is currently being
+      // processed - the for loop in runQueue() only advances it at the
+      // next iteration boundary. Callers that just finished a room pass
+      // index + 1 explicitly so a resume continues with the next room
+      // instead of redundantly reprocessing the one that just succeeded.
+      index: resumeIndex ?? STATE.index,
+      results: STATE.results,
+      paused: STATE.paused,
+      startedAt: STATE.startedAt
+    }
+  });
 }
 
-function cleanName(name) {
-  return String(name || "Unnamed Room")
-    .replace(/[\\/:*?"<>|]/g, "-")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 120) || "Unnamed Room";
+async function clearPersistedJob() {
+  await chrome.storage.local.remove(PERSIST_KEY);
 }
 
 function nowStamp() {
@@ -39,22 +75,6 @@ function nowStamp() {
 function csvEscape(value) {
   const s = String(value ?? "");
   return `"${s.replace(/"/g, '""')}"`;
-}
-
-function getRoomIdFromUrl(url) {
-  const match = String(url || "").match(/\/rooms\/(\d+)/i);
-  return match ? match[1] : "";
-}
-
-function roomUrlToDocumentsUrl(url) {
-  try {
-    const parsed = new URL(url);
-    const match = parsed.pathname.match(/\/rooms\/(\d+)/i);
-    if (!match) return null;
-    return `${parsed.origin}/rooms/${match[1]}/documents`;
-  } catch (e) {
-    return null;
-  }
 }
 
 async function broadcastStatus() {
@@ -127,17 +147,31 @@ async function createReport() {
     ]
   ];
 
-  STATE.results.forEach((r, idx) => {
+  // Was STATE.results.forEach(...) - but results only gets an entry once
+  // a room is actually processed, so a run stopped partway through wrote
+  // a report covering only the rooms it reached. Everything still queued
+  // was silently absent, not "marked waiting" - so uploading that report
+  // back in as a resume could only ever pick up what had already been
+  // touched, never the rest of the original list. Walking STATE.queue
+  // instead (the full original list, restored as-is on a resumed run
+  // too) and looking up each room's result by roomId means every room
+  // gets a row - a real result if it has one, "Waiting" if it doesn't -
+  // so the CSV round-trips through Upload CSV as a genuine resume.
+  const resultsByRoomId = new Map();
+  STATE.results.forEach(r => resultsByRoomId.set(r.roomId, r));
+
+  STATE.queue.forEach((room, idx) => {
+    const r = resultsByRoomId.get(room.roomId);
     rows.push([
       idx + 1,
-      r.roomName || "",
-      r.roomId || "",
-      r.documentsUrl || "",
-      r.status || "",
-      r.reason || "",
-      r.downloadedFilename || "",
-      r.downloadId || "",
-      r.time || ""
+      (r?.roomName || room.roomName || ""),
+      (r?.roomId || room.roomId || ""),
+      (r?.documentsUrl || room.documentsUrl || ""),
+      r?.status || "Waiting",
+      r?.reason || "Not yet processed",
+      r?.downloadedFilename || "",
+      r?.downloadId || "",
+      r?.time || ""
     ]);
   });
 
@@ -182,13 +216,22 @@ async function runQueue() {
   STATE.running = true;
   STATE.stopped = false;
   STATE.finishedAt = null;
-  STATE.startedAt = new Date().toISOString();
+  // Not unconditional - a resumed run already has a real startedAt
+  // restored from storage, and overwriting it here would report the
+  // wrong total elapsed time and, more importantly, imply the job had
+  // no downtime when it may have sat interrupted for a while.
+  STATE.startedAt = STATE.startedAt || new Date().toISOString();
 
   await broadcastStatus();
 
   const worker = await ensureWorkerTab();
 
-  for (STATE.index = 0; STATE.index < STATE.queue.length; STATE.index++) {
+  // No initializer here (unlike a plain `for (STATE.index = 0; ...)`) -
+  // a fresh run's DS_START_QUEUE handler sets STATE.index = 0 itself
+  // before calling this, and a resumed run needs to continue from
+  // whatever index was restored from storage. Forcing it to 0 here would
+  // silently turn every resume into a full restart from the beginning.
+  for (; STATE.index < STATE.queue.length; STATE.index++) {
     if (!(await waitIfPausedOrStopped())) break;
 
     const room = STATE.queue[STATE.index];
@@ -230,6 +273,7 @@ async function runQueue() {
       if (!loaded) {
         result.reason = "Room Documents page did not finish loading";
         STATE.results.push(result);
+        await persistJob(STATE.index + 1);
         await broadcastStatus();
         continue;
       }
@@ -257,6 +301,7 @@ async function runQueue() {
       result.downloadedFilename = expectedFilename;
 
       STATE.results.push(result);
+      await persistJob(STATE.index + 1);
 
       // Real signal instead of a flat guess: wait for
       // chrome.downloads.onDeterminingFilename to actually fire for this
@@ -272,6 +317,7 @@ async function runQueue() {
       result.reason = error.message || "Unknown error";
       result.time = new Date().toISOString();
       STATE.results.push(result);
+      await persistJob(STATE.index + 1);
       await broadcastStatus();
     }
 
@@ -280,6 +326,12 @@ async function runQueue() {
 
   STATE.running = false;
   STATE.currentRoom = null;
+
+  // Covers both ways this loop can end - running out of rooms and an
+  // explicit Stop both fall through to here (break only exits the for
+  // loop, not this function), so one call handles both: nothing left to
+  // resume either way.
+  await clearPersistedJob();
 
   await createReport().catch(() => "");
   await broadcastStatus();
@@ -328,7 +380,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // and report "started" instantly for a room whose download in this
       // run hasn't actually begun yet.
       STATE.downloads = {};
+      // Explicitly cleared, not left as whatever a previous run in this
+      // same service-worker lifetime set it to - runQueue() only sets a
+      // fresh timestamp when this is falsy (so a resumed run keeps its
+      // real start time), which would otherwise make a genuinely new run
+      // silently inherit a stale startedAt from an earlier one.
+      STATE.startedAt = null;
 
+      await persistJob();
       sendResponse({ ok: true, total: STATE.queue.length });
 
       runQueue();
@@ -337,6 +396,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === "DS_PAUSE") {
       STATE.paused = true;
+      await persistJob();
       await broadcastStatus();
       sendResponse({ ok: true });
       return;
@@ -344,6 +404,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === "DS_RESUME") {
       STATE.paused = false;
+      await persistJob();
       await broadcastStatus();
       sendResponse({ ok: true });
       return;
@@ -496,3 +557,39 @@ chrome.downloads.onChanged.addListener(delta => {
     broadcastStatus();
   }
 });
+
+// Runs every time this service worker starts up - fresh install, browser
+// restart, or (far more commonly) Chrome killing this ephemeral worker
+// mid-run and later respawning it. Picks up a job that was still running
+// when this instance's in-memory STATE was lost, instead of leaving it
+// stranded with no way to continue short of rescanning from scratch.
+//
+// Known limitation: this only fires once something wakes the worker -
+// there's no periodic self-wake (no chrome.alarms) here, so resume isn't
+// instant if the browser sits fully closed or no matching tab gets
+// opened. In practice the panel's own DS_GET_STATUS call on load (every
+// Docusign Rooms page) is what wakes it, the next time the user checks in.
+//
+// Also known: if the crash lands mid-room - after the download click but
+// before this room's result gets persisted - the resumed run reprocesses
+// that same room from its start. `conflictAction: "uniquify"` means a
+// resulting duplicate gets its own folder rather than overwriting
+// anything, so the cost is a possible extra ZIP, not lost/corrupted data.
+(async () => {
+  const stored = await chrome.storage.local.get(PERSIST_KEY);
+  const job = stored[PERSIST_KEY];
+
+  if (!job || !job.queue?.length || job.index >= job.queue.length) return;
+
+  STATE.queue = job.queue;
+  STATE.index = job.index;
+  STATE.results = job.results || [];
+  STATE.paused = !!job.paused;
+  STATE.startedAt = job.startedAt || null;
+  STATE.stopped = false;
+  STATE.currentRoom = null;
+  STATE.downloads = {};
+  STATE.workerTabId = null;
+
+  runQueue();
+})();

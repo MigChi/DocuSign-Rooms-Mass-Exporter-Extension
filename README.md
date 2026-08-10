@@ -1,4 +1,4 @@
-# Docusign Rooms Bulk Downloader
+# Docusign Rooms Mass Exporter
 
 This Chrome extension bulk-downloads Docusign Rooms documents by automating the same manual process:
 Room Documents page → Select All → Download → ZIP.
@@ -17,7 +17,8 @@ Room Documents page → Select All → Download → ZIP.
   `Downloads/Docusign Rooms/Room Name/Room Name.zip`
 - Creates a CSV report after it finishes:
   `Downloads/Docusign Rooms/_Download Reports/Docusign Rooms Download Report <timestamp>.csv`
-- Includes Start, Pause, Resume, and Stop buttons.
+- Includes a Start/Stop toggle and a Pause/Resume toggle, plus a manual
+  From/To date range and a CSV-only scan mode.
 
 ## Install
 
@@ -31,7 +32,7 @@ Room Documents page → Select All → Download → ZIP.
 
 1. Go to the main Docusign Rooms list page.
 2. Let the page load.
-3. Use the floating Docusign Bulk Downloader panel at the bottom-right.
+3. Use the floating Docusign Rooms Mass Exporter panel at the bottom-right.
 4. Click Start.
 5. If Chrome asks to allow multiple downloads, click Allow.
 
@@ -239,6 +240,105 @@ some reason, rather than silently returning nothing.
     than added a placeholder icon - the panel's own "Done." status
     message already covers this. Also removed the `"scripting"`
     permission, which was declared but never used anywhere in the code.
+- **Deduplicated `background.js`'s copy of shared helpers.** It had its
+  own separate copies of `sleep`, `cleanName`, `getRoomIdFromUrl`, and
+  `roomUrlToDocumentsUrl` - identical logic to `content/utils.js`, kept
+  as a second copy only because a Manifest V3 service worker runs in a
+  completely separate JS context from content scripts and can't reach
+  their globals through manifest content_scripts ordering the way
+  `scan.js`/`room.js`/`content.js` do among themselves. Fixed with
+  `importScripts("content/utils.js")` at the top of `background.js` -
+  `utils.js` is already plain global function declarations with no
+  `export`/`import`, so it works unmodified as a shared source in both
+  contexts, and the two remaining `window`-dependent fallback paths
+  inside it (`getRoomIdFromUrl`'s default parameter, `roomUrlToDocumentsUrl`'s
+  relative-URL handling) are confirmed unreachable from `background.js` -
+  every call site there always passes an already-resolved, absolute URL.
+  `nowStamp()`/`csvEscape()` stayed in `background.js` since they're not
+  needed anywhere else - not everything shared-shaped needs to move to
+  `utils.js`, only what's actually duplicated.
+- **Manual date range replaces the hardcoded scan constants.** The panel
+  now has From/To date inputs; `autoScrollAndCollectRooms()` in
+  `content/scan.js` takes the range as a parameter instead of reading the
+  old module-level `SCAN_DATE_START`/`SCAN_DATE_END` constants, which
+  meant changing the batch size required editing code and reloading the
+  extension. Both "Scan & Export List (CSV)" and "Start" read the same
+  two inputs (via a shared `readDateRange()` in `content.js`, which also
+  refuses to proceed - clearly, through the status line - if either field
+  is empty or From is after To).
+- **Panel UI redesign.** Restyled from the original dark placeholder look
+  to something closer to the actual Docusign product surface it sits on
+  top of: white background, black text, Docusign's signature yellow
+  (`#ffcc22`) as the single accent color (brand strip along the top edge,
+  the Start button, input focus rings), buttons otherwise neutral
+  (white/black/muted red for Pause/Resume/Stop) instead of the previous
+  arbitrary red/orange/green/gray. Purely visual - no behavior changed.
+- **Renamed to Docusign Rooms Mass Exporter** across `manifest.json`,
+  the panel title, and both docs.
+- **Merged Start/Stop and Pause/Resume into two toggle buttons** instead
+  of four separate ones. Each toggle's label, color, and (for
+  Pause/Resume) disabled state are driven by a single `updateButtonStates()`
+  call fed from the background's actual status broadcasts - not guessed
+  from whichever button was last clicked - so the panel can't drift out
+  of sync with what's really running. Pause/Resume is disabled whenever
+  nothing is running, since pausing doesn't mean anything before a run
+  starts.
+- **Persisted progress via `chrome.storage.local`**, closing out the
+  "Persisted progress" item from the Planned list below. `background.js`
+  now snapshots the resumable state (queue, index, results, paused,
+  startedAt) at every point that changes it - run start, after each
+  room's result is recorded, and on pause/resume - and a startup check
+  picks a job back up if the service worker was killed mid-run instead
+  of losing it outright. Two accepted limitations, not solved here: resume
+  only fires the next time something wakes the service worker (in
+  practice, the next time a Docusign Rooms tab's panel checks in), not
+  instantly on crash; and a crash landing mid-room (after the download
+  click but before that room's result is persisted) causes that one room
+  to be reprocessed on resume - `conflictAction: "uniquify"` means the
+  worst case is a duplicate ZIP, not lost or corrupted data. Full
+  reasoning in `DESIGN.md`'s Decision 6.
+- **CSV upload as a second, more durable resume path.** New "Upload CSV
+  to Run/Resume" button - reads either CSV this extension exports (the
+  scan list or the download report), parsed with a new `parseCsv()` in
+  `content/utils.js` (handles quoted/comma-containing fields, doesn't
+  just split on `,`), and skips the live scan entirely since the room
+  list already came from the file. If the uploaded CSV has a `Status`
+  column (a download report, not a plain scan list), rows already marked
+  `Downloaded` are dropped automatically - uploading a report from an
+  interrupted run resumes it by only re-queueing what didn't finish. This
+  complements the `chrome.storage.local` persistence above rather than
+  duplicating it: that layer only survives inside the same browser
+  profile, while the download report is a real file in Downloads that
+  survives a cleared profile, a different computer, or the extension
+  being reinstalled. Also useful on its own for splitting a big room list
+  into smaller hand-edited batches.
+- **Fixed the download report only covering rooms that were actually
+  reached.** `createReport()` built its rows from `STATE.results`, which
+  only gets an entry once a room is processed - so a run stopped
+  partway through produced a report where every room still in the queue
+  was silently absent, not marked as pending. Uploading that report back
+  in as a resume could therefore only ever pick up rooms already
+  touched, never the rest of the original list - which defeated the
+  point of the upload-to-resume feature above for exactly the case it
+  was meant to help with. Fixed by walking `STATE.queue` (the full
+  original list) instead of `STATE.results`, looking up each room's
+  result by `roomId` and writing `Status: "Waiting"` /
+  `Reason: "Not yet processed"` for anything without one. No change
+  needed on the upload/parsing side - it already kept every non-
+  `"Downloaded"` row, so `"Waiting"` rows flow through correctly now
+  that they actually exist in the file.
+- **Fixed a progress-counter glitch.** The panel's `X / Y` counter added
+  `+1` to the completed count whenever a run was `running`, meant to
+  show "currently on room N" instead of "N completed." But the moment a
+  room's result gets pushed, `running` is still `true` for the rest of
+  that same loop iteration (another status broadcast fires during the
+  download-start wait, before the loop advances to the next room) - so
+  the `+1` fired a second time on the room that had just finished,
+  jumping the counter one room ahead of reality and holding there until
+  the next room actually started. Simplified to a strictly monotonic
+  "rooms completed" count with no `+1` - the status line's
+  "Running: &lt;room&gt;" text already conveys what's currently in flight,
+  so the number doesn't need to also try to.
 
 **Authorship note:** the scanning and date-range-filtering logic above
 was written and debugged by hand. The CSV export and manifest wiring
@@ -249,9 +349,6 @@ end of `DESIGN.md` for the full explanation and where the line is drawn.
 Planned (in progress):
 - A shared work queue with multiple worker tabs claiming rooms
   concurrently, instead of one tab processing rooms one at a time.
-- Persisted progress (via chrome.storage.local) so a run can resume after
-  a browser restart, a killed extension service worker, or a long pause -
-  not just a manual pause/resume within one session.
 - Per-room status tracking through its full lifecycle (queued, in
   progress, done, failed, empty) shown live in the panel, per worker tab.
 - A suggested worker-tab count based on measured average time-per-room,

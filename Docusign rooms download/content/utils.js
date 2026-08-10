@@ -1,9 +1,17 @@
 /**************************************************************
  * content/utils.js
- * Generic string/URL helpers with no DOM/page context of their own.
+ * Generic string/URL/CSV helpers with no DOM/page context of their own.
  * Shared by content/scan.js AND content/room.js - that's why these
  * live in their own file instead of either one: a function used by
  * more than one concern shouldn't be owned by either.
+ *
+ * Also loaded directly by background.js via importScripts(), since the
+ * service worker runs in a separate JS context from content scripts and
+ * can't reach these globals through manifest content_scripts ordering.
+ * Kept as plain global function declarations (no export/import) so it
+ * works unmodified in both places - avoid adding DOM/window-only logic
+ * here that isn't already guarded for a context where `window` doesn't
+ * exist.
  *
  * Must be the FIRST content script listed in manifest.json - scan.js
  * and room.js both call functions defined here.
@@ -49,4 +57,53 @@ function roomUrlToDocumentsUrl(url) {
     } catch (e) {
       return null;
     }
+}
+
+/**
+ * Parses CSV text into an array of row arrays (each a plain string[]).
+ * Handles quoted fields, embedded commas/newlines inside quotes, doubled
+ * quotes as an escaped quote, and both \n and \r\n line endings - mirrors
+ * background.js's csvEscape() (every field quoted, internal quotes
+ * doubled), so it correctly reads back both CSVs this extension exports
+ * (the scan list and the download report) as well as one that was
+ * opened, hand-edited, and re-saved in a normal spreadsheet app.
+ */
+function parseCsv(text) {
+    const rows = [];
+    let row = [];
+    let field = "";
+    let inQuotes = false;
+
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+
+      if (inQuotes) {
+        if (char === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else { inQuotes = false; }
+        } else {
+          field += char;
+        }
+      } else if (char === '"') {
+        inQuotes = true;
+      } else if (char === ",") {
+        row.push(field);
+        field = "";
+      } else if (char === "\n" || char === "\r") {
+        if (char === "\r" && text[i + 1] === "\n") i++;
+        row.push(field);
+        rows.push(row);
+        row = [];
+        field = "";
+      } else {
+        field += char;
+      }
+    }
+
+    if (field.length || row.length) {
+      row.push(field);
+      rows.push(row);
+    }
+
+    return rows.filter(r => r.length > 1 || r[0] !== "");
 }

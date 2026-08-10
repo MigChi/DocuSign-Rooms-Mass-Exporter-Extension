@@ -1,17 +1,14 @@
 /**************************************************************
  * content/scan.js
  * Room-LIST scanning: finds every room row on the Rooms list page,
- * scrolls to load more, and (once Step 3 is added) filters by
- * created-date range.
+ * scrolls to load more, and filters by a caller-supplied created-date
+ * range (set via the panel's own date inputs, not hardcoded here).
  *
  * Depends on content/utils.js (cleanName, getRoomIdFromUrl,
  * roomUrlToDocumentsUrl, sleep) - manifest.json must load utils.js
  * first. Does not depend on content/room.js or content.js; nothing in
  * this file cares what page you're processing, only the list page.
  **************************************************************/
-
-const SCAN_DATE_START = new Date("2020-02-01");
-const SCAN_DATE_END = new Date("2020-04-30");
 
 /**
  * Confirmed (via DevTools computed-style check, 2026-08) that this page
@@ -121,23 +118,26 @@ function getRoomCardsAndLinks() {
 
 /**
  * Entry point for scanning - called from content.js's injectPanel() when
- * Start is clicked. Forces List View via ensureListView() first (Grid
- * View has no readable rows for getRoomCardsAndLinks()), then attempts to
- * set the sort to "Created (Oldest)" via ensureOldestSort(). Still
- * refuses to run (returns []) if that didn't stick - checked via
- * getSortLabel() - since the whole skip/collect/stop algorithm below
- * depends on ascending order and a UI change could silently break the
- * auto-select without breaking the safety check. Otherwise repeatedly
- * scrolls
- * the container found by getScrollContainer() and re-runs
- * getRoomCardsAndLinks() until either: no new rooms appear for several
- * tries (noNewRoomAttempts), a hard scroll cap is hit (totalScrolls), or
- * several consecutive rooms are found past SCAN_DATE_END
- * (outOfRangeStreak) - valid as a stop signal only because the list is
- * confirmed ascending by this point. Returns the final list, filtered to
- * [SCAN_DATE_START, SCAN_DATE_END].
+ * Scan/Start is clicked, passing the date range read from the panel's own
+ * date inputs (`{ start: Date, end: Date }`) - this used to be a pair of
+ * hardcoded module constants; now the caller controls batch size directly
+ * instead of needing a code edit per run.
+ *
+ * Forces List View via ensureListView() first (Grid View has no readable
+ * rows for getRoomCardsAndLinks()), then attempts to set the sort to
+ * "Created (Oldest)" via ensureOldestSort(). Still refuses to run
+ * (returns []) if that didn't stick - checked via getSortLabel() - since
+ * the whole skip/collect/stop algorithm below depends on ascending order
+ * and a UI change could silently break the auto-select without breaking
+ * the safety check. Otherwise repeatedly scrolls the container found by
+ * getScrollContainer() and re-runs getRoomCardsAndLinks() until either:
+ * no new rooms appear for several tries (noNewRoomAttempts), a hard
+ * scroll cap is hit (totalScrolls), or several consecutive rooms are
+ * found past dateRange.end (outOfRangeStreak) - valid as a stop signal
+ * only because the list is confirmed ascending by this point. Returns
+ * the final list, filtered to [dateRange.start, dateRange.end].
  */
-async function autoScrollAndCollectRooms(updateStatus) {
+async function autoScrollAndCollectRooms(updateStatus, dateRange) {
     ensureListView();
     await sleep(500);
 
@@ -149,6 +149,8 @@ async function autoScrollAndCollectRooms(updateStatus) {
       updateStatus?.(`Stopped: set the sort dropdown to "Created (Oldest)" before scanning (currently: ${sortLabel || "unknown"}).`);
       return [];
     }
+
+    const { start: dateStart, end: dateEnd } = dateRange;
 
     const scrollContainer = getScrollContainer();
 
@@ -165,7 +167,7 @@ async function autoScrollAndCollectRooms(updateStatus) {
 
       const newRooms = rooms.slice(lastCount);
       for (const room of newRooms) {
-        if (room.createdDate && room.createdDate > SCAN_DATE_END) {
+        if (room.createdDate && room.createdDate > dateEnd) {
           outOfRangeStreak++;
         } else {
             outOfRangeStreak = 0;
@@ -194,6 +196,6 @@ async function autoScrollAndCollectRooms(updateStatus) {
     }
 
     return getRoomCardsAndLinks().filter(room => {
-        return room.createdDate && room.createdDate >= SCAN_DATE_START && room.createdDate <= SCAN_DATE_END;
+        return room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd;
     });
 }
