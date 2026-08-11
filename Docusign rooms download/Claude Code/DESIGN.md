@@ -4,7 +4,28 @@
 
 A Chrome extension (Manifest V3) that bulk-exports documents from a DocuSign Rooms account to a local folder structure — one folder per room, containing that room's documents. The project started as a small working extension and was redesigned to reliably handle **10,000+ rooms**, a scale where naive approaches (single-tab, fixed delays, no persistence) become impractical — the original design projected to **55-70 hours** of runtime.
 
-This document walks through the problem in the order it was actually solved: what each step addressed, which options were considered, why the chosen option won, and where an earlier decision was later reversed as new requirements surfaced.
+This document walks through the problem in the order it was actually solved: what each step addressed, which options were considered, why the chosen option won, and where an earlier decision was later reversed as new requirements surfaced. For what the extension actually does today and how to use it, see the top-level [`README.md`](../../README.md) — this document is the reasoning behind it, not a user guide.
+
+## Contents
+
+- [Starting Point: Auditing the Existing Extension](#starting-point-auditing-the-existing-extension)
+- [Current Implementation Status](#current-implementation-status)
+- [Decision 1: Official API vs. Continued Browser Automation](#decision-1-official-api-vs-continued-browser-automation)
+- [Decision 2: Parallelism Model — Work Queue, Not Divide-and-Conquer](#decision-2-parallelism-model--work-queue-not-divide-and-conquer)
+- [Decision 3: Concurrency Safety Without Explicit Locks](#decision-3-concurrency-safety-without-explicit-locks)
+- [Decision 4: Scope Reduction via Date-Range Filtering](#decision-4-scope-reduction-via-date-range-filtering)
+- [Decision 5: Batch Scan-Then-Process vs. Streaming (a reversed decision)](#decision-5-batch-scan-then-process-vs-streaming-a-reversed-decision)
+- [Decision 6: Persistence & the MV3 Service Worker Lifecycle](#decision-6-persistence--the-mv3-service-worker-lifecycle)
+- [Decision 7: Replacing Fixed Delays with Real Signals](#decision-7-replacing-fixed-delays-with-real-signals)
+- [Decision 8: Adaptive Concurrency — A Feedback Loop, Not a Formula](#decision-8-adaptive-concurrency--a-feedback-loop-not-a-formula)
+- [Decision 9: Code Organization — Why Not OOP](#decision-9-code-organization--why-not-oop)
+- [Final Build Plan (Deliberately Risk-Ordered)](#final-build-plan-deliberately-risk-ordered)
+- [Build Step 1: Scanning + Filtering + List Export (Complete)](#build-step-1-scanning--filtering--list-export-complete)
+  - [Decision 10: Splitting content.js by Dependency, Not by File History](#decision-10-splitting-contentjs-by-dependency-not-by-file-history)
+  - [Decision 11: Replacing Two DOM Heuristics with DevTools-Confirmed Behavior](#decision-11-replacing-two-dom-heuristics-with-devtools-confirmed-behavior)
+  - [Decision 12: Closing Out Build Step 1 Under Time Pressure — CSV Export, Manifest Wiring](#decision-12-closing-out-build-step-1-under-time-pressure--csv-export-manifest-wiring)
+- [Engineering Concepts Demonstrated](#engineering-concepts-demonstrated)
+- [Development Process: Human-Authored, AI-Guided](#development-process-human-authored-ai-guided)
 
 ---
 
@@ -13,6 +34,23 @@ This document walks through the problem in the order it was actually solved: wha
 The original extension used a single worker tab, processed rooms strictly sequentially, and relied on fixed `sleep()` delays (~11.5 seconds of pure dead time per room, not counting page load) to wait for DOM state to settle before clicking the next button. Its download-renaming trick — intercepting `chrome.downloads.onDeterminingFilename` to route each ZIP into `Docusign Rooms/<Room Name>/<Room Name>.zip` — was sound, but it depended on tracking exactly **one** active room globally, which meant the whole design could never be parallelized without a rework.
 
 Doing the math on 10,000 rooms against that sequential design (~20-25s/room including page load) put the runtime at 55-70 hours — the actual number that motivated everything below.
+
+---
+
+## Current Implementation Status
+
+The [Final Build Plan](#final-build-plan-deliberately-risk-ordered) below lays out six steps in deliberately increasing order of risk. Mapped against where the code actually stands:
+
+| # | Step | Status |
+|---|---|---|
+| 1 | Scanning + filtering + list export | **Done** — [Build Step 1](#build-step-1-scanning--filtering--list-export-complete) below |
+| 2 | Single-tab processing with event-driven waits | **Done** — [Decision 7](#decision-7-replacing-fixed-delays-with-real-signals) |
+| 3 | Full per-room lifecycle status in the panel UI | **Not started.** The panel currently shows one aggregate progress count and whichever single room is active — there's only ever one, so per-room/per-tab status has nothing to differentiate yet |
+| 4 | Persistence and resume | **Done** — [Decision 6](#decision-6-persistence--the-mv3-service-worker-lifecycle), plus a second CSV-based resume path added afterward |
+| 5 | The worker-tab pool (multi-tab queue) | **Not started.** The design (Decisions 2 & 3) is fully worked out below; the code is still single-tab |
+| 6 | Min/max bounds + adaptive concurrency suggestion | **Not started** — depends on real timing data from step 5 |
+
+In short: everything through single-tab processing, plus persistence (originally planned as step 4, built ahead of the multi-tab step it was ordered after — see the note at the end of [Decision 6](#decision-6-persistence--the-mv3-service-worker-lifecycle)), is implemented and has been exercised in live testing against a real account. The multi-tab worker pool and everything downstream of it (steps 3, 5, 6) remain future work.
 
 ---
 
@@ -98,6 +136,8 @@ Two limitations, both accepted rather than solved here: (1) there's no periodic 
 
 **Correction, found immediately by trying to actually use the feature above:** `createReport()` built its CSV from `STATE.results`, which only gets an entry once a room is *processed* — so a run stopped partway through produced a report covering only the rooms it had reached. Everything still sitting in the queue was simply absent from the file, not marked as pending. Re-uploading that report therefore could only ever resume rooms already touched, never the untouched remainder — which broke the CSV-upload resume path for precisely the scenario it exists for (an interrupted run). Fixed by having `createReport()` walk `STATE.queue` (the complete original list, restored in full on a resumed run too) instead of `STATE.results`, looking up each room's outcome by `roomId` and writing `Status: "Waiting"` for anything without one. `roomsFromCsvRows()` on the upload side needed no change — its filter already kept every row that wasn't `"Downloaded"`, it just had nothing to keep before, since the "still waiting" rows never existed in the file.
 
+**Note on build order:** the [Final Build Plan](#final-build-plan-deliberately-risk-ordered) below originally sequenced persistence as step 4, after single-tab processing but before the multi-tab worker pool. In practice it was built and shipped ahead of the multi-tab step it was ordered after, once it became clear a crash losing an hours-long single-tab run was already a real, live problem worth fixing on its own — see [Current Implementation Status](#current-implementation-status) for where each step actually stands.
+
 ---
 
 ## Decision 7: Replacing Fixed Delays with Real Signals
@@ -153,9 +193,9 @@ A small, narrow-date-range dry run (a few dozen rooms) is run through the entire
 
 ---
 
-## Build Step 1 In Progress: Scanning + Filtering + List Export
+## Build Step 1: Scanning + Filtering + List Export (Complete)
 
-The plan above is being executed in order; this section tracks Step 1's actual implementation decisions as they happen, separately from the pre-implementation planning above.
+This section records Step 1's actual implementation decisions as they happened, separately from the pre-implementation planning above — kept in its original, in-the-moment voice (including the "in progress" framing of the notes within it) rather than rewritten in hindsight, since that's an honest record of the order things were actually found and fixed. See [Current Implementation Status](#current-implementation-status) above for where the step numbering actually stands today.
 
 ### Decision 10: Splitting content.js by Dependency, Not by File History
 

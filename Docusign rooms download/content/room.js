@@ -4,11 +4,13 @@
  * on one room's /documents page, as opposed to content/scan.js which
  * only makes sense on the list page.
  *
- * Currently just getRoomNameFromPage(). In Phase 2 of the roadmap, the
- * other room-page functions still sitting in content.js today
- * (clickElement, selectAllDocuments, findBulkDownloadButton,
- * getDocumentCount, waitForSelector, processCurrentRoom) move into this
- * same file, since they're the same kind of concern.
+ * Currently just getRoomNameFromPage(). The other room-page functions
+ * (clickElement, selectAllDocuments, getDocumentCount, waitForSelector,
+ * processCurrentRoom) still live in content.js rather than here - they
+ * could move into this file for consistency, but that's a pure
+ * reorganization with no functional benefit, so it's been left alone in
+ * favor of the roadmap items that actually change behavior (see
+ * README.md's Roadmap section).
  *
  * Depends on content/utils.js (cleanName, getRoomIdFromUrl) -
  * manifest.json must load utils.js first.
