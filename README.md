@@ -27,16 +27,25 @@ documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms
 - **Upload CSV to Run/Resume** — skip the live scan entirely by feeding
   in a previously exported CSV. Uploading a *download report* from an
   interrupted run automatically resumes it: rooms already marked
-  `Downloaded` are skipped, everything else (including rooms the run
-  never even reached) is re-queued.
+  `Downloaded` are preserved as-is (not re-run, but still counted in the
+  new report), everything else (including rooms the run never even
+  reached) is re-queued.
 - **Start/Stop and Pause/Resume**, each a single toggle button whose
   label and color are driven by the extension's actual live state, not
   guessed from the last click.
+- **Concurrent multi-tab processing** — a pool of worker tabs (currently
+  3, hardcoded for now) claim rooms from a shared queue independently,
+  with no explicit locking: the claim itself is a single synchronous
+  step, safe because the extension's background service worker is
+  inherently single-threaded.
 - **Persistence across interruptions** — progress is checkpointed to
-  `chrome.storage.local` as the run progresses. If Chrome kills the
-  extension's background service worker mid-run (an expected, not rare,
-  event for Manifest V3 — see `DESIGN.md`), the next time it wakes up it
-  picks the job back up instead of losing it.
+  `chrome.storage.local` as the run progresses, and resume is computed
+  as "whatever doesn't have a result yet" rather than a saved position -
+  safe even if several tabs had rooms claimed-but-unfinished at the
+  moment of a crash. If Chrome kills the extension's background service
+  worker mid-run (an expected, not rare, event for Manifest V3 — see
+  `DESIGN.md`), the next time it wakes up it picks the job back up
+  instead of losing it.
 - **Per-room download pipeline** — Select All, Bulk Download, confirm
   modal, wait for the ZIP to actually start downloading — all driven by
   real page-state signals rather than fixed timers. Empty rooms are
@@ -47,8 +56,9 @@ documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms
   `Download Error`, or `Waiting` for anything not yet reached), reason,
   saved filename, and timestamp.
 - **Docusign-styled floating panel** — appears on any Rooms page,
-  reflects the run's live status regardless of which tab is doing the
-  processing.
+  reflects the run's live status (including which rooms are actively
+  processing across all worker tabs) regardless of which tab is doing
+  the processing.
 
 ## Install
 
@@ -97,19 +107,24 @@ Run/Resume" if a run gets interrupted.
 | `content.js` | The floating panel UI, and the single-room download pipeline (Select All → Bulk Download → confirm → wait) |
 | `popup.html` / `popup.js` | Leftover from the original 1.0.2 toolbar popup — unused since the in-page panel replaced it; not referenced by `manifest.json`, kept for reference only |
 | `Claude Code/DESIGN.md` | The full architecture and decision-by-decision case study |
+| `Claude Code/CONVERSATION_LOG.txt` | Raw transcript of the planning conversation that produced `DESIGN.md` — kept verbatim as a supplementary record, not maintained going forward the way `DESIGN.md`/this README are |
 
 ## Architecture & Design
 
 The short version: this extension automates 10,000+ independent,
 variable-cost tasks (documents-per-room varies a lot), which makes it an
-**embarrassingly parallel** workload best served by a shared work queue
-rather than a static split — Manifest V3's single-threaded service worker
-gives that queue a natural critical section with no explicit locking
-needed. Persistence is built around the fact that MV3 service workers are
-*deliberately* ephemeral (Chrome can and will kill this one mid-run), not
-treated as an edge case. Every fixed `sleep()` in the original design was
-replaced with either a real event or a timeout sized to what's actually
-being waited for.
+**embarrassingly parallel** workload — implemented as a shared work queue
+that a pool of worker tabs claim from concurrently, rather than a static
+split. Manifest V3's single-threaded service worker gives that queue a
+natural critical section with no explicit locking needed: the claim
+itself is one synchronous function with no `await` inside it. Persistence
+is built around the fact that MV3 service workers are *deliberately*
+ephemeral (Chrome can and will kill this one mid-run), not treated as an
+edge case — and resume is computed as "whatever doesn't have a result
+yet" rather than a saved position, which matters once several tabs can
+each have a room claimed-but-unfinished at the moment of a crash. Every
+fixed `sleep()` in the original design was replaced with either a real
+event or a timeout sized to what's actually being waited for.
 
 None of that was assumed upfront — `DESIGN.md` walks through each
 decision in the order it was actually made, including the official
@@ -121,19 +136,18 @@ than silently rewritten into the original text.
 
 ## Roadmap
 
-Everything below is genuinely unbuilt, not just untested. They build on
-each other in this order:
+Multi-tab processing (Decisions 2 & 3 in `DESIGN.md`) is done — a fixed
+pool of worker tabs claim rooms from a shared queue concurrently, with
+persistence reworked to stay crash-safe under concurrency (see `DESIGN.md`
+Decision 6's corrections). Two items remain, in this order:
 
-1. **Multi-tab worker queue** — currently one tab processes rooms
-   strictly sequentially. The design for this (a shared queue with
-   concurrency-safe claiming) is already worked out in `DESIGN.md`
-   (Decisions 2 & 3) but not yet implemented in code.
-2. **Per-room live status in the panel** (queued/in-progress/done/
-   failed/empty) — only meaningful once there's more than one worker
-   tab to show statuses for.
-3. **Adaptive worker-tab count** — a suggested concurrency level based
-   on measured time-per-room, within safe min/max bounds. Depends on
-   real timing data from #1.
+1. **Richer per-room live status in the panel** — right now the panel
+   shows how many rooms are active and which ones, not a full
+   queued/in-progress/done/failed/empty breakdown per room.
+2. **Adaptive worker-tab count** — a suggested concurrency level based
+   on measured time-per-room, within safe min/max bounds, replacing the
+   currently-hardcoded `WORKER_TAB_COUNT`. Real timing data to build
+   this against now exists, since concurrent processing is live.
 
 ## Development Process
 
@@ -147,6 +161,32 @@ the AI under human review and direction — a deliberate choice made
 under real time pressure, not a quiet drift. The full account, including
 exactly which bugs were caught by which side of that process, is in
 `DESIGN.md`'s "Development Process: Human-Authored, AI-Guided" section.
+
+---
+
+## Development Phases
+
+A scannable map of *when* things were built and *what broke along the way*,
+before diving into the full blow-by-blow in Version History below. Phase
+numbering matches `DESIGN.md`'s [Final Build Plan](Docusign%20rooms%20download/Claude%20Code/DESIGN.md#final-build-plan-deliberately-risk-ordered)
+and [Current Implementation Status](Docusign%20rooms%20download/Claude%20Code/DESIGN.md#current-implementation-status)
+tables, which is the canonical source of truth for status — this table is a
+summary of it, not a second copy that can drift.
+
+| Phase | Goal | Status | Issues hit during this phase |
+|---|---|---|---|
+| 0. Baseline audit | Understand the original 1.0.2 extension before changing anything | Done | Runtime for 10,000 rooms projected to 55-70 hours (single tab, ~11.5s of fixed sleeps per room) — the number that motivated the whole rewrite. Toolbar popup's Start button was already silently broken (`DS_COLLECT_AND_START` had no listener). |
+| 1. Scanning, date-range filtering, list export | Read the Rooms list reliably and cheaply, before touching any download logic | Done | Two DOM-shape heuristics (`getRoomCardsAndLinks`, `findBestScrollContainer`) replaced with confirmed `data-qa` selectors. Sort order assumed "oldest first" turned out not to be a fixed account setting — a session found it set to "Newest," which would've silently returned zero rooms; fixed with a runtime check that refuses to scan otherwise. Scanning only worked in List View, not Grid View, until `ensureListView()` was added. A hand-wired `manifest.json` bug (`"utils.js"` instead of `"content/utils.js"`) would've failed to load every content script. |
+| 2. Single-room download pipeline, event-driven waits | Replace fixed sleeps with real signals; get one room's Select All → Download → confirm flow fully reliable | Done | The real blocker wasn't a selector — `checkbox.click()` on Select All was silently reverted by the page (untrusted synthetic click), so the bulk-actions toolbar never appeared; fixed by clicking the associated `<label>` instead, verified against real DOM state rather than assumed. The final download confirmation button had no `data-qa` at all (an older jQuery modal bolted onto the React UI); fixed with a selector scoped to the modal's own form ID. |
+| 3. Panel UI + Start/Stop/Pause/Resume | A single always-visible control surface reflecting real state | Done for the current two-toggle-button design; a richer per-room status breakdown is still open (see Roadmap) | The original toolbar popup was removed entirely rather than fixed, since the in-page panel already worked and having two half-working control surfaces was worse than one working one. |
+| 4. Persistence & resume | Survive Chrome killing the (deliberately ephemeral) MV3 service worker mid-run | Done, then reworked in phase 5 | Early version resumed from a saved queue *index* — safe only because single-tab guaranteed at most one claimed-but-unfinished room at a time. The CSV-upload resume path initially dropped already-`Downloaded` rows instead of preserving them, losing the record of everything already completed. The download report itself only covered rooms actually reached, silently omitting anything still queued when a run stopped. |
+| 5. Multi-tab worker pool (concurrency) | Multiple tabs claiming from one shared queue, without a mutex | Done, fixed tab count | The index-based resume from phase 4 became actively unsafe under concurrency (could silently drop claimed-but-unfinished rooms) — replaced with "resume = queue minus anything with a result." A synchronous "already running" guard had a race window an `await` earlier had left open. Downloads stopped registering at all under concurrency; first suspected `active: false` on worker tabs, but the same symptom persisted after reverting it — the real cause was worker tabs' downloads opening in a `target="_blank"` browsing context, so `DownloadItem.tabId` never matched the tab that triggered it. The first fix's regex matched `/rooms/<id>/` but the real download URL used DocuSign's internal `/transaction/<id>/` path. Once folder routing worked again, two distinct rooms sharing the same display name were found silently merging into one folder. |
+| 6. Adaptive concurrency | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | Depends on real timing data from phase 5, which now exists to build against. |
+
+Every issue above is one line here and a full paragraph in either
+`DESIGN.md` (the reasoning and the fix) or Version History below (the
+build-log framing) — this table exists so you don't have to read either in
+full just to see *where* a given problem was found and fixed.
 
 ---
 
@@ -335,6 +375,79 @@ practical at 10,000+ rooms instead of a few dozen.
     had just finished — jumping the counter one room ahead of reality
     until the next room actually started. Simplified to a strictly
     monotonic "rooms completed" count.
+  - **Multi-tab concurrent processing.** A pool of worker tabs (a
+    hardcoded `WORKER_TAB_COUNT = 3` for this first pass) now claim
+    rooms from a shared queue independently, per the design already
+    worked out in `DESIGN.md` Decisions 2 & 3: `claimNextRoom()` is a
+    single synchronous function (no `await` inside it) that reads and
+    advances the shared claim pointer, safe without an explicit lock
+    because the service worker is inherently single-threaded and can
+    never truly run two workers' claims simultaneously. Each worker
+    (`runWorker()`) claims, processes, and repeats independently until
+    the queue is empty or Stop ends it; `STATE.currentRoom` (one room)
+    became `STATE.currentRooms` (keyed by tab ID, since several rooms
+    are now genuinely in flight at once).
+  - **Fixed downloads never being redirected into per-room folders.**
+    First suspected cause: worker tabs navigating with `active: false`
+    (added to stop several tabs fighting over focus), on the theory that
+    Chrome's protection against a page silently triggering multiple
+    downloads was dropping background-tab-triggered ones - `Download ID`
+    stayed empty and status never advanced past `Success/Attempted` for
+    every room. Reverting to `active: true` didn't fix it - the exact
+    same symptom persisted, with files confirmed landing directly in the
+    flat Downloads root. The real cause: the download-confirmation
+    form is `<form ... method="post" target="_blank" ...>`, so submitting
+    it opens a **new browsing context** to receive the response - the
+    resulting download's tab ID belongs to that new tab, never the
+    worker tab that triggered it, so looking it up in `STATE.currentRooms`
+    by tab ID never matched anything. Fixed with `findCurrentRoomForDownload()`,
+    which falls back to parsing a room ID out of the download's own URL
+    when the tab-based lookup fails - and confirmed via a diagnostic
+    `console.warn` that a real download's `referrer` is empty and its
+    `url` uses DocuSign's internal `/transaction/<id>/...` path, not
+    `/rooms/<id>/...` like the room's own page - the first version of
+    this fix matched only `rooms` and silently missed the ID anyway.
+    All three attempts (the `active` red herring, the right diagnosis,
+    and the regex miss) are recorded in `DESIGN.md`'s Decision 2 rather
+    than only keeping the version that turned out fully correct.
+  - **Fixed two different rooms with the same name silently sharing one
+    folder.** Once the fix above got real downloads landing in
+    `Docusign Rooms/<Room Name>/` again, a live run showed 12 attempted
+    downloads but only 11 folders on disk. Cause: two distinct rooms
+    (different IDs) both named "Ponchak - Listing" - folder naming was
+    purely `cleanName(roomName)`, so both targeted the same folder, and
+    `conflictAction: "uniquify"` only dedupes filenames within a folder,
+    not the folder itself. Fixed with `computeFolderNames()`, which
+    builds a `roomId -> folderName` map once per run and appends the
+    room ID to the folder name only for rooms whose name actually
+    collides with another room's in that run, leaving everyone else
+    with a plain name. See `DESIGN.md`'s Decision 2 for the full
+    writeup.
+  - **Reworked the persistence model to stay crash-safe under
+    concurrency.** The existing resume logic saved `STATE.index` and
+    continued from it - safe under single-tab, where at most one room
+    was ever claimed-but-unfinished when a crash hit. With several tabs
+    claiming concurrently, `index` can already be past multiple rooms
+    that were claimed but never finished at the moment of a crash;
+    resuming from that saved index would have silently dropped them
+    instead of retrying them. Fixed by no longer persisting `index` at
+    all - `persistJob()` now saves only the full `queue` and whatever
+    `results` actually exist, and resume rebuilds the working list as
+    "queue filtered down to rooms with no result yet," which correctly
+    catches both "never reached" and "claimed but interrupted" rooms
+    without needing to tell them apart.
+  - **CSV upload now preserves already-downloaded rooms instead of
+    discarding their record.** Uploading a download report used to just
+    drop rows already marked `Downloaded` and queue the rest, which
+    meant the resumed run's own new report only covered whatever got
+    reprocessed - losing the record of everything that had already
+    succeeded. `parseUploadedCsv()` (replacing `roomsFromCsvRows()`) now
+    splits the file into rooms still needing work and `priorResults` for
+    the completed ones (full result data preserved: reason, filename,
+    download ID, timestamp), and `DS_START_QUEUE` seeds the new run's
+    results with them - so the final report, and the live progress
+    counter during the run, reflect the true complete picture instead of
+    restarting the count from zero against a shrunk total.
 
 ---
 

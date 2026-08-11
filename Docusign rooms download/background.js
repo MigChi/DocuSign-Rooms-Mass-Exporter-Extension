@@ -1,7 +1,7 @@
 /**************************************************************
  * Docusign Rooms Mass Exporter - background.js
- * Handles queue, worker tab, pause/resume/stop, filename routing,
- * and the final CSV report.
+ * Handles the worker-tab pool, pause/resume/stop, filename routing,
+ * chrome.storage.local persistence, and the final CSV report.
  *
  * Service workers and content scripts run in separate JS contexts -
  * background.js can't reference content/utils.js's globals the way
@@ -16,14 +16,44 @@
 
 importScripts("content/utils.js");
 
+// Hardcoded for this first concurrency pass - Roadmap item 3 (adaptive
+// worker-tab count based on measured speed) will make this a suggested,
+// tunable value instead of a constant. Kept small deliberately: prove
+// the concurrency-safe claiming logic works before scaling it up.
+const WORKER_TAB_COUNT = 3;
+
 const STATE = {
   running: false,
   paused: false,
   stopped: false,
+  // The full original room list for THIS run - immutable once set,
+  // never shrunk. createReport() walks this (not `pending`) so every
+  // room that was ever part of the run gets a row, whether or not it's
+  // been processed yet.
   queue: [],
+  // The working list workers actually claim from - only rooms without a
+  // recorded result yet. Rebuilt (not just resumed from a saved index)
+  // on startup after a crash - see the resume block at the bottom of
+  // this file for why an index alone isn't safe once multiple tabs can
+  // claim concurrently.
+  pending: [],
+  // Index into `pending` - the one piece of shared mutable state every
+  // worker touches. claimNextRoom() is the only function allowed to
+  // read or write it, and does so with zero `await` inside, which is
+  // what makes concurrent claiming safe without an explicit lock (see
+  // DESIGN.md Decision 3).
   index: 0,
-  workerTabId: null,
-  currentRoom: null,
+  workerTabIds: [],
+  // Keyed by tabId - was a single STATE.currentRoom object before
+  // concurrency, since only one room was ever in flight at a time. Now
+  // there's one entry per active worker tab.
+  currentRooms: {},
+  // roomId -> folder name, computed once by computeFolderNames() whenever
+  // STATE.queue is set. Not persisted - it's a pure function of the
+  // queue, cheap to rebuild on resume, so there's no reason to treat it
+  // as state that could drift out of sync with the queue it's derived
+  // from.
+  folderNames: new Map(),
   results: [],
   downloads: {},
   startedAt: null,
@@ -40,30 +70,81 @@ const PERSIST_KEY = "dsJob";
 // instead of losing it outright. Not called from broadcastStatus() (that
 // fires ~once/second while paused) to avoid writing on every tick -
 // only at points that actually change resumable state.
-async function persistJob(resumeIndex) {
+//
+// Deliberately does NOT persist `pending`/`index` - only `queue` (the
+// full list) and `results` (what's actually finished). Resume is
+// recomputed as "queue minus anything with a result" rather than
+// "continue from index N," which matters once concurrency is in play:
+// with several tabs claiming at once, `index` can already be past
+// several rooms that were claimed but never finished when a crash
+// happens. Resuming from a saved index would silently drop those rooms
+// instead of retrying them - recomputing from queue/results instead
+// means anything without a result, claimed-but-interrupted or never
+// reached at all, is naturally included again.
+// Never throws - both storage calls are wrapped so a failed write (quota,
+// or any other chrome.storage error) can't escape as a rejected promise.
+// This matters more than it did pre-concurrency: persistJob() is called
+// from inside processRoom()'s catch block, with no further try/catch
+// around it there - an uncaught throw there would propagate out of
+// processRoom(), out of runWorker(), and reject the Promise.all() in
+// runQueue(), which would skip every bit of cleanup after it (including
+// resetting STATE.running), leaving the run permanently stuck and any
+// still-running sibling workers orphaned. A missed checkpoint write is
+// a much smaller problem than that - worth degrading gracefully for.
+async function persistJob() {
   if (!STATE.queue.length) {
     await clearPersistedJob();
     return;
   }
 
-  await chrome.storage.local.set({
-    [PERSIST_KEY]: {
-      queue: STATE.queue,
-      // STATE.index still points at whichever room is currently being
-      // processed - the for loop in runQueue() only advances it at the
-      // next iteration boundary. Callers that just finished a room pass
-      // index + 1 explicitly so a resume continues with the next room
-      // instead of redundantly reprocessing the one that just succeeded.
-      index: resumeIndex ?? STATE.index,
-      results: STATE.results,
-      paused: STATE.paused,
-      startedAt: STATE.startedAt
-    }
-  });
+  try {
+    await chrome.storage.local.set({
+      [PERSIST_KEY]: {
+        queue: STATE.queue,
+        results: STATE.results,
+        paused: STATE.paused,
+        startedAt: STATE.startedAt
+      }
+    });
+  } catch (e) {
+    console.warn("persistJob: chrome.storage.local.set failed, continuing without this checkpoint", e);
+  }
 }
 
 async function clearPersistedJob() {
-  await chrome.storage.local.remove(PERSIST_KEY);
+  try {
+    await chrome.storage.local.remove(PERSIST_KEY);
+  } catch (e) {
+    console.warn("clearPersistedJob: chrome.storage.local.remove failed", e);
+  }
+}
+
+// Two different rooms can share the same cleaned name (confirmed live:
+// two distinct rooms, different IDs, both named "Ponchak - Listing") -
+// without disambiguation both would target the exact same folder path,
+// and while conflictAction: "uniquify" keeps both ZIPs safely inside it
+// under slightly different filenames, they'd be indistinguishable
+// without opening the folder and checking each file. Appends the room
+// ID only to names that actually collide within this run, so the
+// common case (no collision) keeps the plain, readable name. Computed
+// once whenever STATE.queue is set, not recomputed per-download.
+function computeFolderNames(queue) {
+  const nameCounts = new Map();
+
+  queue.forEach(room => {
+    const name = cleanName(room.roomName || `Docusign Room ${room.roomId}`);
+    nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+  });
+
+  const folderNames = new Map();
+
+  queue.forEach(room => {
+    const name = cleanName(room.roomName || `Docusign Room ${room.roomId}`);
+    const folderName = nameCounts.get(name) > 1 ? `${name} (${room.roomId})` : name;
+    folderNames.set(room.roomId, folderName);
+  });
+
+  return folderNames;
 }
 
 function nowStamp() {
@@ -85,8 +166,8 @@ async function broadcastStatus() {
       paused: STATE.paused,
       stopped: STATE.stopped,
       total: STATE.queue.length,
-      index: STATE.index,
-      currentRoom: STATE.currentRoom,
+      activeCount: Object.keys(STATE.currentRooms).length,
+      currentRooms: Object.values(STATE.currentRooms),
       results: STATE.results,
       startedAt: STATE.startedAt,
       finishedAt: STATE.finishedAt
@@ -114,20 +195,33 @@ async function waitForTabLoaded(tabId, timeoutMs = 60000) {
   return false;
 }
 
-async function ensureWorkerTab() {
-  if (STATE.workerTabId) {
-    const existing = await chrome.tabs.get(STATE.workerTabId).catch(() => null);
-    if (existing) return existing;
-    STATE.workerTabId = null;
+// Verifies any previously-known worker tabs are still alive (survives a
+// resume, where the old tab IDs from before a crash are almost
+// certainly gone) and creates however many more are needed to reach
+// `count`. Each one gets fully activated again on every room it
+// processes anyway (see processRoom()), so the `active` flag here just
+// controls which one is frontmost at creation time, not whether
+// downloads work - only the first is set active to avoid every new tab
+// popping to the front during startup.
+async function ensureWorkerTabs(count) {
+  const alive = [];
+
+  for (const id of STATE.workerTabIds) {
+    const tab = await chrome.tabs.get(id).catch(() => null);
+    if (tab) alive.push(id);
   }
 
-  const tab = await chrome.tabs.create({
-    url: "about:blank",
-    active: true
-  });
+  STATE.workerTabIds = alive;
 
-  STATE.workerTabId = tab.id;
-  return tab;
+  while (STATE.workerTabIds.length < count) {
+    const tab = await chrome.tabs.create({
+      url: "about:blank",
+      active: STATE.workerTabIds.length === 0
+    });
+    STATE.workerTabIds.push(tab.id);
+  }
+
+  return STATE.workerTabIds;
 }
 
 async function createReport() {
@@ -147,16 +241,12 @@ async function createReport() {
     ]
   ];
 
-  // Was STATE.results.forEach(...) - but results only gets an entry once
-  // a room is actually processed, so a run stopped partway through wrote
-  // a report covering only the rooms it reached. Everything still queued
-  // was silently absent, not "marked waiting" - so uploading that report
-  // back in as a resume could only ever pick up what had already been
-  // touched, never the rest of the original list. Walking STATE.queue
-  // instead (the full original list, restored as-is on a resumed run
-  // too) and looking up each room's result by roomId means every room
-  // gets a row - a real result if it has one, "Waiting" if it doesn't -
-  // so the CSV round-trips through Upload CSV as a genuine resume.
+  // results only gets an entry once a room is actually processed, so
+  // walking STATE.queue (the full original list) instead of
+  // STATE.results means every room gets a row - a real result if it has
+  // one, "Waiting" if it doesn't - so the CSV round-trips through
+  // Upload CSV as a genuine resume instead of silently omitting
+  // whatever the run never reached.
   const resultsByRoomId = new Map();
   STATE.results.forEach(r => resultsByRoomId.set(r.roomId, r));
 
@@ -192,6 +282,9 @@ async function createReport() {
 // Real signal for "this room's download has started," instead of guessing
 // with a flat sleep - chrome.downloads.onDeterminingFilename (below)
 // populates STATE.downloads the moment Chrome registers a new download.
+// Already scoped by roomId rather than tab, so this needed no changes
+// for concurrency - multiple simultaneous downloads across tabs each
+// just check for their own roomId's entry.
 async function waitForDownloadStart(roomId, timeoutMs = 15000) {
   const start = Date.now();
 
@@ -212,79 +305,86 @@ async function waitIfPausedOrStopped() {
   return !STATE.stopped;
 }
 
-async function runQueue() {
-  STATE.running = true;
-  STATE.stopped = false;
-  STATE.finishedAt = null;
-  // Not unconditional - a resumed run already has a real startedAt
-  // restored from storage, and overwriting it here would report the
-  // wrong total elapsed time and, more importantly, imply the job had
-  // no downtime when it may have sat interrupted for a while.
-  STATE.startedAt = STATE.startedAt || new Date().toISOString();
+// The only place STATE.index is read or written. Synchronous, no
+// `await` anywhere in this function - that's what makes it safe for
+// multiple workers to call concurrently without an explicit lock.
+// Chrome serializes all incoming extension messages through this one
+// single-threaded service worker, so two workers' calls can never
+// truly overlap; the only way a race could reappear is an `await`
+// between reading the pointer and advancing it, which this function
+// never has (see DESIGN.md Decision 3).
+function claimNextRoom() {
+  if (STATE.index >= STATE.pending.length) return null;
+  const room = STATE.pending[STATE.index];
+  STATE.index++;
+  return room;
+}
 
+// One room's full pipeline: navigate the given tab, wait for it to
+// load, hand off to the content script, wait for the download to
+// register. Returns false if the caller's loop should stop (Stop was
+// triggered), true to keep claiming. Each call has its own local
+// `result` - safe under concurrency since every worker calls this
+// independently with its own tabId, never sharing mutable local state.
+async function processRoom(tabId, room) {
+  const documentsUrl = room.documentsUrl;
+  const roomId = room.roomId || getRoomIdFromUrl(documentsUrl);
+  const guessedRoomName = cleanName(room.roomName || `Docusign Room ${roomId}`);
+
+  STATE.currentRooms[tabId] = { roomId, roomName: guessedRoomName, documentsUrl };
   await broadcastStatus();
 
-  const worker = await ensureWorkerTab();
+  let result = {
+    roomId,
+    roomName: guessedRoomName,
+    documentsUrl,
+    status: "Failed",
+    reason: "Not processed",
+    downloadedFilename: "",
+    downloadId: "",
+    time: new Date().toISOString()
+  };
 
-  // No initializer here (unlike a plain `for (STATE.index = 0; ...)`) -
-  // a fresh run's DS_START_QUEUE handler sets STATE.index = 0 itself
-  // before calling this, and a resumed run needs to continue from
-  // whatever index was restored from storage. Forcing it to 0 here would
-  // silently turn every resume into a full restart from the beginning.
-  for (; STATE.index < STATE.queue.length; STATE.index++) {
-    if (!(await waitIfPausedOrStopped())) break;
+  let keepGoing = true;
 
-    const room = STATE.queue[STATE.index];
-    const documentsUrl = room.documentsUrl;
-    const roomId = room.roomId || getRoomIdFromUrl(documentsUrl);
-    const guessedRoomName = cleanName(room.roomName || `Docusign Room ${roomId}`);
+  try {
+    // active: true - originally reverted from active: false on the theory
+    // that Chrome's "block multiple automatic downloads from a page"
+    // protection was dropping background-tab-triggered downloads (every
+    // room's DOM steps succeeded but onDeterminingFilename never fired).
+    // That turned out not to be the actual cause - the same symptom
+    // persisted after this revert too, and the real bug was
+    // findCurrentRoomForDownload()'s tab-ID matching (see the comment
+    // above that function, and DESIGN.md Decision 2's corrections for
+    // the full history). active: true is kept anyway since reverting it
+    // never showed any downside, but it should not be read as "the fix"
+    // for the folder-routing bug - it wasn't. The tab-switching
+    // thrashing across several concurrent tabs is a real, known cost of
+    // keeping it.
+    await chrome.tabs.update(tabId, { url: documentsUrl, active: true });
+    const loaded = await waitForTabLoaded(tabId, 60000);
 
-    STATE.currentRoom = {
-      roomId,
-      roomName: guessedRoomName,
-      documentsUrl
-    };
-
-    await broadcastStatus();
-
-    let result = {
-      roomId,
-      roomName: guessedRoomName,
-      documentsUrl,
-      status: "Failed",
-      reason: "Not processed",
-      downloadedFilename: "",
-      downloadId: "",
-      time: new Date().toISOString()
-    };
-
-    try {
-      await chrome.tabs.update(worker.id, { url: documentsUrl, active: true });
-      const loaded = await waitForTabLoaded(worker.id, 60000);
-
-      // Stop/Pause were previously only checked once per room, at the top
-      // of this loop - clicking Stop mid-room did nothing until that
-      // room's entire pipeline finished (up to ~75s: tab load + the
-      // content script's own internal waits + the download-start wait).
-      // Re-checking here (the single longest wait) makes Stop/Pause take
-      // effect right after the page load instead of only between rooms.
-      if (!(await waitIfPausedOrStopped())) break;
-
-      if (!loaded) {
-        result.reason = "Room Documents page did not finish loading";
-        STATE.results.push(result);
-        await persistJob(STATE.index + 1);
-        await broadcastStatus();
-        continue;
-      }
-
-      // Only a short buffer, not a "wait for the page to be ready" delay -
-      // processCurrentRoom() already polls for [data-qa="group-name"] itself
-      // (up to 45s). This just covers the gap between document_idle firing
-      // and the content script's onMessage listener actually being attached.
+    // Stop/Pause were previously only checked once per room, at the top
+    // of the loop - clicking Stop mid-room did nothing until that
+    // room's entire pipeline finished. Re-checking here (the single
+    // longest wait) makes Stop/Pause take effect right after the page
+    // load instead of only between rooms.
+    if (!(await waitIfPausedOrStopped())) {
+      keepGoing = false;
+    } else if (!loaded) {
+      result.reason = "Room Documents page did not finish loading";
+      STATE.results.push(result);
+      await persistJob();
+      await broadcastStatus();
+    } else {
+      // Only a short buffer, not a "wait for the page to be ready"
+      // delay - processCurrentRoom() already polls for
+      // [data-qa="group-name"] itself (up to 45s). This just covers the
+      // gap between document_idle firing and the content script's
+      // onMessage listener actually being attached.
       await sleep(500);
 
-      const response = await chrome.tabs.sendMessage(worker.id, {
+      const response = await chrome.tabs.sendMessage(tabId, {
         type: "DS_PROCESS_ROOM",
         roomId,
         documentsUrl
@@ -296,12 +396,18 @@ async function runQueue() {
       result.status = response?.ok ? "Success/Attempted" : "Failed";
       result.reason = response?.reason || (response?.ok ? "Download click attempted" : "Unknown failure");
       result.time = new Date().toISOString();
-
-      const expectedFilename = `Docusign Rooms/${finalRoomName}/${finalRoomName}.zip`;
-      result.downloadedFilename = expectedFilename;
+      // Uses the precomputed, collision-disambiguated folder name (keyed
+      // by roomId), not finalRoomName - onDeterminingFilename below only
+      // ever sees currentRoom.roomName (set from guessedRoomName at
+      // claim time, not this possibly-refreshed finalRoomName), so using
+      // the same source here keeps the reported filename matching what
+      // Chrome actually creates instead of drifting if the live page's
+      // room name differs slightly from what was in the original scan.
+      const folderName = STATE.folderNames.get(roomId) || finalRoomName;
+      result.downloadedFilename = `Docusign Rooms/${folderName}/${folderName}.zip`;
 
       STATE.results.push(result);
-      await persistJob(STATE.index + 1);
+      await persistJob();
 
       // Real signal instead of a flat guess: wait for
       // chrome.downloads.onDeterminingFilename to actually fire for this
@@ -312,34 +418,78 @@ async function runQueue() {
 
       await broadcastStatus();
 
-      if (STATE.stopped) break;
-    } catch (error) {
-      result.reason = error.message || "Unknown error";
-      result.time = new Date().toISOString();
-      STATE.results.push(result);
-      await persistJob(STATE.index + 1);
-      await broadcastStatus();
+      if (STATE.stopped) keepGoing = false;
     }
+  } catch (error) {
+    result.reason = error.message || "Unknown error";
+    result.time = new Date().toISOString();
+    STATE.results.push(result);
+    await persistJob();
+    await broadcastStatus();
+  }
+
+  delete STATE.currentRooms[tabId];
+  return keepGoing;
+}
+
+// One worker's whole lifetime: claim, process, repeat, until the
+// pending list is exhausted or Stop/a claim failure ends it. Multiple
+// of these run concurrently (one per worker tab) via Promise.all in
+// runQueue() - each is a fully independent loop, coordinated only
+// through claimNextRoom()'s shared, synchronous pointer.
+async function runWorker(tabId) {
+  while (true) {
+    if (!(await waitIfPausedOrStopped())) break;
+
+    const room = claimNextRoom();
+    if (!room) break;
+
+    const keepGoing = await processRoom(tabId, room);
+    if (!keepGoing) break;
 
     await sleep(500);
   }
 
-  STATE.running = false;
-  STATE.currentRoom = null;
+  delete STATE.currentRooms[tabId];
+}
 
-  // Covers both ways this loop can end - running out of rooms and an
-  // explicit Stop both fall through to here (break only exits the for
-  // loop, not this function), so one call handles both: nothing left to
-  // resume either way.
+async function runQueue() {
+  STATE.running = true;
+  STATE.stopped = false;
+  STATE.finishedAt = null;
+  // Not unconditional - a resumed run already has a real startedAt
+  // restored from storage, and overwriting it here would report the
+  // wrong total elapsed time and, more importantly, imply the job had
+  // no downtime when it may have sat interrupted for a while.
+  STATE.startedAt = STATE.startedAt || new Date().toISOString();
+  STATE.currentRooms = {};
+
+  await broadcastStatus();
+
+  // Never more tabs than there's work for - a 1-2 room run (or the tail
+  // end of a larger one) doesn't need WORKER_TAB_COUNT tabs sitting open
+  // with nothing to claim.
+  const tabCount = Math.min(WORKER_TAB_COUNT, STATE.pending.length) || 1;
+  const tabIds = await ensureWorkerTabs(tabCount);
+
+  await Promise.all(tabIds.map(id => runWorker(id)));
+
+  STATE.running = false;
+  STATE.currentRooms = {};
+
+  // Covers both ways the workers can all stop - running out of pending
+  // rooms and an explicit Stop both end here (Promise.all only resolves
+  // once every worker's loop has exited), so one call handles both:
+  // nothing left to resume either way.
   await clearPersistedJob();
 
   await createReport().catch(() => "");
   await broadcastStatus();
 
   try {
-    if (STATE.workerTabId) {
-      // Keep the tab open so the user can see where it ended.
-      await chrome.tabs.update(STATE.workerTabId, { active: true }).catch(() => {});
+    if (STATE.workerTabIds[0]) {
+      // Keep one tab focused so the user can see where it ended.
+      await chrome.tabs.update(STATE.workerTabIds[0], { active: true }).catch(() => {});
     }
   } catch (e) {}
 }
@@ -353,6 +503,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: false, reason: "A download run is already active." });
         return;
       }
+      // Reserved synchronously, before the first `await` below - the
+      // actual STATE.running = true inside runQueue() happens too late
+      // to close the race: a second DS_START_QUEUE (or the startup
+      // resume block below, which has its own await before it gets
+      // here) arriving while this handler is mid-await would otherwise
+      // also pass the guard above and end up running two worker pools
+      // concurrently over the same STATE.pending.
+      STATE.running = true;
 
       const rooms = Array.isArray(message.rooms) ? message.rooms : [];
       const normalized = rooms
@@ -368,12 +526,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         })
         .filter(Boolean);
 
-      STATE.queue = normalized;
+      // Optional: when a Download Report CSV is uploaded, content.js
+      // already filters out rows marked "Downloaded" before sending
+      // `rooms` (only what still needs work) - but sending nothing else
+      // would mean this run's own final report only covers that subset,
+      // losing the record of everything already completed before the
+      // interruption. priorResults carries those already-done rows back
+      // in so they're seeded straight into STATE.results and STATE.queue,
+      // giving the resumed run's report (and its live progress counter)
+      // the true, complete picture instead of restarting the count from
+      // zero against a shrunk total.
+      const priorResults = Array.isArray(message.priorResults) ? message.priorResults : [];
+      const priorRoomsForQueue = priorResults.map(r => ({
+        roomId: r.roomId,
+        roomName: r.roomName,
+        documentsUrl: r.documentsUrl
+      }));
+
+      STATE.queue = [...priorRoomsForQueue, ...normalized];
+      STATE.folderNames = computeFolderNames(STATE.queue);
+      STATE.pending = normalized;
       STATE.index = 0;
-      STATE.results = [];
+      STATE.results = priorResults.slice();
       STATE.paused = false;
       STATE.stopped = false;
-      STATE.currentRoom = null;
+      STATE.currentRooms = {};
       // Without this, a stale entry from a previous run (e.g. Stop, then
       // Start again over a list that includes an already-processed room)
       // could make waitForDownloadStart() match against that old download
@@ -426,8 +603,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           paused: STATE.paused,
           stopped: STATE.stopped,
           total: STATE.queue.length,
-          index: STATE.index,
-          currentRoom: STATE.currentRoom,
+          activeCount: Object.keys(STATE.currentRooms).length,
+          currentRooms: Object.values(STATE.currentRooms),
           results: STATE.results,
           startedAt: STATE.startedAt,
           finishedAt: STATE.finishedAt
@@ -473,8 +650,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === "DS_ROOM_PAGE_INFO") {
       const tabId = sender.tab?.id;
-      if (tabId === STATE.workerTabId && STATE.currentRoom) {
-        STATE.currentRoom.roomName = cleanName(message.roomName || STATE.currentRoom.roomName);
+      const currentRoom = STATE.currentRooms[tabId];
+      if (currentRoom) {
+        currentRoom.roomName = cleanName(message.roomName || currentRoom.roomName);
       }
       sendResponse({ ok: true });
       return;
@@ -484,23 +662,79 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
-  const isRelevantTab = downloadItem.tabId === STATE.workerTabId;
-  const looksLikeZip = String(downloadItem.filename || "").toLowerCase().endsWith(".zip");
-  const looksLikeDocusign =
-    String(downloadItem.url || "").includes("docusign") ||
-    String(downloadItem.finalUrl || "").includes("docusign") ||
-    String(downloadItem.referrer || "").includes("docusign");
+// The download-confirmation form on a room's Documents page is
+// `<form id="formDownloadDocuments" method="post" target="_blank" ...>`
+// (confirmed via captured markup) - submitting it opens a *new*
+// browsing context to receive the response, so the resulting
+// DownloadItem's tabId belongs to that new (often instantly-closed) tab,
+// never the worker tab that actually triggered it. Looking up
+// STATE.currentRooms by downloadItem.tabId alone therefore never
+// matches. Falls back to parsing a room ID out of the download's own
+// referrer/url/finalUrl (which points back to the room's Documents page,
+// .../rooms/<id>/documents) and matching that against whichever rooms
+// are currently in flight - correct regardless of which tab Chrome
+// attributes the download to.
+function findCurrentRoomForDownload(downloadItem) {
+  const byTab = STATE.currentRooms[downloadItem.tabId];
+  if (byTab) return byTab;
 
-  if (!STATE.currentRoom || (!isRelevantTab && !looksLikeDocusign && !looksLikeZip)) {
+  // Confirmed via a live-captured DownloadItem: referrer is empty for
+  // these downloads (the target="_blank" navigation apparently doesn't
+  // carry one over), and the actual download URL uses DocuSign's
+  // internal "transaction" path, not "rooms" -
+  // .../transaction/<id>/documents/download - even though the room's
+  // own page and documentsUrl use .../rooms/<id>/documents. Both are the
+  // same numeric ID under two different path segments, so this matches
+  // either. Matching only "rooms" (the first attempt) silently missed
+  // every real download, since the URL that actually carries the ID
+  // never uses that word at all.
+  const candidates = [downloadItem.referrer, downloadItem.url, downloadItem.finalUrl];
+
+  for (const candidate of candidates) {
+    const match = String(candidate || "").match(/\/(?:rooms|transaction)\/(\d+)/i);
+    if (!match) continue;
+
+    const roomId = match[1];
+    const found = Object.values(STATE.currentRooms).find(r => r.roomId === roomId);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
+  const currentRoom = findCurrentRoomForDownload(downloadItem);
+
+  if (!currentRoom) {
+    // Visible in the SERVICE WORKER console (chrome://extensions -> the
+    // "service worker" link), not the page console - if room matching
+    // is still failing after the referrer/url fallback above, this shows
+    // exactly what fields a real DownloadItem actually has to match
+    // against, instead of guessing again from an empty Download ID column.
+    console.warn("[DSBD] Unmatched download - no current room found:", {
+      tabId: downloadItem.tabId,
+      url: downloadItem.url,
+      finalUrl: downloadItem.finalUrl,
+      referrer: downloadItem.referrer,
+      filename: downloadItem.filename,
+      currentRoomsInFlight: Object.values(STATE.currentRooms)
+    });
     return;
   }
 
-  const roomName = cleanName(STATE.currentRoom.roomName || `Docusign Room ${STATE.currentRoom.roomId}`);
-  const filename = `Docusign Rooms/${roomName}/${roomName}.zip`;
+  const roomName = cleanName(currentRoom.roomName || `Docusign Room ${currentRoom.roomId}`);
+  // Two different rooms can share the same display name (e.g. two
+  // "Ponchak - Listing" rooms with different IDs) - cleanName() alone
+  // would send both into the same folder, silently merging their
+  // downloads. STATE.folderNames (built once per run by
+  // computeFolderNames()) appends the room ID only where a collision
+  // actually exists in this run's queue, so most rooms still get a
+  // plain, readable folder name.
+  const folderName = STATE.folderNames.get(currentRoom.roomId) || roomName;
+  const filename = `Docusign Rooms/${folderName}/${folderName}.zip`;
 
   STATE.downloads[downloadItem.id] = {
-    roomId: STATE.currentRoom.roomId,
+    roomId: currentRoom.roomId,
     roomName,
     filename,
     startedAt: new Date().toISOString()
@@ -564,32 +798,46 @@ chrome.downloads.onChanged.addListener(delta => {
 // when this instance's in-memory STATE was lost, instead of leaving it
 // stranded with no way to continue short of rescanning from scratch.
 //
+// Rebuilds `pending` as "queue minus anything with a result" rather than
+// resuming from a saved index - see persistJob()'s comment for why that
+// matters once several tabs can be claiming rooms concurrently: an index
+// alone can't tell the difference between "finished" and "claimed by some
+// tab right before the crash," and resuming from it would silently drop
+// the latter instead of retrying them.
+//
 // Known limitation: this only fires once something wakes the worker -
 // there's no periodic self-wake (no chrome.alarms) here, so resume isn't
 // instant if the browser sits fully closed or no matching tab gets
 // opened. In practice the panel's own DS_GET_STATUS call on load (every
 // Docusign Rooms page) is what wakes it, the next time the user checks in.
-//
-// Also known: if the crash lands mid-room - after the download click but
-// before this room's result gets persisted - the resumed run reprocesses
-// that same room from its start. `conflictAction: "uniquify"` means a
-// resulting duplicate gets its own folder rather than overwriting
-// anything, so the cost is a possible extra ZIP, not lost/corrupted data.
 (async () => {
   const stored = await chrome.storage.local.get(PERSIST_KEY);
   const job = stored[PERSIST_KEY];
 
-  if (!job || !job.queue?.length || job.index >= job.queue.length) return;
+  if (!job || !job.queue?.length) return;
+
+  const completedIds = new Set((job.results || []).map(r => r.roomId));
+  const pending = job.queue.filter(r => !completedIds.has(r.roomId));
+
+  if (!pending.length) return;
+
+  // A DS_START_QUEUE could have arrived and already reserved STATE.running
+  // while this block was awaiting chrome.storage.local.get() above - same
+  // race as the one closed in the DS_START_QUEUE handler, mirrored here.
+  if (STATE.running) return;
+  STATE.running = true;
 
   STATE.queue = job.queue;
-  STATE.index = job.index;
+  STATE.folderNames = computeFolderNames(STATE.queue);
+  STATE.pending = pending;
+  STATE.index = 0;
   STATE.results = job.results || [];
   STATE.paused = !!job.paused;
   STATE.startedAt = job.startedAt || null;
   STATE.stopped = false;
-  STATE.currentRoom = null;
+  STATE.currentRooms = {};
   STATE.downloads = {};
-  STATE.workerTabId = null;
+  STATE.workerTabIds = [];
 
   runQueue();
 })();

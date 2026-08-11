@@ -404,8 +404,10 @@
     // handler below (which skips scanning entirely) - confirms with the
     // user, then hands the room list to background.js. Pulled out once
     // this became the second caller, rather than duplicating the same
-    // confirm+sendMessage flow twice.
-    function beginRun(rooms, confirmMessage) {
+    // confirm+sendMessage flow twice. priorResults (only non-empty for a
+    // resumed CSV upload) is forwarded as-is so background.js can seed
+    // the new run's results/report with rooms already known to be done.
+    function beginRun(rooms, confirmMessage, priorResults = []) {
       if (!rooms.length) {
         setStatus("No rooms to run - the list is empty.");
         return;
@@ -419,11 +421,12 @@
       }
 
       setStatus(`Starting ${rooms.length} rooms...`);
-      progressEl.textContent = `0 / ${rooms.length}`;
+      progressEl.textContent = `${priorResults.length} / ${rooms.length + priorResults.length}`;
 
       chrome.runtime.sendMessage({
         type: "DS_START_QUEUE",
-        rooms
+        rooms,
+        priorResults
       }, response => {
         if (!response?.ok) {
           setStatus(response?.reason || "Could not start.");
@@ -431,34 +434,62 @@
       });
     }
 
-    // Converts an uploaded CSV's parsed rows into {roomId, roomName,
-    // documentsUrl} objects, using the header row to find columns rather
-    // than assuming a fixed layout - works for either CSV this extension
-    // exports. If a "Status" column is present (the download report,
-    // not the plain scan list), rows already marked "Downloaded" are
-    // dropped - this is what makes uploading a report a resume rather
-    // than a blind full re-run, without needing chrome.storage.local at
-    // all (which doesn't survive a cleared profile or a different
-    // computer - a CSV file on disk does).
-    function roomsFromCsvRows(rows) {
-      if (rows.length < 2) return [];
+    // Converts an uploaded CSV's parsed rows into two lists, using the
+    // header row to find columns rather than assuming a fixed layout -
+    // works for either CSV this extension exports:
+    //   - rooms: still need processing (everything on a plain scan
+    //     list, or anything not marked "Downloaded" on a download report)
+    //   - priorResults: rows already marked "Downloaded" on a download
+    //     report, carried over in full (not just dropped) so a resumed
+    //     run's own report still shows them instead of only covering
+    //     whatever gets reprocessed. This is what makes uploading a
+    //     report a genuine resume rather than a blind full re-run,
+    //     without needing chrome.storage.local at all (which doesn't
+    //     survive a cleared profile or a different computer - a CSV
+    //     file on disk does).
+    function parseUploadedCsv(rows) {
+      if (rows.length < 2) return { rooms: [], priorResults: [] };
 
       const header = rows[0];
       const nameIdx = header.indexOf("Room Name");
       const idIdx = header.indexOf("Room ID");
       const urlIdx = header.indexOf("Documents URL");
       const statusIdx = header.indexOf("Status");
+      const reasonIdx = header.indexOf("Reason");
+      const filenameIdx = header.indexOf("Downloaded Filename");
+      const downloadIdIdx = header.indexOf("Download ID");
+      const timeIdx = header.indexOf("Time");
 
-      if (urlIdx === -1) return [];
+      if (urlIdx === -1) return { rooms: [], priorResults: [] };
 
-      return rows.slice(1)
-        .filter(r => statusIdx === -1 || r[statusIdx] !== "Downloaded")
-        .map(r => ({
-          roomId: idIdx === -1 ? "" : (r[idIdx] || ""),
-          roomName: nameIdx === -1 ? "" : (r[nameIdx] || ""),
-          documentsUrl: r[urlIdx] || ""
-        }))
-        .filter(r => r.documentsUrl);
+      const rooms = [];
+      const priorResults = [];
+
+      rows.slice(1).forEach(r => {
+        const documentsUrl = r[urlIdx] || "";
+        if (!documentsUrl) return;
+
+        const roomId = idIdx === -1 ? "" : (r[idIdx] || "");
+        const roomName = nameIdx === -1 ? "" : (r[nameIdx] || "");
+        const status = statusIdx === -1 ? "" : (r[statusIdx] || "");
+
+        if (status === "Downloaded") {
+          priorResults.push({
+            roomId,
+            roomName,
+            documentsUrl,
+            status,
+            reason: reasonIdx === -1 ? "" : (r[reasonIdx] || ""),
+            downloadedFilename: filenameIdx === -1 ? "" : (r[filenameIdx] || ""),
+            downloadId: downloadIdIdx === -1 ? "" : (r[downloadIdIdx] || ""),
+            time: timeIdx === -1 ? "" : (r[timeIdx] || "")
+          });
+        } else {
+          rooms.push({ roomId, roomName, documentsUrl });
+        }
+      });
+
+      return { rooms, priorResults };
     }
 
     const csvInput = panel.querySelector("#dsbd-csv-input");
@@ -476,19 +507,23 @@
 
       const text = await file.text();
       const rows = parseCsv(text);
-      const rooms = roomsFromCsvRows(rows);
+      const { rooms, priorResults } = parseUploadedCsv(rows);
 
       if (!rooms.length) {
-        setStatus("No usable rooms found in that CSV. Expected a Scan List or Download Report exported by this extension.");
+        setStatus(priorResults.length
+          ? `Everything in ${file.name} is already marked Downloaded - nothing to run.`
+          : "No usable rooms found in that CSV. Expected a Scan List or Download Report exported by this extension.");
         return;
       }
 
-      const skipped = rows.length - 1 - rooms.length;
-      const skippedNote = skipped > 0 ? ` (${skipped} already-downloaded row${skipped === 1 ? "" : "s"} skipped)` : "";
+      const priorNote = priorResults.length > 0
+        ? ` (${priorResults.length} already-downloaded room${priorResults.length === 1 ? "" : "s"} preserved, not re-run)`
+        : "";
 
       beginRun(
         rooms,
-        `Found ${rooms.length} rooms in ${file.name}${skippedNote}.\n\nThis will open a worker tab, download each room's documents, save each ZIP inside its own room folder, and create a CSV report when done. No scan needed - these rooms come straight from the file.\n\nChrome may ask you to allow multiple downloads.\n\nContinue?`
+        `Found ${rooms.length} rooms to process in ${file.name}${priorNote}.\n\nThis will open worker tabs, download each room's documents, save each ZIP inside its own room folder, and create a CSV report when done. No scan needed - these rooms come straight from the file.\n\nChrome may ask you to allow multiple downloads.\n\nContinue?`,
+        priorResults
       );
     });
 
@@ -549,7 +584,14 @@
       if (isRunning) {
         const confirmed = confirm("Stop after the current step?");
         if (!confirmed) return;
-        chrome.runtime.sendMessage({ type: "DS_STOP" });
+        // .catch(): if this panel is a stale copy left over from before
+        // the extension was last reloaded (a real, expected scenario -
+        // reloading the extension orphans any content script still
+        // injected in an already-open tab), sendMessage() rejects with
+        // "Extension context invalidated" - harmless, but uncaught
+        // otherwise, since this call has no callback argument to receive
+        // a normal error through.
+        chrome.runtime.sendMessage({ type: "DS_STOP" }).catch(() => {});
         setStatus("Stopping...");
         return;
       }
@@ -567,19 +609,29 @@
 
       beginRun(
         rooms,
-        `Found ${rooms.length} rooms.\n\nThis will open a worker tab, download each room's documents, save each ZIP inside its own room folder, and create a CSV report when done.\n\nChrome may ask you to allow multiple downloads.\n\nContinue?`
+        `Found ${rooms.length} rooms.\n\nThis will open worker tabs, download each room's documents, save each ZIP inside its own room folder, and create a CSV report when done.\n\nChrome may ask you to allow multiple downloads.\n\nContinue?`
       );
     });
 
     pauseResumeBtn.addEventListener("click", () => {
       if (isPaused) {
-        chrome.runtime.sendMessage({ type: "DS_RESUME" });
+        chrome.runtime.sendMessage({ type: "DS_RESUME" }).catch(() => {});
         setStatus("Resuming...");
       } else {
-        chrome.runtime.sendMessage({ type: "DS_PAUSE" });
+        chrome.runtime.sendMessage({ type: "DS_PAUSE" }).catch(() => {});
         setStatus("Pausing after current step...");
       }
     });
+
+    // Multiple rooms can be active at once now (one per worker tab) -
+    // s.currentRooms is an array, not the single s.currentRoom object
+    // from before concurrency. Shared by both status-update sites below.
+    function runningStatusText(s) {
+      const rooms = s.currentRooms || [];
+      if (!rooms.length) return "Running...";
+      const names = rooms.map(r => r.roomName || r.roomId).join(", ");
+      return `Running: ${rooms.length} active (${names})`;
+    }
 
     chrome.runtime.onMessage.addListener(message => {
       if (!message || message.type !== "DS_BULK_STATUS") return;
@@ -594,7 +646,7 @@
       // firing a second time on the room that just finished, jumping the
       // counter one room ahead of reality until the next one actually
       // started. A strictly monotonic "completed" count doesn't have
-      // that ambiguity; "Running: <room>" below already shows what's
+      // that ambiguity; "Running: <rooms>" below already shows what's
       // currently in flight.
       progressEl.textContent = `${s.results?.length || 0} / ${s.total || 0}`;
 
@@ -602,12 +654,10 @@
 
       if (s.paused) {
         setStatus("Paused.");
-      } else if (s.running && s.currentRoom) {
-        setStatus(`Running: ${s.currentRoom.roomName || s.currentRoom.roomId}`);
+      } else if (s.running) {
+        setStatus(runningStatusText(s));
       } else if (s.finishedAt) {
         setStatus("Done. CSV report saved in Downloads / Docusign Rooms / _Download Reports.");
-      } else if (s.running) {
-        setStatus("Running...");
       }
     });
 
@@ -616,7 +666,7 @@
       if (!s) return;
       progressEl.textContent = `${s.results?.length || 0} / ${s.total || 0}`;
       updateButtonStates(s);
-      if (s.running && s.currentRoom) setStatus(`Running: ${s.currentRoom.roomName || s.currentRoom.roomId}`);
+      if (s.running) setStatus(runningStatusText(s));
       else if (s.paused) setStatus("Paused.");
     });
   }

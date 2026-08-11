@@ -1,3 +1,17 @@
+/**************************************************************
+ * popup.js - UNUSED, kept for reference only.
+ * Leftover from the original 1.0.2 toolbar popup. manifest.json no
+ * longer declares action.default_popup, so this file is never loaded
+ * by the extension - the floating in-page panel in content.js is the
+ * only control surface. Also stale relative to the current message
+ * protocol: DS_COLLECT_AND_START below has no listener anywhere in the
+ * current codebase (content.js only handles DS_PROCESS_ROOM), and
+ * DS_GET_STATUS's response shape here (s.index, s.currentRoom) predates
+ * the multi-tab rework - background.js now reports s.results.length and
+ * s.currentRooms (plural). See README.md's Version 2.0 history and
+ * Project Structure table for why this was kept instead of deleted.
+ **************************************************************/
+
 function setStatus(text) {
   document.getElementById("status").textContent = text;
 }
