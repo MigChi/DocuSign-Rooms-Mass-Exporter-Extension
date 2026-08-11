@@ -59,6 +59,10 @@ documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms
   reflects the run's live status (including which rooms are actively
   processing across all worker tabs) regardless of which tab is doing
   the processing.
+- **Per-worker-tab status breakdown** — the panel shows a live row per
+  worker tab ("Worker 1: Room Name · 12s", "Worker 2: idle") plus a
+  results-by-outcome tally (Downloaded / Failed / Errors / Waiting)
+  updated as the run progresses, instead of only an aggregate count.
 
 ## Install
 
@@ -95,6 +99,23 @@ documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms
 The Download Report is also the file to re-upload via "Upload CSV to
 Run/Resume" if a run gets interrupted.
 
+## Testing
+
+Automated tests cover the project's pure logic (string/URL/CSV helpers,
+queue claiming, folder-name collision handling, download-to-room
+matching) — not the DOM-driving/browser-orchestration code, which is
+still verified by live testing against a real account, as it always has
+been. See `DESIGN.md`'s [Decision 13](Docusign%20rooms%20download/Claude%20Code/DESIGN.md#decision-13-automated-testing-strategy)
+for the reasoning behind what is and isn't covered this way.
+
+Requires [Node.js](https://nodejs.org) (v18+; built with v24 LTS) — no
+other dependencies, no `npm install` needed:
+
+```
+cd "Docusign rooms download"
+npm test
+```
+
 ## Project structure
 
 | File | Responsibility |
@@ -106,6 +127,10 @@ Run/Resume" if a run gets interrupted.
 | `content/room.js` | Room-page helpers (currently just reading the room name from its Details page) |
 | `content.js` | The floating panel UI, and the single-room download pipeline (Select All → Bulk Download → confirm → wait) |
 | `popup.html` / `popup.js` | Leftover from the original 1.0.2 toolbar popup — unused since the in-page panel replaced it; not referenced by `manifest.json`, kept for reference only |
+| `package.json` | Just a `test` script (`node --test`) — no dependencies, not part of the loaded extension, exists purely so `npm test` works |
+| `tests/utils.test.js` | Tests for `content/utils.js`'s pure helpers |
+| `tests/background.test.js` | Tests for `background.js`'s pure/`STATE`-driven logic, including regression tests for two of this session's real live-testing bugs |
+| `tests/helpers/` | Minimal `chrome.*` stub and a fresh-module-load helper, both test-only — see `DESIGN.md`'s Decision 13 |
 | `Claude Code/DESIGN.md` | The full architecture and decision-by-decision case study |
 | `Claude Code/CONVERSATION_LOG.txt` | Raw transcript of the planning conversation that produced `DESIGN.md` — kept verbatim as a supplementary record, not maintained going forward the way `DESIGN.md`/this README are |
 
@@ -139,15 +164,21 @@ than silently rewritten into the original text.
 Multi-tab processing (Decisions 2 & 3 in `DESIGN.md`) is done — a fixed
 pool of worker tabs claim rooms from a shared queue concurrently, with
 persistence reworked to stay crash-safe under concurrency (see `DESIGN.md`
-Decision 6's corrections). Two items remain, in this order:
+Decision 6's corrections). The panel now shows a live per-worker-tab
+breakdown and a results-by-outcome tally (`DESIGN.md` Decision 14), and
+a Node-based automated test suite covers the project's pure logic
+(Decision 13). One item remains:
 
-1. **Richer per-room live status in the panel** — right now the panel
-   shows how many rooms are active and which ones, not a full
-   queued/in-progress/done/failed/empty breakdown per room.
-2. **Adaptive worker-tab count** — a suggested concurrency level based
+1. **Adaptive worker-tab count** — a suggested concurrency level based
    on measured time-per-room, within safe min/max bounds, replacing the
    currently-hardcoded `WORKER_TAB_COUNT`. Real timing data to build
    this against now exists, since concurrent processing is live.
+
+Also open, not yet scoped as a real feature: a full per-*room* (not just
+per-worker-tab) status breakdown covering all 10,000+ rooms in a run
+would need pagination/virtualization to stay usable in a 320px panel —
+a bigger feature than the per-worker breakdown above, and not currently
+planned.
 
 ## Development Process
 
@@ -178,9 +209,11 @@ summary of it, not a second copy that can drift.
 | 0. Baseline audit | Understand the original 1.0.2 extension before changing anything | Done | Runtime for 10,000 rooms projected to 55-70 hours (single tab, ~11.5s of fixed sleeps per room) — the number that motivated the whole rewrite. Toolbar popup's Start button was already silently broken (`DS_COLLECT_AND_START` had no listener). |
 | 1. Scanning, date-range filtering, list export | Read the Rooms list reliably and cheaply, before touching any download logic | Done | Two DOM-shape heuristics (`getRoomCardsAndLinks`, `findBestScrollContainer`) replaced with confirmed `data-qa` selectors. Sort order assumed "oldest first" turned out not to be a fixed account setting — a session found it set to "Newest," which would've silently returned zero rooms; fixed with a runtime check that refuses to scan otherwise. Scanning only worked in List View, not Grid View, until `ensureListView()` was added. A hand-wired `manifest.json` bug (`"utils.js"` instead of `"content/utils.js"`) would've failed to load every content script. |
 | 2. Single-room download pipeline, event-driven waits | Replace fixed sleeps with real signals; get one room's Select All → Download → confirm flow fully reliable | Done | The real blocker wasn't a selector — `checkbox.click()` on Select All was silently reverted by the page (untrusted synthetic click), so the bulk-actions toolbar never appeared; fixed by clicking the associated `<label>` instead, verified against real DOM state rather than assumed. The final download confirmation button had no `data-qa` at all (an older jQuery modal bolted onto the React UI); fixed with a selector scoped to the modal's own form ID. |
-| 3. Panel UI + Start/Stop/Pause/Resume | A single always-visible control surface reflecting real state | Done for the current two-toggle-button design; a richer per-room status breakdown is still open (see Roadmap) | The original toolbar popup was removed entirely rather than fixed, since the in-page panel already worked and having two half-working control surfaces was worse than one working one. |
+| 3. Panel UI + Start/Stop/Pause/Resume | A single always-visible control surface reflecting real state | Done, later extended with a per-worker-tab breakdown (phase 5b) | The original toolbar popup was removed entirely rather than fixed, since the in-page panel already worked and having two half-working control surfaces was worse than one working one. |
 | 4. Persistence & resume | Survive Chrome killing the (deliberately ephemeral) MV3 service worker mid-run | Done, then reworked in phase 5 | Early version resumed from a saved queue *index* — safe only because single-tab guaranteed at most one claimed-but-unfinished room at a time. The CSV-upload resume path initially dropped already-`Downloaded` rows instead of preserving them, losing the record of everything already completed. The download report itself only covered rooms actually reached, silently omitting anything still queued when a run stopped. |
 | 5. Multi-tab worker pool (concurrency) | Multiple tabs claiming from one shared queue, without a mutex | Done, fixed tab count | The index-based resume from phase 4 became actively unsafe under concurrency (could silently drop claimed-but-unfinished rooms) — replaced with "resume = queue minus anything with a result." A synchronous "already running" guard had a race window an `await` earlier had left open. Downloads stopped registering at all under concurrency; first suspected `active: false` on worker tabs, but the same symptom persisted after reverting it — the real cause was worker tabs' downloads opening in a `target="_blank"` browsing context, so `DownloadItem.tabId` never matched the tab that triggered it. The first fix's regex matched `/rooms/<id>/` but the real download URL used DocuSign's internal `/transaction/<id>/` path. Once folder routing worked again, two distinct rooms sharing the same display name were found silently merging into one folder. |
+| 5a. Automated testing | Cover the project's pure logic with a real test suite, without pretending DOM/timing-heavy code can be unit tested | Done — 24 tests, `node:test` | This machine had no Node/npm/Homebrew installed at all; installed Node's official `.pkg` via a GUI admin-privileges prompt (`osascript ... with administrator privileges`) since this environment's shell has no interactive `sudo`. `content/utils.js` and `background.js` were never written to be `require()`-able (plain globals / `importScripts()`, by design) - solved with guarded export tails that are no-ops in the real browser/service-worker runtime. |
+| 5b. Per-worker-tab status breakdown | Show which worker tab has which room, and a results-by-outcome tally | Done | `currentRooms` was already sent to the panel but had its tab-ID keys flattened away by `Object.values()`; `workerTabIds` (needed to label rows "Worker 1/2/3") wasn't sent at all. Both fixed by sending more of what `background.js` already had, not by inventing new tracking. |
 | 6. Adaptive concurrency | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | Depends on real timing data from phase 5, which now exists to build against. |
 
 Every issue above is one line here and a full paragraph in either
@@ -448,6 +481,33 @@ practical at 10,000+ rooms instead of a few dozen.
     results with them - so the final report, and the live progress
     counter during the run, reflect the true complete picture instead of
     restarting the count from zero against a shrunk total.
+  - **Added an automated test suite** (`tests/`, run via `npm test`) covering
+    the project's pure logic - `content/utils.js`'s string/URL/CSV helpers
+    and `background.js`'s `computeFolderNames`, `csvEscape`, `nowStamp`,
+    `claimNextRoom`, and `findCurrentRoomForDownload` - using Node's
+    built-in `node:test`, no dependencies to install. Neither file was
+    originally written to be `require()`-able (both are plain global
+    function declarations, by design, for the content-script/service-worker
+    runtimes they actually load in); both got a small guarded export tail
+    that's a no-op in the browser and only activates under Node. Two of
+    the 24 tests are direct regressions for this session's own
+    `computeFolderNames`/`findCurrentRoomForDownload` bugs. This machine
+    had no Node/npm/Homebrew installed at all going in - Node's official
+    installer needed `sudo`, which needs an interactive terminal this
+    environment doesn't have, worked around via macOS's native
+    admin-privileges GUI prompt instead. Full reasoning in `DESIGN.md`'s
+    Decision 13.
+  - **Added a per-worker-tab status breakdown to the panel.** Previously
+    the panel only showed an aggregate "N active" count and a flat list of
+    room names, with no way to tell which worker tab had which room or how
+    long it had been on it. `background.js` now sends `workerTabIds` (for
+    stable "Worker 1/2/3" labels) and tags each `currentRooms` entry with
+    its own `tabId` and a `claimedAt` timestamp; the panel renders one row
+    per worker ("Worker 2: Room Name · 14s", or "idle") plus a
+    results-by-outcome tally (Downloaded/Failed/Errors/Waiting) built from
+    the existing results array - no new tracking, just exposing data
+    `background.js` already had. Full reasoning in `DESIGN.md`'s
+    Decision 14.
 
 ---
 

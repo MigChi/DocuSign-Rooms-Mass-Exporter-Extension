@@ -14,7 +14,15 @@
  * this file (every call site here passes an already-absolute URL).
  **************************************************************/
 
-importScripts("content/utils.js");
+// importScripts only exists in a real service worker - the `require`
+// branch runs instead under Node (tests/), loading the same file so
+// cleanName/getRoomIdFromUrl/etc. end up as real globals here exactly as
+// they do in production (see content/utils.js's own export-tail comment).
+if (typeof importScripts === "function") {
+  importScripts("content/utils.js");
+} else if (typeof require === "function") {
+  require("./content/utils.js");
+}
 
 // Hardcoded for this first concurrency pass - Roadmap item 3 (adaptive
 // worker-tab count based on measured speed) will make this a suggested,
@@ -168,6 +176,10 @@ async function broadcastStatus() {
       total: STATE.queue.length,
       activeCount: Object.keys(STATE.currentRooms).length,
       currentRooms: Object.values(STATE.currentRooms),
+      // Ordered tab-creation order, stable for the lifetime of a run -
+      // lets the panel label rows "Worker 1"/"Worker 2"/... consistently
+      // instead of by raw (meaningless-to-a-user) Chrome tab ID.
+      workerTabIds: STATE.workerTabIds,
       results: STATE.results,
       startedAt: STATE.startedAt,
       finishedAt: STATE.finishedAt
@@ -331,7 +343,12 @@ async function processRoom(tabId, room) {
   const roomId = room.roomId || getRoomIdFromUrl(documentsUrl);
   const guessedRoomName = cleanName(room.roomName || `Docusign Room ${roomId}`);
 
-  STATE.currentRooms[tabId] = { roomId, roomName: guessedRoomName, documentsUrl };
+  // tabId and claimedAt are here so the panel can render a real per-worker
+  // breakdown (which tab has which room, and how long it's been on it)
+  // instead of just a flattened "N active" count - broadcastStatus() below
+  // sends this object's values as-is, and content.js correlates tabId
+  // against the workerTabIds list (also sent) to label each row "Worker N".
+  STATE.currentRooms[tabId] = { roomId, roomName: guessedRoomName, documentsUrl, tabId, claimedAt: new Date().toISOString() };
   await broadcastStatus();
 
   let result = {
@@ -605,6 +622,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           total: STATE.queue.length,
           activeCount: Object.keys(STATE.currentRooms).length,
           currentRooms: Object.values(STATE.currentRooms),
+          workerTabIds: STATE.workerTabIds,
           results: STATE.results,
           startedAt: STATE.startedAt,
           finishedAt: STATE.finishedAt
@@ -841,3 +859,24 @@ chrome.downloads.onChanged.addListener(delta => {
 
   runQueue();
 })();
+
+// Test-only, mirrors content/utils.js's export tail - `module` never
+// exists in a real service worker. Exposes the pure/STATE-driven logic
+// worth unit testing directly (queue claiming, folder-name collision
+// handling, download-to-room matching, CSV field escaping) without
+// touching anything chrome.* or timing-dependent. STATE itself is
+// exported too, not just the functions that close over it - claimNextRoom()
+// and findCurrentRoomForDownload() both read/write STATE.pending,
+// STATE.index, and STATE.currentRooms directly rather than taking them as
+// parameters (correctly, for production - there's exactly one STATE), so
+// tests set those up by mutating the same object the functions actually use.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    STATE,
+    computeFolderNames,
+    csvEscape,
+    nowStamp,
+    claimNextRoom,
+    findCurrentRoomForDownload
+  };
+}

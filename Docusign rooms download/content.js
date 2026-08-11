@@ -185,6 +185,8 @@
       </div>
       <div class="dsbd-status" id="dsbd-status">Ready</div>
       <div class="dsbd-progress" id="dsbd-progress">0 / 0</div>
+      <div class="dsbd-breakdown" id="dsbd-breakdown"></div>
+      <div class="dsbd-workers" id="dsbd-workers"></div>
       <div class="dsbd-field-label">Date range</div>
       <div class="dsbd-date-row">
         <div class="dsbd-date-field">
@@ -269,8 +271,36 @@
       }
       #${PANEL_ID} .dsbd-progress {
         color: #6b6b6b;
-        margin-bottom: 12px;
+        margin-bottom: 4px;
         font-weight: 600;
+      }
+      #${PANEL_ID} .dsbd-breakdown {
+        color: #8a8a8a;
+        font-size: 11px;
+        margin-bottom: 8px;
+        min-height: 13px;
+      }
+      #${PANEL_ID} .dsbd-workers {
+        margin-bottom: 8px;
+      }
+      #${PANEL_ID} .dsbd-workers:empty {
+        margin-bottom: 0;
+      }
+      #${PANEL_ID} .dsbd-worker-row {
+        font-size: 11px;
+        color: #333;
+        background: #f7f7f5;
+        border-left: 3px solid #ffcc22;
+        border-radius: 4px;
+        padding: 4px 7px;
+        margin-bottom: 4px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #${PANEL_ID} .dsbd-worker-row.dsbd-worker-idle {
+        color: #b0b0b0;
+        border-left-color: #d6d6d6;
       }
       #${PANEL_ID} .dsbd-field-label {
         font-size: 11px;
@@ -371,10 +401,74 @@
 
     const statusEl = panel.querySelector("#dsbd-status");
     const progressEl = panel.querySelector("#dsbd-progress");
+    const breakdownEl = panel.querySelector("#dsbd-breakdown");
+    const workersEl = panel.querySelector("#dsbd-workers");
 
     const setStatus = text => {
       statusEl.textContent = text;
     };
+
+    // One row per worker tab (s.workerTabIds, in creation order - stable
+    // for the run's lifetime, unlike raw Chrome tab IDs which mean nothing
+    // to a user) showing which room it currently has claimed, or "idle" if
+    // it has none (between rooms, or no work left). Built with DOM APIs
+    // and .textContent rather than innerHTML - room names are already
+    // run through cleanName() before reaching here (see background.js's
+    // DS_ROOM_PAGE_INFO handler), which happens to strip HTML-unsafe
+    // characters too, but that's a filename-safety guarantee, not an
+    // XSS one, so this doesn't lean on it.
+    function renderWorkers(s) {
+      const workerTabIds = s.workerTabIds || [];
+      workersEl.textContent = "";
+      if (!workerTabIds.length) return;
+
+      const byTabId = new Map((s.currentRooms || []).map(r => [r.tabId, r]));
+
+      workerTabIds.forEach((tabId, i) => {
+        const room = byTabId.get(tabId);
+        const row = document.createElement("div");
+        row.className = "dsbd-worker-row" + (room ? "" : " dsbd-worker-idle");
+
+        if (!room) {
+          row.textContent = `Worker ${i + 1}: idle`;
+        } else {
+          // Recomputed from claimedAt on every status message rather than
+          // ticking live client-side - broadcastStatus() already fires
+          // often enough (every room claim, pause tick, and completion)
+          // that a live per-second clock would add real complexity for
+          // barely-noticeable accuracy gain.
+          const claimedMs = room.claimedAt ? new Date(room.claimedAt).getTime() : NaN;
+          const elapsedS = Number.isFinite(claimedMs) ? Math.max(0, Math.round((Date.now() - claimedMs) / 1000)) : null;
+          const label = room.roomName || room.roomId || "Unknown room";
+          row.textContent = `Worker ${i + 1}: ${label}` + (elapsedS === null ? "" : ` · ${elapsedS}s`);
+        }
+
+        workersEl.appendChild(row);
+      });
+    }
+
+    // Tallies s.results by their .status string (Downloaded / Failed /
+    // Download Error / Success-Attempted-but-not-yet-confirmed) plus
+    // however many queued rooms haven't been reached yet (total minus
+    // results.length) - the per-room outcome breakdown the panel never
+    // showed before, short of opening the final CSV report.
+    function renderBreakdown(s) {
+      const counts = {};
+      (s.results || []).forEach(r => {
+        const key = r.status || "Unknown";
+        counts[key] = (counts[key] || 0) + 1;
+      });
+      const waiting = Math.max(0, (s.total || 0) - (s.results?.length || 0));
+
+      const parts = [];
+      if (counts["Downloaded"]) parts.push(`Downloaded ${counts["Downloaded"]}`);
+      if (counts["Success/Attempted"]) parts.push(`In progress ${counts["Success/Attempted"]}`);
+      if (counts["Failed"]) parts.push(`Failed ${counts["Failed"]}`);
+      if (counts["Download Error"]) parts.push(`Errors ${counts["Download Error"]}`);
+      if (waiting) parts.push(`Waiting ${waiting}`);
+
+      breakdownEl.textContent = parts.join(" · ");
+    }
 
     // Reads and validates the panel's own From/To date inputs - replaces
     // the old hardcoded SCAN_DATE_START/SCAN_DATE_END constants in
@@ -625,12 +719,13 @@
 
     // Multiple rooms can be active at once now (one per worker tab) -
     // s.currentRooms is an array, not the single s.currentRoom object
-    // from before concurrency. Shared by both status-update sites below.
+    // from before concurrency. Kept as a short one-line summary for the
+    // main status line; renderWorkers() below shows the actual per-tab
+    // breakdown (which room, how long), so this doesn't need to repeat
+    // room names the way it used to before that existed.
     function runningStatusText(s) {
-      const rooms = s.currentRooms || [];
-      if (!rooms.length) return "Running...";
-      const names = rooms.map(r => r.roomName || r.roomId).join(", ");
-      return `Running: ${rooms.length} active (${names})`;
+      const count = (s.currentRooms || []).length;
+      return count ? `Running: ${count} active` : "Running...";
     }
 
     chrome.runtime.onMessage.addListener(message => {
@@ -649,6 +744,8 @@
       // that ambiguity; "Running: <rooms>" below already shows what's
       // currently in flight.
       progressEl.textContent = `${s.results?.length || 0} / ${s.total || 0}`;
+      renderBreakdown(s);
+      renderWorkers(s);
 
       updateButtonStates(s);
 
@@ -665,6 +762,8 @@
       const s = response?.state;
       if (!s) return;
       progressEl.textContent = `${s.results?.length || 0} / ${s.total || 0}`;
+      renderBreakdown(s);
+      renderWorkers(s);
       updateButtonStates(s);
       if (s.running) setStatus(runningStatusText(s));
       else if (s.paused) setStatus("Paused.");

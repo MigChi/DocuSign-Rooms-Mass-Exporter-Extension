@@ -107,3 +107,17 @@ function parseCsv(text) {
 
     return rows.filter(r => r.length > 1 || r[0] !== "");
 }
+
+// Test-only: `module` never exists in a content script or the service
+// worker, so this is a no-op in the real extension. Under Node (tests/),
+// it both exports these functions for `require()` and attaches them to
+// globalThis - reproducing this file's real runtime behavior, where
+// manifest.json's content_scripts load order (and background.js's
+// importScripts()) put these plain function declarations directly into
+// the shared scope everything else runs in. Testing against a
+// module-scoped shape instead would test something other than what
+// actually ships.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { sleep, cleanName, getRoomIdFromUrl, roomUrlToDocumentsUrl, parseCsv };
+  Object.assign(globalThis, module.exports);
+}
