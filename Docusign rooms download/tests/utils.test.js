@@ -243,6 +243,10 @@ test("describeWorkerEvent describes every logWorkerEvent() type background.js ac
     utils.describeWorkerEvent({ type: "waiting_for_downloads_to_settle", count: 3 }),
     "Waiting for 3 downloads to finish before writing the report"
   );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "scan_tab_closed", tabId: 42 }),
+    "Scan cancelled: tab 42 was closed"
+  );
 });
 
 test("describeWorkerEvent falls back to the raw event type for an unrecognized type, instead of throwing", () => {

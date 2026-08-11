@@ -1,0 +1,271 @@
+<!--
+  Standalone control panel - a real, detached Chrome window (opened via
+  chrome.action.onClicked in background.js), not injected into the
+  Docusign page. See DESIGN.md for why this replaced the old in-page
+  floating panel: an injected panel dies on every page refresh and only
+  ever existed on whichever tab it was injected into, which made it hard
+  to use during a long scan or download run. This page has no DOM access
+  to any Docusign tab of its own - background.js brokers scan requests to
+  whichever content script is running one, the same way it already
+  brokers per-room work to worker tabs.
+-->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Docusign Rooms Mass Exporter</title>
+  <style>
+    body {
+      margin: 0;
+      background: #ffffff;
+      color: #1a1a1a;
+      font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 13px;
+      padding: 0 16px 14px;
+    }
+    .dsbd-brandbar {
+      height: 4px;
+      margin: 0 -16px 12px;
+      background: #ffcc22;
+    }
+    .dsbd-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      padding-top: 14px;
+    }
+    .dsbd-tag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      background: #ffcc22;
+      color: #1a1a1a;
+      font-weight: 800;
+      font-size: 11px;
+      letter-spacing: .3px;
+    }
+    .dsbd-title {
+      font-weight: 700;
+      font-size: 14.5px;
+      color: #1a1a1a;
+    }
+    .dsbd-status {
+      background: #f7f7f5;
+      border: 1px solid #ececec;
+      border-left: 3px solid #ffcc22;
+      padding: 8px 10px;
+      border-radius: 6px;
+      min-height: 18px;
+      margin-bottom: 8px;
+      line-height: 1.35;
+      color: #333;
+    }
+    .dsbd-progress {
+      color: #6b6b6b;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+    .dsbd-breakdown {
+      color: #8a8a8a;
+      font-size: 11px;
+      margin-bottom: 8px;
+      min-height: 13px;
+    }
+    .dsbd-workers {
+      margin-bottom: 8px;
+    }
+    .dsbd-workers:empty {
+      margin-bottom: 0;
+    }
+    .dsbd-worker-row {
+      font-size: 11px;
+      color: #333;
+      background: #f7f7f5;
+      border-left: 3px solid #ffcc22;
+      border-radius: 4px;
+      padding: 4px 7px;
+      margin-bottom: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .dsbd-worker-row.dsbd-worker-idle {
+      color: #b0b0b0;
+      border-left-color: #d6d6d6;
+    }
+    .dsbd-eventlog-details {
+      margin-bottom: 10px;
+    }
+    .dsbd-eventlog-details summary {
+      font-size: 11px;
+      font-weight: 700;
+      color: #6b6b6b;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: .4px;
+    }
+    .dsbd-eventlog {
+      margin-top: 6px;
+      max-height: 110px;
+      overflow-y: auto;
+      font-size: 10.5px;
+      color: #6b6b6b;
+    }
+    .dsbd-eventlog-row {
+      padding: 3px 0;
+      border-bottom: 1px solid #f0f0f0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .dsbd-eventlog-empty {
+      color: #b0b0b0;
+      padding: 3px 0;
+    }
+    .dsbd-field-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: #6b6b6b;
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      margin-bottom: 5px;
+    }
+    .dsbd-date-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .dsbd-date-field label {
+      display: block;
+      font-size: 10.5px;
+      color: #8a8a8a;
+      margin-bottom: 2px;
+    }
+    .dsbd-date-field input {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #d6d6d6;
+      border-radius: 6px;
+      padding: 6px 7px;
+      font-size: 12px;
+      font-family: inherit;
+      color: #1a1a1a;
+      background: #fff;
+    }
+    .dsbd-date-field input:focus {
+      outline: none;
+      border-color: #ffcc22;
+      box-shadow: 0 0 0 2px rgba(255,204,34,.35);
+    }
+    .dsbd-workercount-field {
+      width: 80px;
+      margin-bottom: 12px;
+    }
+    .dsbd-secondary {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #d6d6d6;
+      border-radius: 8px;
+      padding: 9px;
+      cursor: pointer;
+      font-weight: 700;
+      background: #fff;
+      color: #1a1a1a;
+      margin-bottom: 8px;
+    }
+    .dsbd-secondary:hover {
+      background: #f7f7f5;
+    }
+    .dsbd-buttons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+    }
+    button {
+      border: none;
+      border-radius: 8px;
+      padding: 9px;
+      cursor: pointer;
+      font-weight: 700;
+      font-family: inherit;
+    }
+    #dsbd-startstop.dsbd-state-start { background: #ffcc22; color: #1a1a1a; }
+    #dsbd-startstop.dsbd-state-start:hover { background: #f5c000; }
+    #dsbd-startstop.dsbd-state-stop { background: #fff; color: #c0392b; border: 1px solid #e6b3ac; }
+    #dsbd-startstop.dsbd-state-stop:hover { background: #fdf1ef; }
+    #dsbd-pauseresume.dsbd-state-pause { background: #fff; color: #1a1a1a; border: 1px solid #d6d6d6; }
+    #dsbd-pauseresume.dsbd-state-pause:hover { background: #f7f7f5; }
+    #dsbd-pauseresume.dsbd-state-resume { background: #1a1a1a; color: #fff; }
+    #dsbd-pauseresume.dsbd-state-resume:hover { background: #333; }
+    button:disabled {
+      opacity: .45;
+      cursor: not-allowed;
+    }
+    .dsbd-credit {
+      color: #b0b0b0;
+      margin-top: 10px;
+      font-size: 9px;
+      line-height: 1;
+      text-align: center;
+      letter-spacing: .2px;
+      text-transform: lowercase;
+    }
+    .dsbd-note {
+      color: #8a8a8a;
+      margin-top: 6px;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+  </style>
+</head>
+<body>
+  <div class="dsbd-brandbar"></div>
+  <div class="dsbd-header">
+    <span class="dsbd-tag">DS</span>
+    <div class="dsbd-title">Rooms Mass Exporter</div>
+  </div>
+  <div class="dsbd-status" id="dsbd-status">Ready</div>
+  <div class="dsbd-progress" id="dsbd-progress">0 / 0</div>
+  <div class="dsbd-breakdown" id="dsbd-breakdown"></div>
+  <div class="dsbd-workers" id="dsbd-workers"></div>
+  <details class="dsbd-eventlog-details">
+    <summary>Activity Log</summary>
+    <div class="dsbd-eventlog" id="dsbd-eventlog"></div>
+  </details>
+  <div class="dsbd-field-label">Date range</div>
+  <div class="dsbd-date-row">
+    <div class="dsbd-date-field">
+      <label for="dsbd-date-start">From</label>
+      <input type="date" id="dsbd-date-start">
+    </div>
+    <div class="dsbd-date-field">
+      <label for="dsbd-date-end">To</label>
+      <input type="date" id="dsbd-date-end">
+    </div>
+  </div>
+  <div class="dsbd-field-label" id="dsbd-worker-count-label">Worker tabs</div>
+  <div class="dsbd-date-field dsbd-workercount-field">
+    <input type="number" id="dsbd-worker-count" step="1">
+  </div>
+  <button id="dsbd-scan-export" class="dsbd-secondary">Scan &amp; Export List (CSV)</button>
+  <button id="dsbd-upload" class="dsbd-secondary">Upload CSV to Run/Resume</button>
+  <input type="file" id="dsbd-csv-input" accept=".csv" style="display:none">
+  <div class="dsbd-buttons">
+    <button id="dsbd-startstop" class="dsbd-state-start">Start</button>
+    <button id="dsbd-pauseresume" class="dsbd-state-pause" disabled>Pause</button>
+  </div>
+  <div class="dsbd-credit">created by Miguel Chica</div>
+  <div class="dsbd-note">
+    Saves as: Downloads / Docusign Rooms / Room Name / Room Name.zip. Requires a Docusign Rooms list tab to be open for scanning.
+  </div>
+
+  <script src="content/utils.js"></script>
+  <script src="panel.js"></script>
+</body>
+</html>

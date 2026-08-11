@@ -33,7 +33,19 @@ function makeChromeStub() {
       get: async () => null,
       update: async () => ({}),
       create: async () => ({ id: 1 }),
-      sendMessage: async () => ({})
+      sendMessage: async () => ({}),
+      onRemoved: { addListener() {} }
+    },
+    // Needed since the detached panel window (see DESIGN.md) - chrome.
+    // action.onClicked.addListener() runs at require() time, same as the
+    // other top-level listener registrations already stubbed above.
+    action: {
+      onClicked: { addListener() {} }
+    },
+    windows: {
+      get: async () => null,
+      update: async () => ({}),
+      create: async () => ({ id: 1 })
     }
   };
 }

@@ -93,6 +93,20 @@ const STATE = {
   // a resumed run's eventual report still carries the original run's
   // label instead of losing it partway through.
   runDateRangeLabel: null,
+  // Scan-relay state (see the DS_RUN_SCAN family of handlers below and
+  // DESIGN.md's write-up on the detached panel window) - a live scan
+  // needs real DOM access to a Docusign tab (content.js/content/scan.js),
+  // but the panel that requests one now lives in a separate extension
+  // window with no DOM access of its own, so background.js brokers
+  // between them the same way it already brokers per-room work between
+  // the panel and a worker tab. Not persisted - a scan is never resumed
+  // across a service-worker restart the way a download run is; if the
+  // worker dies mid-scan, the scan is simply gone, same as it always was
+  // when scanning lived entirely inside one content-script execution.
+  scanning: false,
+  scanTabId: null,
+  scanMode: null,
+  scanDateRangeLabel: null,
   // Keyed by tabId - was a single STATE.currentRoom object before
   // concurrency, since only one room was ever in flight at a time. Now
   // there's one entry per active worker tab.
@@ -293,16 +307,20 @@ async function broadcastStatus() {
       workerEvents: STATE.workerEvents.slice(-20),
       results: STATE.results,
       startedAt: STATE.startedAt,
-      finishedAt: STATE.finishedAt
+      finishedAt: STATE.finishedAt,
+      scanning: STATE.scanning
     }
   };
 
-  try {
-    const tabs = await chrome.tabs.query({ url: "https://rooms.docusign.com/*" });
-    for (const tab of tabs) {
-      chrome.tabs.sendMessage(tab.id, payload).catch(() => {});
-    }
-  } catch (e) {}
+  // chrome.runtime.sendMessage() (no tabId - a broadcast), not
+  // chrome.tabs.sendMessage() to each Docusign tab as this used to do -
+  // the panel is now a standalone extension window, not something
+  // injected into the page, so it can only be reached the way any other
+  // extension page (options page, popup) receives messages. Content
+  // scripts no longer need this broadcast at all now that the panel UI
+  // has moved out of them - they only handle DS_PROCESS_ROOM and the
+  // scan-relay messages, neither of which reads DS_BULK_STATUS.
+  chrome.runtime.sendMessage(payload).catch(() => {});
 }
 
 async function waitForTabLoaded(tabId, timeoutMs = 60000) {
@@ -791,6 +809,54 @@ async function runQueue() {
   } catch (e) {}
 }
 
+// Builds and downloads the Scan List CSV. A plain function, not a message
+// handler - this used to be DS_EXPORT_SCAN_LIST's entire body, but once
+// scanning moved behind the DS_RUN_SCAN relay (see the panel-window
+// decision in DESIGN.md), the only caller left is DS_SCAN_COMPLETE's
+// "export" branch below, so there's no reason for this to still be a
+// separately-addressable message type. Wraps the whole body in `try`, not
+// just the chrome.downloads.download() call - confirmed live as the
+// actual bug behind an 8000-room scan's CSV export hanging forever with
+// no error shown (see safeEncodeURIComponent()'s own comment for the
+// confirmed cause). Returns a response object rather than calling
+// sendResponse() directly, since the caller decides how (or whether) to
+// relay it onward.
+async function handleExportScanList(rooms, dateRangeLabel) {
+  try {
+    const roomsArr = Array.isArray(rooms) ? rooms : [];
+
+    const rows = [
+      ["Room #", "Room Name", "Room ID", "Documents URL", "Created Date"]
+    ];
+
+    roomsArr.forEach((r, idx) => {
+      rows.push([
+        idx + 1,
+        r.roomName || "",
+        r.roomId || "",
+        r.documentsUrl || "",
+        String(r.createdDate || "").slice(0, 10)
+      ]);
+    });
+
+    const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
+    const dataUrl = "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
+    const label = typeof dateRangeLabel === "string" ? dateRangeLabel : null;
+    const filename = `Docusign Rooms/_Scan Lists/${labeledFilename("Scan List", label)}.csv`;
+
+    await chrome.downloads.download({
+      url: dataUrl,
+      filename,
+      saveAs: false,
+      conflictAction: "uniquify"
+    });
+
+    return { ok: true, filename, total: roomsArr.length };
+  } catch (error) {
+    return { ok: false, reason: error.message || "CSV export failed" };
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     if (!message || !message.type) return;
@@ -912,55 +978,119 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           workerEvents: STATE.workerEvents.slice(-20),
           results: STATE.results,
           startedAt: STATE.startedAt,
-          finishedAt: STATE.finishedAt
+          finishedAt: STATE.finishedAt,
+          // So a (re)opened panel window can show "a scan is in progress"
+          // correctly even if it wasn't the panel instance that started
+          // it - e.g. the panel window was closed and reopened mid-scan.
+          scanning: STATE.scanning
         }
       });
       return;
     }
 
-    if (message.type === "DS_EXPORT_SCAN_LIST") {
-      // Wraps the ENTIRE handler, not just the chrome.downloads.download()
-      // call below - confirmed live as the actual bug behind an 8000-room
-      // scan's CSV export hanging forever with no error shown. Building
-      // `rows`/`csv`/`dataUrl` used to sit outside any try/catch; if any
-      // of that throws (the safeEncodeURIComponent() comment above
-      // explains the specific, confirmed cause), sendResponse() never
-      // gets called, the message channel is never told anything went
-      // wrong, and chrome.runtime.sendMessage() on the content.js side
-      // just hangs indefinitely - it only rejects when the channel itself
-      // closes, not merely because the handler threw internally.
-      try {
-        const rooms = Array.isArray(message.rooms) ? message.rooms : [];
-
-        const rows = [
-          ["Room #", "Room Name", "Room ID", "Documents URL", "Created Date"]
-        ];
-
-        rooms.forEach((r, idx) => {
-          rows.push([
-            idx + 1,
-            r.roomName || "",
-            r.roomId || "",
-            r.documentsUrl || "",
-            String(r.createdDate || "").slice(0, 10)
-          ]);
-        });
-
-        const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
-        const dataUrl = "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
-        const dateRangeLabel = typeof message.dateRangeLabel === "string" ? message.dateRangeLabel : null;
-        const filename = `Docusign Rooms/_Scan Lists/${labeledFilename("Scan List", dateRangeLabel)}.csv`;
-
-        await chrome.downloads.download({
-          url: dataUrl,
-          filename,
-          saveAs: false,
-          conflictAction: "uniquify"
-        });
-        sendResponse({ ok: true, filename, total: rooms.length });
-      } catch (error) {
-        sendResponse({ ok: false, reason: error.message || "CSV export failed" });
+    // DS_RUN_SCAN / DS_SCAN_PROGRESS / DS_SCAN_COMPLETE / DS_SCAN_STOP /
+    // DS_SCAN_PAUSE / DS_SCAN_RESUME - the scan-relay protocol. A live
+    // scan needs real DOM access to a Docusign tab, which the standalone
+    // panel window doesn't have (it's a separate extension page, not a
+    // content script) - background.js brokers between the panel and
+    // whichever content script actually runs the scan, the same
+    // relationship it already has with worker tabs for per-room work.
+    // Full reasoning in DESIGN.md.
+    if (message.type === "DS_RUN_SCAN") {
+      if (STATE.running) {
+        sendResponse({ ok: false, reason: "A download run is already active." });
+        return;
       }
+      if (STATE.scanning) {
+        sendResponse({ ok: false, reason: "A scan is already in progress." });
+        return;
+      }
+      // Reserved synchronously, before the first `await` below - same
+      // race, same fix as DS_START_QUEUE's STATE.running reservation
+      // above. Without this, two DS_RUN_SCAN messages arriving close
+      // together could both pass the `if (STATE.scanning)` check above
+      // before either one actually sets it, since the only await between
+      // the check and the set used to be chrome.tabs.query() - both
+      // would then proceed to request a scan, and content.js would end up
+      // running autoScrollAndCollectRooms() twice concurrently in the
+      // same tab.
+      STATE.scanning = true;
+
+      // Picks the first matching tab - if more than one Docusign Rooms
+      // tab happens to be open, this is the same "first match wins"
+      // choice ensureWorkerTabs()/broadcastStatus() implicitly make
+      // elsewhere in this file, not a new ambiguity introduced here.
+      const tabs = await chrome.tabs.query({ url: "https://rooms.docusign.com/*" });
+      const targetTab = tabs[0];
+
+      if (!targetTab) {
+        STATE.scanning = false;
+        sendResponse({ ok: false, reason: "No Docusign Rooms tab is open. Open the Rooms list page first." });
+        return;
+      }
+
+      STATE.scanTabId = targetTab.id;
+      STATE.scanMode = message.mode;
+      STATE.scanDateRangeLabel = typeof message.dateRangeLabel === "string" ? message.dateRangeLabel : null;
+
+      try {
+        // Only acknowledging that the scan *started* - the actual result
+        // arrives later via DS_SCAN_COMPLETE below, since a scan can run
+        // for minutes and there's no reason to hold this message channel
+        // open that whole time when a follow-up message works just as well.
+        await chrome.tabs.sendMessage(targetTab.id, { type: "DS_BEGIN_SCAN", dateRange: message.dateRange });
+        sendResponse({ ok: true });
+      } catch (error) {
+        STATE.scanning = false;
+        STATE.scanTabId = null;
+        STATE.scanMode = null;
+        STATE.scanDateRangeLabel = null;
+        sendResponse({ ok: false, reason: "Could not reach the Docusign tab - try refreshing it and make sure you're on the Rooms list page." });
+      }
+      return;
+    }
+
+    if (message.type === "DS_SCAN_PROGRESS") {
+      // Relay only - content scripts can't reach the standalone panel
+      // window directly (chrome.tabs.sendMessage only targets tabs; the
+      // panel is an extension page, not a tab). chrome.runtime.sendMessage
+      // (no tabId - a broadcast) is what reaches it, same as
+      // broadcastStatus() below.
+      chrome.runtime.sendMessage({ type: "DS_SCAN_PROGRESS", text: message.text }).catch(() => {});
+      return;
+    }
+
+    if (message.type === "DS_SCAN_COMPLETE") {
+      STATE.scanning = false;
+      STATE.scanTabId = null;
+      const mode = STATE.scanMode;
+      const dateRangeLabel = STATE.scanDateRangeLabel;
+      STATE.scanMode = null;
+      STATE.scanDateRangeLabel = null;
+
+      const rooms = Array.isArray(message.rooms) ? message.rooms : [];
+
+      if (mode === "export") {
+        const response = await handleExportScanList(rooms, dateRangeLabel);
+        chrome.runtime.sendMessage({ type: "DS_SCAN_RESULT", mode: "export", response }).catch(() => {});
+      } else {
+        // Deliberately NOT auto-starting the queue here - the panel still
+        // shows its own confirm() dialog ("Found N rooms... Continue?")
+        // once it receives this, exactly like the pre-relay flow did
+        // right after autoScrollAndCollectRooms() returned. Auto-starting
+        // would have silently dropped that confirmation step.
+        chrome.runtime.sendMessage({ type: "DS_SCAN_RESULT", mode: "start", rooms, dateRangeLabel }).catch(() => {});
+      }
+      return;
+    }
+
+    if (message.type === "DS_SCAN_STOP" || message.type === "DS_SCAN_PAUSE" || message.type === "DS_SCAN_RESUME") {
+      if (!STATE.scanTabId) {
+        sendResponse({ ok: false, reason: "No scan in progress." });
+        return;
+      }
+      chrome.tabs.sendMessage(STATE.scanTabId, { type: message.type }).catch(() => {});
+      sendResponse({ ok: true });
       return;
     }
 
@@ -1106,6 +1236,66 @@ chrome.downloads.onChanged.addListener(delta => {
 
     broadcastStatus();
   }
+});
+
+// If the Docusign tab running an active scan gets closed mid-scan (the
+// user closes it, navigates away in a way that kills the content script,
+// or Chrome reclaims it), that content script's whole execution context
+// disappears with it - no DS_SCAN_COMPLETE will ever arrive to reset
+// STATE.scanning, which would otherwise stay stuck `true` forever,
+// permanently blocking every future scan with "already in progress" even
+// though nothing is actually running. This is the scan-relay's version of
+// the same problem runWorker()'s tab-liveness check solves for worker
+// tabs - the difference is a scan has exactly one tab and no natural
+// per-iteration point to poll it, so an event listener is the simpler fit
+// here rather than adapting that polling pattern.
+chrome.tabs.onRemoved.addListener(tabId => {
+  if (STATE.scanTabId !== tabId) return;
+
+  STATE.scanning = false;
+  STATE.scanTabId = null;
+  STATE.scanMode = null;
+  STATE.scanDateRangeLabel = null;
+
+  logWorkerEvent("scan_tab_closed", { tabId });
+  chrome.runtime.sendMessage({ type: "DS_SCAN_FAILED", reason: "The Docusign tab was closed while scanning." }).catch(() => {});
+});
+
+// Module-level, not STATE - a live browser resource (a window either
+// exists or it doesn't), not resumable job data, so it has no business
+// in chrome.storage.local or surviving a restart the way STATE's
+// persisted fields do. A fresh service worker start always begins with
+// this unset, which is correct: any window that was open before a
+// restart is a real Chrome window that still exists independently of
+// this variable - the next click on the toolbar icon will find it via
+// chrome.windows.get() below regardless, this is just a fast-path cache.
+let panelWindowId = null;
+
+// Opens the standalone panel window (see DESIGN.md's write-up on why the
+// panel moved out of the page: an in-page floating panel dies on every
+// refresh and only exists on the tab it was injected into, which made it
+// hard to use during a long-running scan or download job) - or, if one is
+// already open, focuses it instead of creating a second one.
+chrome.action.onClicked.addListener(async () => {
+  if (panelWindowId !== null) {
+    const existing = await chrome.windows.get(panelWindowId).catch(() => null);
+    if (existing) {
+      await chrome.windows.update(panelWindowId, { focused: true }).catch(() => {});
+      return;
+    }
+    // The window was closed since we last tracked it (or Chrome restarted
+    // without one open) - fall through and create a fresh one.
+    panelWindowId = null;
+  }
+
+  const created = await chrome.windows.create({
+    url: chrome.runtime.getURL("panel.html"),
+    type: "popup",
+    width: 360,
+    height: 720
+  }).catch(() => null);
+
+  if (created) panelWindowId = created.id;
 });
 
 // Runs every time this service worker starts up - fresh install, browser

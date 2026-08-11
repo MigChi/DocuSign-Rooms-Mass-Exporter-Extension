@@ -65,10 +65,14 @@ documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms
   filename, and timestamp. `Downloaded` and `Complete (Empty)` rooms are
   both skipped (not re-run) if this report is re-uploaded via "Upload
   CSV to Run/Resume".
-- **Docusign-styled floating panel** — appears on any Rooms page,
-  reflects the run's live status (including which rooms are actively
-  processing across all worker tabs) regardless of which tab is doing
-  the processing.
+- **Standalone panel window** — opened via the toolbar icon, independent
+  of any Docusign tab. Reflects the run's live status (including which
+  rooms are actively processing across all worker tabs) regardless of
+  which tab is doing the processing, and survives a Docusign page
+  refresh or switching tabs — the original in-page panel died on both.
+  Scanning still requires an actual Docusign tab (it's DOM automation),
+  so the panel relays scan requests to it and back; see `DESIGN.md`
+  Decision 24 for the full message-relay design.
 - **Per-worker-tab status breakdown** — the panel shows a live row per
   worker tab ("Worker 1: Room Name · 12s", "Worker 2: idle") plus a
   results-by-outcome tally (Downloaded / Failed / Errors / Waiting)
@@ -86,7 +90,9 @@ documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms
 ## Usage
 
 1. Go to the main Docusign Rooms list page and let it load.
-2. Use the floating panel at the bottom-right.
+2. Click the extension's toolbar icon to open the panel — a standalone
+   window, not part of the page, so it stays put through refreshes and
+   tab switches.
 3. Set a **From** and **To** date to control which rooms get included.
 4. Optional: click **Scan & Export List (CSV)** first to preview what
    would be processed, with no downloads triggered.
@@ -148,8 +154,9 @@ npm test
 | `content/utils.js` | Shared string/URL/CSV helpers with no DOM dependency — loaded by the other content scripts *and* by `background.js` via `importScripts()`, since a service worker and content scripts run in separate JS contexts and can't otherwise share code |
 | `content/scan.js` | Rooms-list scanning: scrolling, row parsing, date-range filtering, forcing List View/oldest-first sort |
 | `content/room.js` | Room-page helpers (currently just reading the room name from its Details page) |
-| `content.js` | The floating panel UI, and the single-room download pipeline (Select All → Bulk Download → confirm → wait) |
-| `popup.html` / `popup.js` | Leftover from the original 1.0.2 toolbar popup — unused since the in-page panel replaced it; not referenced by `manifest.json`, kept for reference only |
+| `content.js` | DOM automation only — the single-room download pipeline (Select All → Bulk Download → confirm → wait) and the scan relay (`DS_BEGIN_SCAN`/`DS_SCAN_STOP`/`DS_SCAN_PAUSE`/`DS_SCAN_RESUME`) that lets the standalone panel trigger and control a scan it has no DOM access to run itself |
+| `panel.html` / `panel.js` | The standalone control panel window (opened via the toolbar icon), replacing the old in-page panel that used to live inside `content.js` — see `DESIGN.md` Decision 24 |
+| `popup.html` / `popup.js` | Leftover from the original 1.0.2 toolbar popup — unused since it was replaced by the in-page panel and later `panel.html`; not referenced by `manifest.json`, kept for reference only |
 | `package.json` | Just a `test` script (`node --test`) — no dependencies, not part of the loaded extension, exists purely so `npm test` works |
 | `tests/utils.test.js` | Tests for `content/utils.js`'s pure helpers |
 | `tests/background.test.js` | Tests for `background.js`'s pure/`STATE`-driven logic, including regression tests for two of this session's real live-testing bugs |
@@ -246,6 +253,7 @@ summary of it, not a second copy that can drift.
 | 5f. First real-scale test (8000 rooms) | Actually run the tool at something close to the 10,000-room scale it was designed for, not just a ~25-room smoke test | Found two real gaps | CSV export hung forever with no error - `encodeURIComponent()` throwing on a lone UTF-16 surrogate somewhere in 8000 real room names, outside the handler's `try` block, so `sendResponse()` never fired and the caller never knew anything was wrong. Fixed with `safeEncodeURIComponent()` plus a widened `try/catch`, and the same latent bug closed in `createReport()`/`createEventLogReport()` before it could cause an identical silent failure there. Separately: scanning had no Stop/Pause at all, fine for a 25-room test that finishes in seconds, a real gap for an 8000-room scan running several minutes - added, session-scoped (not crash-persistent like the download run's). See `DESIGN.md` Decisions 20 and 21. |
 | 5g. CSV-upload resume reliability | Make Stop-then-reupload actually trustworthy, raised mid-run on the same 8000-room test | Done | A room whose ZIP was still downloading when the report was generated could show `Success/Attempted` instead of `Downloaded`, even though it finished fine seconds later - since resume only skips rows marked `Downloaded`, that room would get needlessly re-downloaded. Fixed with a bounded wait for in-flight downloads before writing the reports. Separately, empty rooms were marked `Failed` (not their own outcome), so every resume re-checked every empty room from scratch - fixed with a distinct `Complete (Empty)` status, also skipped on resume. `parseUploadedCsv()` was found to be pure and untested, sitting inside `content.js`'s closure the same way three other functions were in phase 5e - moved to `content/utils.js`, given real coverage of the exact behavior changed here. See `DESIGN.md` Decision 22. |
 | 5h. Trailing-period filename bug | Diagnose "some files did not get saved to the Docusign Rooms folder" from the same 8000-room run | Done | Confirmed via the user's own console (`Unchecked runtime.lastError: Invalid filename`) and the actual Download Report CSV - 5 real rooms, all named with a street-abbreviation period (`"124 Rosman Rd."`, `"1 Landmark Sq."`, etc.), all landed in the flat Downloads root. First diagnostic pass looked at the wrong CSV column (`Downloaded Filename`, which Chrome overwrites with its own fallback name) and seemed to contradict the trailing-period theory until the *Room Name* column was checked instead. Fixed in `cleanName()` - the single function every folder/file name in this codebase passes through - plus a Windows-reserved-device-name guard added at the same time. Regression tests added using the exact 5 confirmed room names, at both `cleanName()` and `computeFolderNames()` (the function `background.js` actually calls). See `DESIGN.md` Decision 23. |
+| 5i. Detached panel window | Move the control panel out of the Docusign page into its own standalone window, raised as a design problem (not a bug) once long runs made refresh/tab-switch fragility actually matter | Done | The panel and the scan it triggers structurally can't share one execution context - a standalone window has no DOM access, and scanning must run as DOM automation inside an actual Docusign tab. Solved with a message relay through `background.js` (`chrome.tabs.sendMessage` reaches a tab but not other extension pages; `chrome.runtime.sendMessage` reaches the reverse) - four hops for one logical scan request. Found two gaps via code review before calling it done, not live testing: a synchronous-guard race on `STATE.scanning` (same class of bug already fixed once for `STATE.running`), and no recovery if the Docusign tab closes mid-scan (fixed with a `chrome.tabs.onRemoved` listener and a new `DS_SCAN_FAILED` message). See `DESIGN.md` Decision 24. |
 | 6. Adaptive concurrency suggestion | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | The bounds half of this landed early, in phase 5d - what's left is the *measured, suggested* half. Depends on real timing data, which now exists to build against. |
 
 Every issue above is one line here and a full paragraph in either
@@ -694,6 +702,30 @@ practical at 10,000+ rooms instead of a few dozen.
     CSV report exports themselves triggering the same listener, not a
     second bug) - confirmed by checking the actual URL before assuming.
     Full reasoning in `DESIGN.md`'s Decision 23.
+  - **Moved the control panel out of the Docusign page into a standalone
+    window**, opened via the toolbar icon instead of auto-injected into
+    the page - raised as a design problem, not a bug ("anytime the page
+    is refreshed or it moves from tab to tab it becomes super hard to
+    press any of the buttons or accurately see progress"). The download
+    run itself needed no DOM access and moved cleanly; scanning
+    (`autoScrollAndCollectRooms()`) does, and must still run inside an
+    actual Docusign tab, so the panel now relays scan requests to it and
+    back through `background.js` - `chrome.tabs.sendMessage` reaches a
+    tab but not other extension pages, `chrome.runtime.sendMessage`
+    reaches the reverse, so no single message can go straight from the
+    panel to a content script. Long-running scans are acknowledged
+    immediately and deliver their result later over a follow-up message,
+    the same decoupling pattern already used for the download run itself,
+    rather than holding one message channel open for several minutes.
+    The original confirm()-before-starting UX is preserved unchanged.
+    Two gaps found via code review (not live testing) before calling this
+    done: a synchronous-guard race on the new `STATE.scanning` flag (the
+    same class of bug already fixed once for `STATE.running`), and no
+    recovery if the Docusign tab closes mid-scan, which would otherwise
+    leave `STATE.scanning` stuck `true` forever - fixed with a
+    `chrome.tabs.onRemoved` listener and a new `DS_SCAN_FAILED` message
+    that resets the panel's state and shows why. Full reasoning in
+    `DESIGN.md`'s Decision 24.
 
 ---
 

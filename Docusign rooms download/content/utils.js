@@ -210,6 +210,8 @@ function describeWorkerEvent(evt) {
         return `Failed to write the ${evt.stage === "activity_log" ? "activity log" : "download report"} CSV: ${evt.error}`;
       case "waiting_for_downloads_to_settle":
         return `Waiting for ${evt.count} download${evt.count === 1 ? "" : "s"} to finish before writing the report`;
+      case "scan_tab_closed":
+        return `Scan cancelled: tab ${evt.tabId} was closed`;
       default:
         return evt.type;
     }
