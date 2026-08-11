@@ -10,6 +10,17 @@
 
   const PANEL_ID = "ds-mass-exporter-panel";
 
+  // Mirrors background.js's DEFAULT/MIN/MAX_WORKER_TAB_COUNT - duplicated
+  // rather than shared because content scripts and the service worker are
+  // separate JS contexts (see content/utils.js's header comment for why
+  // that split exists elsewhere in this codebase too). Not load-bearing if
+  // they ever drift: background.js's clampWorkerTabCount() re-validates
+  // whatever this sends regardless, so a mismatch here would only affect
+  // the input's UI bounds, not actually let an out-of-range value through.
+  const WORKER_TAB_COUNT_DEFAULT = 3;
+  const WORKER_TAB_COUNT_MIN = 1;
+  const WORKER_TAB_COUNT_MAX = 8;
+
   function clickElement(el, label) {
     if (!el) {
       console.warn(`Could not find: ${label}`);
@@ -187,6 +198,10 @@
       <div class="dsbd-progress" id="dsbd-progress">0 / 0</div>
       <div class="dsbd-breakdown" id="dsbd-breakdown"></div>
       <div class="dsbd-workers" id="dsbd-workers"></div>
+      <details class="dsbd-eventlog-details">
+        <summary>Activity Log</summary>
+        <div class="dsbd-eventlog" id="dsbd-eventlog"></div>
+      </details>
       <div class="dsbd-field-label">Date range</div>
       <div class="dsbd-date-row">
         <div class="dsbd-date-field">
@@ -197,6 +212,10 @@
           <label for="dsbd-date-end">To</label>
           <input type="date" id="dsbd-date-end">
         </div>
+      </div>
+      <div class="dsbd-field-label">Worker tabs (${WORKER_TAB_COUNT_MIN}-${WORKER_TAB_COUNT_MAX})</div>
+      <div class="dsbd-date-field dsbd-workercount-field">
+        <input type="number" id="dsbd-worker-count" min="${WORKER_TAB_COUNT_MIN}" max="${WORKER_TAB_COUNT_MAX}" step="1" value="${WORKER_TAB_COUNT_DEFAULT}">
       </div>
       <button id="dsbd-scan-export" class="dsbd-secondary">Scan &amp; Export List (CSV)</button>
       <button id="dsbd-upload" class="dsbd-secondary">Upload CSV to Run/Resume</button>
@@ -302,6 +321,35 @@
         color: #b0b0b0;
         border-left-color: #d6d6d6;
       }
+      #${PANEL_ID} .dsbd-eventlog-details {
+        margin-bottom: 10px;
+      }
+      #${PANEL_ID} .dsbd-eventlog-details summary {
+        font-size: 11px;
+        font-weight: 700;
+        color: #6b6b6b;
+        cursor: pointer;
+        text-transform: uppercase;
+        letter-spacing: .4px;
+      }
+      #${PANEL_ID} .dsbd-eventlog {
+        margin-top: 6px;
+        max-height: 110px;
+        overflow-y: auto;
+        font-size: 10.5px;
+        color: #6b6b6b;
+      }
+      #${PANEL_ID} .dsbd-eventlog-row {
+        padding: 3px 0;
+        border-bottom: 1px solid #f0f0f0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #${PANEL_ID} .dsbd-eventlog-empty {
+        color: #b0b0b0;
+        padding: 3px 0;
+      }
       #${PANEL_ID} .dsbd-field-label {
         font-size: 11px;
         font-weight: 700;
@@ -337,6 +385,10 @@
         outline: none;
         border-color: #ffcc22;
         box-shadow: 0 0 0 2px rgba(255,204,34,.35);
+      }
+      #${PANEL_ID} .dsbd-workercount-field {
+        width: 80px;
+        margin-bottom: 12px;
       }
       #${PANEL_ID} .dsbd-secondary {
         display: block;
@@ -403,6 +455,7 @@
     const progressEl = panel.querySelector("#dsbd-progress");
     const breakdownEl = panel.querySelector("#dsbd-breakdown");
     const workersEl = panel.querySelector("#dsbd-workers");
+    const eventLogEl = panel.querySelector("#dsbd-eventlog");
 
     const setStatus = text => {
       statusEl.textContent = text;
@@ -470,6 +523,33 @@
       breakdownEl.textContent = parts.join(" · ");
     }
 
+    // s.workerEvents arrives oldest-first (how background.js appends them)
+    // but is shown newest-first here, since the most recent event is what
+    // you actually came to check. describeWorkerEvent() (turning one event
+    // into a short line) lives in content/utils.js, not here - it's pure
+    // (no DOM), so it gets real unit test coverage there instead of being
+    // untestable trapped inside this closure.
+    function renderEventLog(s) {
+      const events = s.workerEvents || [];
+      eventLogEl.textContent = "";
+
+      if (!events.length) {
+        const empty = document.createElement("div");
+        empty.className = "dsbd-eventlog-empty";
+        empty.textContent = "No activity yet.";
+        eventLogEl.appendChild(empty);
+        return;
+      }
+
+      events.slice().reverse().forEach(evt => {
+        const row = document.createElement("div");
+        row.className = "dsbd-eventlog-row";
+        const time = evt.time ? new Date(evt.time).toLocaleTimeString() : "";
+        row.textContent = `${time} — ${describeWorkerEvent(evt)}`;
+        eventLogEl.appendChild(row);
+      });
+    }
+
     // Reads and validates the panel's own From/To date inputs - replaces
     // the old hardcoded SCAN_DATE_START/SCAN_DATE_END constants in
     // scan.js, so batch size (how much date range gets scanned/queued)
@@ -494,6 +574,22 @@
       return { start, end };
     }
 
+    // formatDateRangeLabel() (used below) lives in content/utils.js, not
+    // here - pure, no DOM, so it gets real unit test coverage there.
+
+    // Reads the "Worker tabs" field; parseWorkerTabCountInput() (in
+    // content/utils.js) does the actual clamping/fallback, same reasons
+    // as formatDateRangeLabel() above. Clamping here instead of rejecting
+    // out-of-range input is deliberate: unlike the date range (where an
+    // invalid range means "the user needs to fix something before this
+    // can run at all"), a worker count outside [MIN, MAX] has an obvious,
+    // harmless correction (snap to the nearest bound), so silently doing
+    // that is less friction than blocking Start over it.
+    function readWorkerTabCount() {
+      const value = panel.querySelector("#dsbd-worker-count").value;
+      return parseWorkerTabCountInput(value, WORKER_TAB_COUNT_MIN, WORKER_TAB_COUNT_MAX, WORKER_TAB_COUNT_DEFAULT);
+    }
+
     // Shared by the Start button (after a live scan) and the CSV upload
     // handler below (which skips scanning entirely) - confirms with the
     // user, then hands the room list to background.js. Pulled out once
@@ -501,7 +597,12 @@
     // confirm+sendMessage flow twice. priorResults (only non-empty for a
     // resumed CSV upload) is forwarded as-is so background.js can seed
     // the new run's results/report with rooms already known to be done.
-    function beginRun(rooms, confirmMessage, priorResults = []) {
+    // dateRangeLabel (see formatDateRangeLabel() above) is only ever
+    // known for the live-scan call site below, not the CSV-upload one -
+    // rooms uploaded from a file have no date range at all, so it's
+    // deliberately optional here rather than required. background.js
+    // falls back to a plain timestamp-only filename when it's absent.
+    function beginRun(rooms, confirmMessage, priorResults = [], dateRangeLabel = null) {
       if (!rooms.length) {
         setStatus("No rooms to run - the list is empty.");
         return;
@@ -517,14 +618,27 @@
       setStatus(`Starting ${rooms.length} rooms...`);
       progressEl.textContent = `${priorResults.length} / ${rooms.length + priorResults.length}`;
 
+      // No callback argument - sendMessage only returns a Promise to
+      // .catch() when called this way; passing a callback makes it
+      // return undefined instead (Chrome's API contract), which would
+      // make a chained .catch() throw immediately on every call. This
+      // form catches "Extension context invalidated" (a stale content
+      // script left over from before the extension was last reloaded -
+      // real, expected Chrome behavior), which previously left the
+      // status line stuck on "Starting..." forever with no indication
+      // anything was wrong.
       chrome.runtime.sendMessage({
         type: "DS_START_QUEUE",
         rooms,
-        priorResults
-      }, response => {
+        priorResults,
+        workerTabCount: readWorkerTabCount(),
+        dateRangeLabel
+      }).then(response => {
         if (!response?.ok) {
           setStatus(response?.reason || "Could not start.");
         }
+      }).catch(() => {
+        setStatus("Could not reach the extension - reload this page and try again (the extension was likely reloaded since this page loaded).");
       });
     }
 
@@ -635,15 +749,23 @@
 
       setStatus(`Found ${rooms.length} rooms in range. Exporting CSV...`);
 
+      // No callback argument, same reason as beginRun() above - this is
+      // exactly the call that produced a real "Extension context
+      // invalidated" error (a stale content script from before the
+      // extension was last reloaded) with the status line stuck on
+      // "Exporting CSV..." forever, no callback ever firing.
       chrome.runtime.sendMessage({
         type: "DS_EXPORT_SCAN_LIST",
-        rooms
-      }, response => {
+        rooms,
+        dateRangeLabel: formatDateRangeLabel(dateRange)
+      }).then(response => {
         if (response?.ok) {
           setStatus(`Exported ${rooms.length} rooms to: ${response.filename}`);
         } else {
           setStatus(response?.reason || "Could not export CSV.");
         }
+      }).catch(() => {
+        setStatus("Could not reach the extension - reload this page and try again (the extension was likely reloaded since this page loaded).");
       });
     });
 
@@ -703,7 +825,9 @@
 
       beginRun(
         rooms,
-        `Found ${rooms.length} rooms.\n\nThis will open worker tabs, download each room's documents, save each ZIP inside its own room folder, and create a CSV report when done.\n\nChrome may ask you to allow multiple downloads.\n\nContinue?`
+        `Found ${rooms.length} rooms.\n\nThis will open worker tabs, download each room's documents, save each ZIP inside its own room folder, and create a CSV report when done.\n\nChrome may ask you to allow multiple downloads.\n\nContinue?`,
+        [],
+        formatDateRangeLabel(dateRange)
       );
     });
 
@@ -746,6 +870,7 @@
       progressEl.textContent = `${s.results?.length || 0} / ${s.total || 0}`;
       renderBreakdown(s);
       renderWorkers(s);
+      renderEventLog(s);
 
       updateButtonStates(s);
 
@@ -754,19 +879,27 @@
       } else if (s.running) {
         setStatus(runningStatusText(s));
       } else if (s.finishedAt) {
-        setStatus("Done. CSV report saved in Downloads / Docusign Rooms / _Download Reports.");
+        setStatus("Done. Download report and activity log saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.");
       }
     });
 
-    chrome.runtime.sendMessage({ type: "DS_GET_STATUS" }, response => {
+    // No callback argument, same reason as beginRun()/the CSV export
+    // handler above - lets .catch() actually receive "Extension context
+    // invalidated" if this panel is a stale copy from before the last
+    // extension reload, instead of silently sitting on the initial
+    // "Ready" state with no indication it never connected.
+    chrome.runtime.sendMessage({ type: "DS_GET_STATUS" }).then(response => {
       const s = response?.state;
       if (!s) return;
       progressEl.textContent = `${s.results?.length || 0} / ${s.total || 0}`;
       renderBreakdown(s);
       renderWorkers(s);
+      renderEventLog(s);
       updateButtonStates(s);
       if (s.running) setStatus(runningStatusText(s));
       else if (s.paused) setStatus("Paused.");
+    }).catch(() => {
+      setStatus("Could not reach the extension - reload this page.");
     });
   }
 

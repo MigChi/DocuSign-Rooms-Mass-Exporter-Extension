@@ -33,11 +33,13 @@ documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms
 - **Start/Stop and Pause/Resume**, each a single toggle button whose
   label and color are driven by the extension's actual live state, not
   guessed from the last click.
-- **Concurrent multi-tab processing** — a pool of worker tabs (currently
-  3, hardcoded for now) claim rooms from a shared queue independently,
-  with no explicit locking: the claim itself is a single synchronous
-  step, safe because the extension's background service worker is
-  inherently single-threaded.
+- **Concurrent multi-tab processing** — a pool of worker tabs (1-8,
+  user-configurable via the panel's "Worker Tabs" field, default 3)
+  claim rooms from a shared queue independently, with no explicit
+  locking: the claim itself is a single synchronous step, safe because
+  the extension's background service worker is inherently
+  single-threaded. A worker tab dying mid-run (closed, crashed, or
+  reclaimed by Chrome) is detected and replaced automatically.
 - **Persistence across interruptions** — progress is checkpointed to
   `chrome.storage.local` as the run progresses, and resume is computed
   as "whatever doesn't have a result yet" rather than a saved position -
@@ -93,11 +95,24 @@ documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms
 | What | Where |
 |---|---|
 | Each room's documents | `Downloads/Docusign Rooms/<Room Name>/<Room Name>.zip` |
-| Scan List CSV (from "Scan & Export List") | `Downloads/Docusign Rooms/_Scan Lists/Scan List <timestamp>.csv` |
-| Download Report CSV (after Start finishes or Stop) | `Downloads/Docusign Rooms/_Download Reports/Docusign Rooms Download Report <timestamp>.csv` |
+| Scan List CSV (from "Scan & Export List") | `Downloads/Docusign Rooms/_Scan Lists/Scan List (<date range>) <timestamp>.csv` |
+| Download Report CSV (after Start finishes or Stop) | `Downloads/Docusign Rooms/_Download Reports/Docusign Rooms Download Report (<date range>) <timestamp>.csv` |
+| Activity Log CSV (after Start finishes or Stop) | `Downloads/Docusign Rooms/_Activity Logs/Activity Log (<date range>) <timestamp>.csv` |
 
-The Download Report is also the file to re-upload via "Upload CSV to
-Run/Resume" if a run gets interrupted.
+All three filenames include the scan's From/To date range (e.g.
+`(2026-01-01 to 2026-03-01)`) so they're identifiable without opening
+them — useful after several test/production runs pile up in the same
+Downloads folder. The `(<date range>)` segment is omitted for a run
+started via "Upload CSV to Run/Resume" instead of a live scan, since
+that path has no date range to begin with (falls back to the plain
+`<name> <timestamp>.csv` form these exports always used). The Download
+Report is also the file to re-upload via "Upload CSV to Run/Resume" if a
+run gets interrupted. The Activity Log is the same worker/service-worker
+lifecycle history shown in the panel's Activity Log (see `DESIGN.md`'s
+Decision 15) — service worker restarts, why resume did or didn't
+proceed, worker tabs dying and being replaced — saved to a file so it
+doesn't only exist in a panel that scrolled past its cap or a job that's
+already been cleared.
 
 ## Testing
 
@@ -161,18 +176,21 @@ than silently rewritten into the original text.
 
 ## Roadmap
 
-Multi-tab processing (Decisions 2 & 3 in `DESIGN.md`) is done — a fixed
-pool of worker tabs claim rooms from a shared queue concurrently, with
+Multi-tab processing (Decisions 2 & 3 in `DESIGN.md`) is done — a pool of
+worker tabs claim rooms from a shared queue concurrently, with
 persistence reworked to stay crash-safe under concurrency (see `DESIGN.md`
 Decision 6's corrections). The panel now shows a live per-worker-tab
-breakdown and a results-by-outcome tally (`DESIGN.md` Decision 14), and
-a Node-based automated test suite covers the project's pure logic
-(Decision 13). One item remains:
+breakdown and a results-by-outcome tally (`DESIGN.md` Decision 14), a
+Node-based automated test suite covers the project's pure logic
+(Decision 13), and the worker-tab count is user-configurable within
+bounds (1-8, Decision 17) instead of a hardcoded constant. One item
+remains:
 
-1. **Adaptive worker-tab count** — a suggested concurrency level based
-   on measured time-per-room, within safe min/max bounds, replacing the
-   currently-hardcoded `WORKER_TAB_COUNT`. Real timing data to build
-   this against now exists, since concurrent processing is live.
+1. **Adaptive worker-tab count suggestion** — Decision 17 added the
+   *manual, bounded* half of this (a number field, clamped 1-8); what's
+   still missing is *suggesting* a value based on measured time-per-room
+   rather than just accepting whatever the user enters. Real timing data
+   to build this against now exists, since concurrent processing is live.
 
 Also open, not yet scoped as a real feature: a full per-*room* (not just
 per-worker-tab) status breakdown covering all 10,000+ rooms in a run
@@ -212,9 +230,12 @@ summary of it, not a second copy that can drift.
 | 3. Panel UI + Start/Stop/Pause/Resume | A single always-visible control surface reflecting real state | Done, later extended with a per-worker-tab breakdown (phase 5b) | The original toolbar popup was removed entirely rather than fixed, since the in-page panel already worked and having two half-working control surfaces was worse than one working one. |
 | 4. Persistence & resume | Survive Chrome killing the (deliberately ephemeral) MV3 service worker mid-run | Done, then reworked in phase 5 | Early version resumed from a saved queue *index* — safe only because single-tab guaranteed at most one claimed-but-unfinished room at a time. The CSV-upload resume path initially dropped already-`Downloaded` rows instead of preserving them, losing the record of everything already completed. The download report itself only covered rooms actually reached, silently omitting anything still queued when a run stopped. |
 | 5. Multi-tab worker pool (concurrency) | Multiple tabs claiming from one shared queue, without a mutex | Done, fixed tab count | The index-based resume from phase 4 became actively unsafe under concurrency (could silently drop claimed-but-unfinished rooms) — replaced with "resume = queue minus anything with a result." A synchronous "already running" guard had a race window an `await` earlier had left open. Downloads stopped registering at all under concurrency; first suspected `active: false` on worker tabs, but the same symptom persisted after reverting it — the real cause was worker tabs' downloads opening in a `target="_blank"` browsing context, so `DownloadItem.tabId` never matched the tab that triggered it. The first fix's regex matched `/rooms/<id>/` but the real download URL used DocuSign's internal `/transaction/<id>/` path. Once folder routing worked again, two distinct rooms sharing the same display name were found silently merging into one folder. |
-| 5a. Automated testing | Cover the project's pure logic with a real test suite, without pretending DOM/timing-heavy code can be unit tested | Done — 24 tests, `node:test` | This machine had no Node/npm/Homebrew installed at all; installed Node's official `.pkg` via a GUI admin-privileges prompt (`osascript ... with administrator privileges`) since this environment's shell has no interactive `sudo`. `content/utils.js` and `background.js` were never written to be `require()`-able (plain globals / `importScripts()`, by design) - solved with guarded export tails that are no-ops in the real browser/service-worker runtime. |
+| 5a. Automated testing | Cover the project's pure logic with a real test suite, without pretending DOM/timing-heavy code can be unit tested | Done — 53 tests as of phase 5e, `node:test`, growing as new pure logic is added | This machine had no Node/npm/Homebrew installed at all; installed Node's official `.pkg` via a GUI admin-privileges prompt (`osascript ... with administrator privileges`) since this environment's shell has no interactive `sudo`. `content/utils.js` and `background.js` were never written to be `require()`-able (plain globals / `importScripts()`, by design) - solved with guarded export tails that are no-ops in the real browser/service-worker runtime. |
 | 5b. Per-worker-tab status breakdown | Show which worker tab has which room, and a results-by-outcome tally | Done | `currentRooms` was already sent to the panel but had its tab-ID keys flattened away by `Object.values()`; `workerTabIds` (needed to label rows "Worker 1/2/3") wasn't sent at all. Both fixed by sending more of what `background.js` already had, not by inventing new tracking. |
-| 6. Adaptive concurrency | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | Depends on real timing data from phase 5, which now exists to build against. |
+| 5c. 10k-scale readiness pass | Stress-test the assumptions behind "designed for 10,000 rooms" instead of just trusting the architecture | In progress, persistence now confirmed | A dead worker tab had no recovery mid-run - confirmed live by closing one (twice, including two at once), now fixed and confirmed working. The real persistence test (deliberately killing the service worker via `chrome://serviceworker-internals`, then reopening a Rooms tab) **succeeded** - confirmed twice in one session, each restart correctly resuming with a decreasing pending-room count. A stuck "Exporting CSV..." status was traced to a stale content script after an extension reload (`DESIGN.md` Decision 16) and fixed. Still open: `chrome.storage.local`'s default ~10MB quota (no `unlimitedStorage` permission declared) at 10k rooms' worth of persisted `queue`+`results`; the CSV report being written before downloads still in flight finish, which could show a trailing chunk of rooms as "stuck in progress" that actually completed seconds later. |
+| 5d. Configurable worker-tab count | Manual, bounded control over concurrency (1-8), ahead of the fuller adaptive-suggestion version in phase 6 | Done | A first version of the validation function silently mishandled `null`/empty input as "the number zero" (via `Number(null) === 0`) instead of "no value provided" - caught by the tests written for it, before it ever reached live testing. A second, more consequential bug - `ensureWorkerTabs()` never *shrinking* the tab pool, so lowering the count between two runs in one session silently had no effect - was found in phase 5e's code review, not live testing. |
+| 5e. Pre-real-run review pass | Full code/logic/documentation/test audit before committing to a run larger than ~25 rooms | Done | Found the `ensureWorkerTabs()` shrink bug above and wrote up a live-confirmed "kept opening new tabs after Stop" fix that had shipped previously but was never documented. Found three pure helper functions (date-range labeling, worker-tab-count validation, activity-log event descriptions) sitting untested purely because they were written inside `content.js`'s closure instead of `content/utils.js` - moved, given real coverage, no functional change (44 → 53 tests). Along the way, a doc comment that accidentally contained the literal characters `*/` broke `content/utils.js`'s syntax - caught immediately by `node --check`, before it reached anything. |
+| 6. Adaptive concurrency suggestion | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | The bounds half of this landed early, in phase 5d - what's left is the *measured, suggested* half. Depends on real timing data, which now exists to build against. |
 
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
@@ -508,6 +529,92 @@ practical at 10,000+ rooms instead of a few dozen.
     the existing results array - no new tracking, just exposing data
     `background.js` already had. Full reasoning in `DESIGN.md`'s
     Decision 14.
+  - **Fixed a worker tab dying mid-run having no recovery - confirmed live
+    by closing one on purpose.** `ensureWorkerTabs()` only ever checked
+    tab health once, at the very start of a run; a tab dying afterward
+    (closed by the user, reclaimed by Chrome, a crash) had no recovery at
+    all, and since all workers claim from one shared queue, a dead-tab
+    worker could burn through the remaining rooms far faster than the
+    healthy ones could do real work, mass-marking a chunk of the queue
+    "Failed" for a reason unrelated to those rooms. Fixed by checking tab
+    liveness inside `runWorker()`'s own loop, before every claim, and
+    creating a replacement tab in place if it's gone. Full reasoning in
+    `DESIGN.md`'s Decision 2, fifth correction.
+  - **Added a worker/service-worker lifecycle event log**, prompted by a
+    live persistence test reporting "it did not resume" with no way to
+    tell why. `logWorkerEvent()` records service-worker-start, why resume
+    did-or-didn't proceed, and worker-tab death/replacement to
+    `STATE.workerEvents` - console-logged immediately and persisted
+    alongside the job specifically so a restart (the one event most worth
+    seeing) doesn't also wipe the record of it. Shown in the panel under a
+    collapsed "Activity Log". This is diagnostic infrastructure, not a fix
+    for the resume report itself - that investigation is still open; see
+    `DESIGN.md`'s Decision 15.
+  - **Fixed "Scan & Export List" getting stuck on "Exporting CSV..."
+    forever.** Real cause: `content.js:724` threw `Uncaught (in promise)
+    Error: Extension context invalidated` - a stale content script left
+    over from before the extension was last reloaded. An earlier fix
+    added `.catch()` to `DS_STOP`/`DS_PAUSE`/`DS_RESUME` for this exact
+    scenario but missed `DS_START_QUEUE` and `DS_EXPORT_SCAN_LIST`, both
+    of which used the two-argument `sendMessage(message, callback)` form.
+    First fix attempt chained `.catch()` directly onto those - wrong,
+    since `sendMessage` returns `undefined` (not a Promise) when a
+    callback is given, which would have thrown on every single call, a
+    worse bug than the one being fixed. Caught before landing; corrected
+    by converting all of them (plus the initial `DS_GET_STATUS` panel-load
+    fetch, same gap) to the single-argument promise form already proven
+    correct elsewhere. Immediate workaround if you ever hit this: reload
+    the Docusign tab, not just the extension. Full incident in
+    `DESIGN.md`'s Decision 16.
+  - **The Activity Log now saves to a file too, not just the panel.**
+    `createEventLogReport()` exports the full accumulated worker/service-
+    worker event history to `Docusign Rooms/_Activity Logs/` alongside
+    the download report, whenever a run finishes or is Stopped - the
+    panel only shows the most recent 20 events and only while that tab
+    stays open, so without this the diagnostic history behind a run's
+    outcome couldn't be inspected after the fact.
+  - **Made the worker-tab count user-configurable (1-8), replacing the
+    hardcoded `WORKER_TAB_COUNT`.** A new "Worker Tabs" field in the panel
+    is validated and clamped (`clampWorkerTabCount()`), persisted with the
+    job so a resumed run keeps whatever count it started with, and bounded
+    rather than an open number field - several 10k-scale risks are still
+    under active investigation at the default of 3, and letting the count
+    go arbitrarily high before those are resolved would compound the
+    risks being chased rather than help isolate them. A bug in the first
+    version of the validation - `Number(null)` and `Number("")` both
+    evaluate to `0`, a real finite number, so missing/empty input was
+    silently clamped up to the minimum instead of falling back to the
+    default - was caught by the tests written for this feature, before it
+    ever reached live testing. Full reasoning in `DESIGN.md`'s Decision 17.
+  - **Added the scan's date range to all three exported CSV filenames**
+    (Scan List, Download Report, Activity Log), e.g. `Scan List
+    (2026-01-01 to 2026-03-01) 2026-08-11_16-43-05.csv` - requested after
+    several same-day test runs made the Downloads folder full of files
+    distinguishable only by generation timestamp. Falls back to the
+    original plain-timestamp filename for a run started via CSV upload
+    instead of a live scan, since that path has no date range to label
+    with in the first place. Full reasoning in `DESIGN.md`'s Decision 18.
+  - **Full pre-real-run review pass**, requested explicitly before
+    committing to a run larger than the ~25-room tests done so far:
+    code, logic, documentation, and test coverage all checked, not just
+    whatever the next live test happened to surface. Found two real bugs
+    by reading the code rather than running it: `ensureWorkerTabs()`
+    only ever grew the worker-tab pool, never shrank it, so starting a
+    *second* run with a lower Worker Tabs count than a previous one in
+    the same session would silently keep using the old, larger count -
+    directly undermining the feature's main intended use (dialing
+    concurrency down to isolate the ongoing 10k-scale investigation).
+    Also wrote up the "kept opening new tabs after Stop" fix from live
+    testing, which had shipped in a prior turn but was never documented.
+    Separately, found that three genuinely pure helper functions
+    (`formatDateRangeLabel`, the Worker Tabs field's validation,
+    `describeEvent`) were untestable purely because they'd been written
+    inside `content.js`'s closure rather than `content/utils.js` -
+    moved, given real test coverage, no functional change. Test suite
+    grew from 44 to 53. Full reasoning, including a small self-caught
+    mistake (a doc comment that accidentally contained `*/` and broke
+    the file's syntax, caught by `node --check` before it reached
+    anything), in `DESIGN.md`'s Decision 19.
 
 ---
 

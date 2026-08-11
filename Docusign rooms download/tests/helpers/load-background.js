@@ -15,8 +15,15 @@ const { makeChromeStub } = require("./chrome-stub");
 const BACKGROUND_PATH = path.join(__dirname, "..", "..", "background.js");
 const UTILS_PATH = path.join(__dirname, "..", "..", "content", "utils.js");
 
-function freshBackground() {
-  global.chrome = makeChromeStub();
+// `storageLocalGet`, if given, replaces the stub's chrome.storage.local.get
+// - the one override the startup-resume tests need, to simulate a
+// persisted job already existing when background.js's top-level resume
+// IIFE runs (that IIFE executes immediately on require(), before the
+// caller gets a chance to touch anything).
+function freshBackground({ storageLocalGet } = {}) {
+  const stub = makeChromeStub();
+  if (storageLocalGet) stub.storage.local.get = storageLocalGet;
+  global.chrome = stub;
 
   delete require.cache[require.resolve(BACKGROUND_PATH)];
   delete require.cache[require.resolve(UTILS_PATH)];
