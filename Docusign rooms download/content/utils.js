@@ -33,15 +33,45 @@ function sleep(ms) {
 
 /**
  * Sanitize a string for safe use as a filename/folder name (strips
- * \/:*?"<>|, collapses whitespace, caps length). Called on every room
- * name before it's used to build a download path.
+ * \/:*?"<>|, collapses whitespace, strips a trailing period/space, guards
+ * against a Windows reserved device name, caps length). Called on every
+ * room name before it's used to build a download path.
+ *
+ * The trailing period/space strip is the fix for a real bug confirmed
+ * live at scale: Windows (and Chrome's cross-platform downloads-path
+ * validation, which enforces this regardless of the user's actual OS)
+ * rejects a path segment ending in "." or " " - business names ending in
+ * an abbreviation like "LLC." or "Inc." are common enough that this
+ * showed up as a handful of real rooms (out of thousands) landing in the
+ * flat Downloads root instead of their own folder, each logging
+ * "Unchecked runtime.lastError: Invalid filename" - `suggest()` in
+ * background.js's onDeterminingFilename listener doesn't check for that
+ * error, so the failure was both real and completely silent until this
+ * was diagnosed from the console output directly. Applied after the
+ * length cap too (not just before), in case truncating to 120 characters
+ * exposed a new trailing period/space that wasn't there originally.
  */
 function cleanName(name) {
-    return String(name || "Unnamed Room")
+    let cleaned = String(name || "Unnamed Room")
       .replace(/[\\/:*?"<>|]/g, "-")
       .replace(/\s+/g, " ")
       .trim()
-      .slice(0, 120) || "Unnamed Room";
+      .slice(0, 120)
+      .replace(/[.\s]+$/, "");
+
+    if (!cleaned) return "Unnamed Room";
+
+    // Windows reserved device names are invalid as a file/folder name even
+    // with an extension attached (e.g. "CON.zip" is still invalid) -
+    // exceedingly unlikely to collide with a real room name, but cheap to
+    // guard against now that the trailing-period/space issue above showed
+    // Chrome's validation really does enforce Windows path rules
+    // regardless of platform.
+    if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(cleaned)) {
+      cleaned = `${cleaned}_`;
+    }
+
+    return cleaned;
 }
 
 /** Pull the numeric room ID out of a Docusign room URL, e.g. ".../rooms/2393913" -> "2393913". */
@@ -176,9 +206,78 @@ function describeWorkerEvent(evt) {
         return `Worker tab ${evt.oldTabId} replaced with tab ${evt.newTabId}`;
       case "worker_tab_replace_failed":
         return `Could not replace dead worker tab ${evt.tabId} - one worker is now down for the rest of this run`;
+      case "report_failed":
+        return `Failed to write the ${evt.stage === "activity_log" ? "activity log" : "download report"} CSV: ${evt.error}`;
+      case "waiting_for_downloads_to_settle":
+        return `Waiting for ${evt.count} download${evt.count === 1 ? "" : "s"} to finish before writing the report`;
       default:
         return evt.type;
     }
+}
+
+/**
+ * Converts an uploaded CSV's parsed rows into two lists, using the header
+ * row to find columns rather than assuming a fixed layout - works for
+ * either CSV this extension exports:
+ *   - rooms: still need processing (everything on a plain scan list, or
+ *     anything not marked "Downloaded"/"Complete (Empty)" on a download
+ *     report)
+ *   - priorResults: rows already marked "Downloaded" OR "Complete (Empty)"
+ *     on a download report, carried over in full (not just dropped) so a
+ *     resumed run's own report still shows them instead of only covering
+ *     whatever gets reprocessed. "Complete (Empty)" (see background.js's
+ *     processRoom()) is treated the same as "Downloaded" here - a room
+ *     correctly confirmed empty has nothing left to do, and without this
+ *     it would get re-visited on every single CSV-upload resume, wasting
+ *     real time at scale for a room that was never going to produce
+ *     anything different. This is what makes uploading a report a genuine
+ *     resume rather than a blind full re-run, without needing
+ *     chrome.storage.local at all (which doesn't survive a cleared
+ *     profile or a different computer - a CSV file on disk does).
+ */
+function parseUploadedCsv(rows) {
+    if (rows.length < 2) return { rooms: [], priorResults: [] };
+
+    const header = rows[0];
+    const nameIdx = header.indexOf("Room Name");
+    const idIdx = header.indexOf("Room ID");
+    const urlIdx = header.indexOf("Documents URL");
+    const statusIdx = header.indexOf("Status");
+    const reasonIdx = header.indexOf("Reason");
+    const filenameIdx = header.indexOf("Downloaded Filename");
+    const downloadIdIdx = header.indexOf("Download ID");
+    const timeIdx = header.indexOf("Time");
+
+    if (urlIdx === -1) return { rooms: [], priorResults: [] };
+
+    const rooms = [];
+    const priorResults = [];
+
+    rows.slice(1).forEach(r => {
+      const documentsUrl = r[urlIdx] || "";
+      if (!documentsUrl) return;
+
+      const roomId = idIdx === -1 ? "" : (r[idIdx] || "");
+      const roomName = nameIdx === -1 ? "" : (r[nameIdx] || "");
+      const status = statusIdx === -1 ? "" : (r[statusIdx] || "");
+
+      if (status === "Downloaded" || status === "Complete (Empty)") {
+        priorResults.push({
+          roomId,
+          roomName,
+          documentsUrl,
+          status,
+          reason: reasonIdx === -1 ? "" : (r[reasonIdx] || ""),
+          downloadedFilename: filenameIdx === -1 ? "" : (r[filenameIdx] || ""),
+          downloadId: downloadIdIdx === -1 ? "" : (r[downloadIdIdx] || ""),
+          time: timeIdx === -1 ? "" : (r[timeIdx] || "")
+        });
+      } else {
+        rooms.push({ roomId, roomName, documentsUrl });
+      }
+    });
+
+    return { rooms, priorResults };
 }
 
 // Test-only: `module` never exists in a content script or the service
@@ -199,7 +298,8 @@ if (typeof module !== "undefined" && module.exports) {
     parseCsv,
     formatDateRangeLabel,
     parseWorkerTabCountInput,
-    describeWorkerEvent
+    describeWorkerEvent,
+    parseUploadedCsv
   };
   Object.assign(globalThis, module.exports);
 }

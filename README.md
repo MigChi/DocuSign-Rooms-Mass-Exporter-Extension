@@ -32,7 +32,12 @@ documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms
   reached) is re-queued.
 - **Start/Stop and Pause/Resume**, each a single toggle button whose
   label and color are driven by the extension's actual live state, not
-  guessed from the last click.
+  guessed from the last click. Controls scanning too, not just the
+  download run — useful at real scale, where a scan across thousands of
+  rooms can take several minutes on its own. Scan-phase Stop/Pause only
+  apply within the current page session (not crash-persistent the way
+  the download run's are), and a stopped scan's partial results are
+  still used, not discarded.
 - **Concurrent multi-tab processing** — a pool of worker tabs (1-8,
   user-configurable via the panel's "Worker Tabs" field, default 3)
   claim rooms from a shared queue independently, with no explicit
@@ -54,9 +59,12 @@ documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms
   detected and skipped in under a second instead of waiting out a full
   timeout.
 - **Download report CSV** after every run (or Stop) — one row per room
-  that was ever queued, with its outcome (`Downloaded`, `Failed`,
-  `Download Error`, or `Waiting` for anything not yet reached), reason,
-  saved filename, and timestamp.
+  that was ever queued, with its outcome (`Downloaded`, `Complete
+  (Empty)` for a room with nothing to download, `Failed`, `Download
+  Error`, or `Waiting` for anything not yet reached), reason, saved
+  filename, and timestamp. `Downloaded` and `Complete (Empty)` rooms are
+  both skipped (not re-run) if this report is re-uploaded via "Upload
+  CSV to Run/Resume".
 - **Docusign-styled floating panel** — appears on any Rooms page,
   reflects the run's live status (including which rooms are actively
   processing across all worker tabs) regardless of which tab is doing
@@ -230,11 +238,14 @@ summary of it, not a second copy that can drift.
 | 3. Panel UI + Start/Stop/Pause/Resume | A single always-visible control surface reflecting real state | Done, later extended with a per-worker-tab breakdown (phase 5b) | The original toolbar popup was removed entirely rather than fixed, since the in-page panel already worked and having two half-working control surfaces was worse than one working one. |
 | 4. Persistence & resume | Survive Chrome killing the (deliberately ephemeral) MV3 service worker mid-run | Done, then reworked in phase 5 | Early version resumed from a saved queue *index* — safe only because single-tab guaranteed at most one claimed-but-unfinished room at a time. The CSV-upload resume path initially dropped already-`Downloaded` rows instead of preserving them, losing the record of everything already completed. The download report itself only covered rooms actually reached, silently omitting anything still queued when a run stopped. |
 | 5. Multi-tab worker pool (concurrency) | Multiple tabs claiming from one shared queue, without a mutex | Done, fixed tab count | The index-based resume from phase 4 became actively unsafe under concurrency (could silently drop claimed-but-unfinished rooms) — replaced with "resume = queue minus anything with a result." A synchronous "already running" guard had a race window an `await` earlier had left open. Downloads stopped registering at all under concurrency; first suspected `active: false` on worker tabs, but the same symptom persisted after reverting it — the real cause was worker tabs' downloads opening in a `target="_blank"` browsing context, so `DownloadItem.tabId` never matched the tab that triggered it. The first fix's regex matched `/rooms/<id>/` but the real download URL used DocuSign's internal `/transaction/<id>/` path. Once folder routing worked again, two distinct rooms sharing the same display name were found silently merging into one folder. |
-| 5a. Automated testing | Cover the project's pure logic with a real test suite, without pretending DOM/timing-heavy code can be unit tested | Done — 53 tests as of phase 5e, `node:test`, growing as new pure logic is added | This machine had no Node/npm/Homebrew installed at all; installed Node's official `.pkg` via a GUI admin-privileges prompt (`osascript ... with administrator privileges`) since this environment's shell has no interactive `sudo`. `content/utils.js` and `background.js` were never written to be `require()`-able (plain globals / `importScripts()`, by design) - solved with guarded export tails that are no-ops in the real browser/service-worker runtime. |
+| 5a. Automated testing | Cover the project's pure logic with a real test suite, without pretending DOM/timing-heavy code can be unit tested | Done — 78 tests as of phase 5h, `node:test`, growing as new pure logic is added | This machine had no Node/npm/Homebrew installed at all; installed Node's official `.pkg` via a GUI admin-privileges prompt (`osascript ... with administrator privileges`) since this environment's shell has no interactive `sudo`. `content/utils.js` and `background.js` were never written to be `require()`-able (plain globals / `importScripts()`, by design) - solved with guarded export tails that are no-ops in the real browser/service-worker runtime. |
 | 5b. Per-worker-tab status breakdown | Show which worker tab has which room, and a results-by-outcome tally | Done | `currentRooms` was already sent to the panel but had its tab-ID keys flattened away by `Object.values()`; `workerTabIds` (needed to label rows "Worker 1/2/3") wasn't sent at all. Both fixed by sending more of what `background.js` already had, not by inventing new tracking. |
 | 5c. 10k-scale readiness pass | Stress-test the assumptions behind "designed for 10,000 rooms" instead of just trusting the architecture | In progress, persistence now confirmed | A dead worker tab had no recovery mid-run - confirmed live by closing one (twice, including two at once), now fixed and confirmed working. The real persistence test (deliberately killing the service worker via `chrome://serviceworker-internals`, then reopening a Rooms tab) **succeeded** - confirmed twice in one session, each restart correctly resuming with a decreasing pending-room count. A stuck "Exporting CSV..." status was traced to a stale content script after an extension reload (`DESIGN.md` Decision 16) and fixed. Still open: `chrome.storage.local`'s default ~10MB quota (no `unlimitedStorage` permission declared) at 10k rooms' worth of persisted `queue`+`results`; the CSV report being written before downloads still in flight finish, which could show a trailing chunk of rooms as "stuck in progress" that actually completed seconds later. |
 | 5d. Configurable worker-tab count | Manual, bounded control over concurrency (1-8), ahead of the fuller adaptive-suggestion version in phase 6 | Done | A first version of the validation function silently mishandled `null`/empty input as "the number zero" (via `Number(null) === 0`) instead of "no value provided" - caught by the tests written for it, before it ever reached live testing. A second, more consequential bug - `ensureWorkerTabs()` never *shrinking* the tab pool, so lowering the count between two runs in one session silently had no effect - was found in phase 5e's code review, not live testing. |
 | 5e. Pre-real-run review pass | Full code/logic/documentation/test audit before committing to a run larger than ~25 rooms | Done | Found the `ensureWorkerTabs()` shrink bug above and wrote up a live-confirmed "kept opening new tabs after Stop" fix that had shipped previously but was never documented. Found three pure helper functions (date-range labeling, worker-tab-count validation, activity-log event descriptions) sitting untested purely because they were written inside `content.js`'s closure instead of `content/utils.js` - moved, given real coverage, no functional change (44 → 53 tests). Along the way, a doc comment that accidentally contained the literal characters `*/` broke `content/utils.js`'s syntax - caught immediately by `node --check`, before it reached anything. |
+| 5f. First real-scale test (8000 rooms) | Actually run the tool at something close to the 10,000-room scale it was designed for, not just a ~25-room smoke test | Found two real gaps | CSV export hung forever with no error - `encodeURIComponent()` throwing on a lone UTF-16 surrogate somewhere in 8000 real room names, outside the handler's `try` block, so `sendResponse()` never fired and the caller never knew anything was wrong. Fixed with `safeEncodeURIComponent()` plus a widened `try/catch`, and the same latent bug closed in `createReport()`/`createEventLogReport()` before it could cause an identical silent failure there. Separately: scanning had no Stop/Pause at all, fine for a 25-room test that finishes in seconds, a real gap for an 8000-room scan running several minutes - added, session-scoped (not crash-persistent like the download run's). See `DESIGN.md` Decisions 20 and 21. |
+| 5g. CSV-upload resume reliability | Make Stop-then-reupload actually trustworthy, raised mid-run on the same 8000-room test | Done | A room whose ZIP was still downloading when the report was generated could show `Success/Attempted` instead of `Downloaded`, even though it finished fine seconds later - since resume only skips rows marked `Downloaded`, that room would get needlessly re-downloaded. Fixed with a bounded wait for in-flight downloads before writing the reports. Separately, empty rooms were marked `Failed` (not their own outcome), so every resume re-checked every empty room from scratch - fixed with a distinct `Complete (Empty)` status, also skipped on resume. `parseUploadedCsv()` was found to be pure and untested, sitting inside `content.js`'s closure the same way three other functions were in phase 5e - moved to `content/utils.js`, given real coverage of the exact behavior changed here. See `DESIGN.md` Decision 22. |
+| 5h. Trailing-period filename bug | Diagnose "some files did not get saved to the Docusign Rooms folder" from the same 8000-room run | Done | Confirmed via the user's own console (`Unchecked runtime.lastError: Invalid filename`) and the actual Download Report CSV - 5 real rooms, all named with a street-abbreviation period (`"124 Rosman Rd."`, `"1 Landmark Sq."`, etc.), all landed in the flat Downloads root. First diagnostic pass looked at the wrong CSV column (`Downloaded Filename`, which Chrome overwrites with its own fallback name) and seemed to contradict the trailing-period theory until the *Room Name* column was checked instead. Fixed in `cleanName()` - the single function every folder/file name in this codebase passes through - plus a Windows-reserved-device-name guard added at the same time. Regression tests added using the exact 5 confirmed room names, at both `cleanName()` and `computeFolderNames()` (the function `background.js` actually calls). See `DESIGN.md` Decision 23. |
 | 6. Adaptive concurrency suggestion | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | The bounds half of this landed early, in phase 5d - what's left is the *measured, suggested* half. Depends on real timing data, which now exists to build against. |
 
 Every issue above is one line here and a full paragraph in either
@@ -615,6 +626,74 @@ practical at 10,000+ rooms instead of a few dozen.
     mistake (a doc comment that accidentally contained `*/` and broke
     the file's syntax, caught by `node --check` before it reached
     anything), in `DESIGN.md`'s Decision 19.
+  - **Fixed CSV export hanging forever with no error, found live on the
+    first real-scale test (an 8000-room scan).** Root cause:
+    `encodeURIComponent()` throws on a lone UTF-16 surrogate, which
+    `DS_EXPORT_SCAN_LIST`'s handler didn't guard against - the odds of
+    hitting one in a 25-room test are near zero, but real at 8000 real
+    room names. Since the throw happened outside the handler's `try`
+    block, `sendResponse()` was never called and the content script's
+    `sendMessage()` call just hung indefinitely - it only rejects when
+    the message channel itself closes, not when the other side throws
+    internally. Fixed with `safeEncodeURIComponent()` (falls back to
+    replacing only genuinely unpaired surrogates, preserving valid ones
+    like an emoji in a room name) used everywhere a CSV becomes a
+    `data:` URL, plus widening the `try/catch` to cover the whole
+    handler so any future throw there is reported instead of hanging.
+    The identical vulnerability in `createReport()`/
+    `createEventLogReport()` was silent rather than a hang (a bare
+    `.catch(() => "")` swallowed it) - now logged via a new
+    `report_failed` Activity Log event instead of vanishing without a
+    trace. Full reasoning in `DESIGN.md`'s Decision 20.
+  - **Added Stop/Pause/Resume for scanning**, not just the download run -
+    confirmed live as a real gap once scans reached real scale (an
+    8000-room scan has no way to interrupt it once started, only wait
+    it out). The same Start/Stop and Pause/Resume buttons now control
+    whichever phase is active; scan-phase control is session-only, not
+    crash-persistent like the download run's, since scanning has no
+    natural checkpoint the way `chrome.storage.local`-backed run
+    persistence does. A stopped scan still uses whatever rooms it had
+    already collected, rather than discarding them. Full reasoning in
+    `DESIGN.md`'s Decision 21.
+  - **Made CSV-upload resume actually reliable**, prompted mid-run on the
+    same 8000-room test: "I've seen CSVs where the room downloaded but
+    the status was Success/Attempted." Two fixes. First, a report-timing
+    race - `createReport()` ran the instant every worker ran out of
+    rooms to claim, not once every started download had actually
+    finished, so a room whose ZIP was still downloading could get
+    reported as `Success/Attempted` even though it finished fine
+    moments later - and since re-uploading a report only skips rows
+    marked `Downloaded`, that room would get needlessly re-downloaded.
+    Fixed with `waitForInFlightDownloadsToSettle()`, a bounded
+    (20s-max) wait for in-flight downloads before the reports are
+    written. Second: empty rooms were marked `Failed`, so every
+    CSV-upload resume re-visited and re-confirmed every empty room from
+    scratch - fixed with a distinct `Complete (Empty)` status that
+    `parseUploadedCsv()` now also skips re-running, without adding the
+    wasted 15s-download-wait that simply flipping the room to
+    "succeeded" would have caused. Full reasoning in `DESIGN.md`'s
+    Decision 22.
+  - **Fixed some rooms silently downloading to the flat Downloads root
+    instead of their own folder** - found live ("some files did not get
+    saved to the Docusign Rooms folder"), confirmed by the user's own
+    DevTools console showing `Unchecked runtime.lastError: Invalid
+    filename` and exactly 7 misplaced files out of thousands processed.
+    Root cause: `cleanName()` never stripped a trailing period or space,
+    and Chrome's downloads API rejects a suggested filename whose path
+    segment ends in either (a Windows rule Chrome enforces
+    cross-platform) - with no error-checking on the `suggest()` call,
+    the failure was completely silent, falling back to Chrome's default
+    download location. Business names ending in an abbreviation ("LLC.",
+    "Inc.", "Jr.") are common enough to hit this reliably at real scale
+    while never showing up in small test runs. Fixed at the source in
+    `cleanName()` (the one function every folder/file name in this
+    codebase passes through), also guarding against Windows reserved
+    device names (`CON`, `NUL`, etc.) as a related, cheap addition. A
+    separate `[DSBD] Unmatched download` warning in the same console
+    dump turned out to be an unrelated, already-expected symptom (the
+    CSV report exports themselves triggering the same listener, not a
+    second bug) - confirmed by checking the actual URL before assuming.
+    Full reasoning in `DESIGN.md`'s Decision 23.
 
 ---
 

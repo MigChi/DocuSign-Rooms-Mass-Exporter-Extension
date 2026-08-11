@@ -119,8 +119,17 @@
     const documentCount = getDocumentCount();
 
     if (documentCount === 0) {
+      // ok: true (nothing went wrong - correctly determined there's
+      // nothing to download) plus a distinct `empty: true` flag, not just
+      // ok: true alone - background.js's processRoom() uses `empty` to
+      // both give this a distinct "Complete (Empty)" status (instead of
+      // "Failed", so re-uploading a report to resume doesn't re-visit
+      // rooms already confirmed empty) and to skip its post-click
+      // waitForDownloadStart() wait, which would otherwise burn up to 15s
+      // waiting for a download that can never start.
       return {
-        ok: false,
+        ok: true,
+        empty: true,
         roomId,
         roomName,
         reason: "Room is empty (0 documents)"
@@ -515,6 +524,7 @@
 
       const parts = [];
       if (counts["Downloaded"]) parts.push(`Downloaded ${counts["Downloaded"]}`);
+      if (counts["Complete (Empty)"]) parts.push(`Empty ${counts["Complete (Empty)"]}`);
       if (counts["Success/Attempted"]) parts.push(`In progress ${counts["Success/Attempted"]}`);
       if (counts["Failed"]) parts.push(`Failed ${counts["Failed"]}`);
       if (counts["Download Error"]) parts.push(`Errors ${counts["Download Error"]}`);
@@ -642,63 +652,10 @@
       });
     }
 
-    // Converts an uploaded CSV's parsed rows into two lists, using the
-    // header row to find columns rather than assuming a fixed layout -
-    // works for either CSV this extension exports:
-    //   - rooms: still need processing (everything on a plain scan
-    //     list, or anything not marked "Downloaded" on a download report)
-    //   - priorResults: rows already marked "Downloaded" on a download
-    //     report, carried over in full (not just dropped) so a resumed
-    //     run's own report still shows them instead of only covering
-    //     whatever gets reprocessed. This is what makes uploading a
-    //     report a genuine resume rather than a blind full re-run,
-    //     without needing chrome.storage.local at all (which doesn't
-    //     survive a cleared profile or a different computer - a CSV
-    //     file on disk does).
-    function parseUploadedCsv(rows) {
-      if (rows.length < 2) return { rooms: [], priorResults: [] };
-
-      const header = rows[0];
-      const nameIdx = header.indexOf("Room Name");
-      const idIdx = header.indexOf("Room ID");
-      const urlIdx = header.indexOf("Documents URL");
-      const statusIdx = header.indexOf("Status");
-      const reasonIdx = header.indexOf("Reason");
-      const filenameIdx = header.indexOf("Downloaded Filename");
-      const downloadIdIdx = header.indexOf("Download ID");
-      const timeIdx = header.indexOf("Time");
-
-      if (urlIdx === -1) return { rooms: [], priorResults: [] };
-
-      const rooms = [];
-      const priorResults = [];
-
-      rows.slice(1).forEach(r => {
-        const documentsUrl = r[urlIdx] || "";
-        if (!documentsUrl) return;
-
-        const roomId = idIdx === -1 ? "" : (r[idIdx] || "");
-        const roomName = nameIdx === -1 ? "" : (r[nameIdx] || "");
-        const status = statusIdx === -1 ? "" : (r[statusIdx] || "");
-
-        if (status === "Downloaded") {
-          priorResults.push({
-            roomId,
-            roomName,
-            documentsUrl,
-            status,
-            reason: reasonIdx === -1 ? "" : (r[reasonIdx] || ""),
-            downloadedFilename: filenameIdx === -1 ? "" : (r[filenameIdx] || ""),
-            downloadId: downloadIdIdx === -1 ? "" : (r[downloadIdIdx] || ""),
-            time: timeIdx === -1 ? "" : (r[timeIdx] || "")
-          });
-        } else {
-          rooms.push({ roomId, roomName, documentsUrl });
-        }
-      });
-
-      return { rooms, priorResults };
-    }
+    // parseUploadedCsv() (used below) lives in content/utils.js, not here
+    // - pure, no DOM, so it gets real unit test coverage there instead of
+    // being untestable trapped inside this closure (same reasoning as
+    // formatDateRangeLabel() etc. above).
 
     const csvInput = panel.querySelector("#dsbd-csv-input");
 
@@ -719,13 +676,16 @@
 
       if (!rooms.length) {
         setStatus(priorResults.length
-          ? `Everything in ${file.name} is already marked Downloaded - nothing to run.`
+          ? `Everything in ${file.name} is already marked Downloaded or Complete (Empty) - nothing to run.`
           : "No usable rooms found in that CSV. Expected a Scan List or Download Report exported by this extension.");
         return;
       }
 
+      // "already-done" rather than "already-downloaded" - priorResults
+      // now also includes rooms marked Complete (Empty) (nothing was
+      // ever downloaded for those, correctly), not just Downloaded ones.
       const priorNote = priorResults.length > 0
-        ? ` (${priorResults.length} already-downloaded room${priorResults.length === 1 ? "" : "s"} preserved, not re-run)`
+        ? ` (${priorResults.length} already-done room${priorResults.length === 1 ? "" : "s"} preserved, not re-run)`
         : "";
 
       beginRun(
@@ -739,8 +699,15 @@
       const dateRange = readDateRange();
       if (!dateRange) return;
 
+      // Same scanControl the Start button uses (see its declaration
+      // below) - Stop/Pause on the shared buttons apply here too, since
+      // this calls the identical autoScrollAndCollectRooms().
+      scanControl = { stopped: false, paused: false };
+      updateButtonStates({ running: false, paused: false });
       setStatus("Auto-scrolling and collecting room links...");
-      const rooms = await autoScrollAndCollectRooms(setStatus, dateRange);
+      const rooms = await autoScrollAndCollectRooms(setStatus, dateRange, scanControl);
+      scanControl = null;
+      updateButtonStates({ running: false, paused: false });
 
       if (!rooms.length) {
         setStatus("No rooms found in the configured date range.");
@@ -774,6 +741,16 @@
 
     let isRunning = false;
     let isPaused = false;
+    // Non-null exactly while a scan (autoScrollAndCollectRooms) is
+    // in-flight, from either the Start button or "Scan & Export List" -
+    // client-side only, never sent to background.js, since a scan is a
+    // single content-script execution with no natural resume-after-reload
+    // point the way a download run has via chrome.storage.local. Lets the
+    // same Start/Stop and Pause/Resume buttons that already control a
+    // download run also control an in-progress scan - confirmed live as a
+    // real gap at real scale: an 8000-room scan previously had no way to
+    // stop or pause it once started.
+    let scanControl = null;
 
     // Drives both toggle buttons' label/color/disabled state off the
     // background's actual STATE (called from both the live status
@@ -782,21 +759,44 @@
     // keeps the buttons honest if state changes from something other
     // than a click on this exact panel instance (e.g. another tab's
     // copy of the panel, or a stop that hasn't round-tripped yet).
+    // Also factors in the client-only `scanControl` (background.js has no
+    // concept of a scan in progress, so `s` alone can't tell us this) -
+    // read directly as a closure variable rather than threaded through
+    // `s`, so every existing call site (the live broadcast listener, the
+    // initial status fetch) keeps working unchanged.
     function updateButtonStates(s) {
       isRunning = !!s.running;
       isPaused = !!s.paused;
 
-      startStopBtn.textContent = isRunning ? "Stop" : "Start";
-      startStopBtn.classList.toggle("dsbd-state-start", !isRunning);
-      startStopBtn.classList.toggle("dsbd-state-stop", isRunning);
+      const scanning = !!scanControl;
+      const active = isRunning || scanning;
+      const paused = isPaused || (scanning && scanControl.paused);
 
-      pauseResumeBtn.textContent = isPaused ? "Resume" : "Pause";
-      pauseResumeBtn.classList.toggle("dsbd-state-pause", !isPaused);
-      pauseResumeBtn.classList.toggle("dsbd-state-resume", isPaused);
-      pauseResumeBtn.disabled = !isRunning;
+      startStopBtn.textContent = active ? "Stop" : "Start";
+      startStopBtn.classList.toggle("dsbd-state-start", !active);
+      startStopBtn.classList.toggle("dsbd-state-stop", active);
+
+      pauseResumeBtn.textContent = paused ? "Resume" : "Pause";
+      pauseResumeBtn.classList.toggle("dsbd-state-pause", !paused);
+      pauseResumeBtn.classList.toggle("dsbd-state-resume", paused);
+      pauseResumeBtn.disabled = !active;
     }
 
     startStopBtn.addEventListener("click", async () => {
+      if (scanControl) {
+        // A scan is in progress (not yet a download run - that only
+        // starts once the scan finishes and beginRun() sends
+        // DS_START_QUEUE) - "Stop" here means stop the scan, not a run
+        // that hasn't started yet. Whatever was collected before this
+        // point is still used - see autoScrollAndCollectRooms()'s header
+        // comment for why a stopped scan isn't a wasted one.
+        const confirmed = confirm("Stop scanning? Rooms found so far will still be used.");
+        if (!confirmed) return;
+        scanControl.stopped = true;
+        setStatus("Stopping scan...");
+        return;
+      }
+
       if (isRunning) {
         const confirmed = confirm("Stop after the current step?");
         if (!confirmed) return;
@@ -815,8 +815,12 @@
       const dateRange = readDateRange();
       if (!dateRange) return;
 
+      scanControl = { stopped: false, paused: false };
+      updateButtonStates({ running: false, paused: false });
       setStatus("Auto-scrolling and collecting room links...");
-      const rooms = await autoScrollAndCollectRooms(setStatus, dateRange);
+      const rooms = await autoScrollAndCollectRooms(setStatus, dateRange, scanControl);
+      scanControl = null;
+      updateButtonStates({ running: false, paused: false });
 
       if (!rooms.length) {
         setStatus("No rooms found. Make sure you are on the Rooms list page.");
@@ -832,6 +836,13 @@
     });
 
     pauseResumeBtn.addEventListener("click", () => {
+      if (scanControl) {
+        scanControl.paused = !scanControl.paused;
+        setStatus(scanControl.paused ? "Pausing scan..." : "Resuming scan...");
+        updateButtonStates({ running: false, paused: false });
+        return;
+      }
+
       if (isPaused) {
         chrome.runtime.sendMessage({ type: "DS_RESUME" }).catch(() => {});
         setStatus("Resuming...");

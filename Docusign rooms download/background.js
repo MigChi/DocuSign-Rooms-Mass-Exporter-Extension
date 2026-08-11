@@ -236,6 +236,26 @@ function csvEscape(value) {
   return `"${s.replace(/"/g, '""')}"`;
 }
 
+// encodeURIComponent() throws URIError: "URI malformed" if given a string
+// containing a lone (unpaired) UTF-16 surrogate - vanishingly unlikely to
+// hit in a small test run, but confirmed live at real scale: an 8000-room
+// scan's CSV export got stuck forever with no error ever shown, consistent
+// with exactly this throw happening somewhere inside 8000 real room names
+// pulled from a live account, uncaught, leaving the message's sendResponse()
+// never called. Falls back to replacing only the genuinely unpaired
+// surrogates (U+FFFD) and retrying, rather than losing an entire 8000-room
+// export over one bad character in one room's name - a valid surrogate
+// pair (e.g. an emoji in a room name) is left untouched, since the fast
+// path above only fails at all when something in the string isn't valid.
+function safeEncodeURIComponent(str) {
+  try {
+    return encodeURIComponent(str);
+  } catch (e) {
+    const sanitized = str.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "�");
+    return encodeURIComponent(sanitized);
+  }
+}
+
 // Shared by every CSV export (scan list, download report, activity log)
 // so all three follow one naming convention rather than three slightly
 // different ones. `dateRangeLabel` is optional - null for anything not
@@ -385,7 +405,7 @@ async function createReport() {
   });
 
   const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
-  const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+  const dataUrl = "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
   const filename = `Docusign Rooms/_Download Reports/${labeledFilename("Docusign Rooms Download Report", STATE.runDateRangeLabel)}.csv`;
 
   await chrome.downloads.download({
@@ -419,7 +439,7 @@ async function createEventLogReport() {
   });
 
   const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
-  const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+  const dataUrl = "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
   const filename = `Docusign Rooms/_Activity Logs/${labeledFilename("Activity Log", STATE.runDateRangeLabel)}.csv`;
 
   await chrome.downloads.download({
@@ -448,6 +468,37 @@ async function waitForDownloadStart(roomId, timeoutMs = 15000) {
   }
 
   return false;
+}
+
+// Closes a real report-timing race, confirmed live: runQueue() used to
+// call createReport() the instant every worker ran out of rooms to claim
+// - but "claimed the last room" and "that room's ZIP finished downloading"
+// are different moments. A room whose download was still in flight (click
+// succeeded, chrome.downloads.onDeterminingFilename fired, but
+// onChanged's "complete" event hadn't arrived yet) got reported as
+// "Success/Attempted" instead of "Downloaded" even though the file landed
+// fine seconds later - and since parseUploadedCsv() in content.js only
+// treats a literal "Downloaded" status as already-done, re-uploading that
+// report to resume would re-download a room that had actually already
+// succeeded. STATE.downloads entries without completedAt or error are
+// still in flight; this polls until none remain or `timeoutMs` elapses,
+// whichever first - bounded so one genuinely stalled download (a real
+// possibility, not just a race) can't hang run completion indefinitely.
+// Whatever hasn't settled by the deadline is still reported as-is,
+// same as before this existed - not worse, just not always fully caught up.
+async function waitForInFlightDownloadsToSettle(timeoutMs = 20000) {
+  const stillUnsettled = () => Object.values(STATE.downloads).filter(d => !d.completedAt && !d.error);
+
+  const pendingCount = stillUnsettled().length;
+  if (!pendingCount) return;
+
+  logWorkerEvent("waiting_for_downloads_to_settle", { count: pendingCount });
+
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!stillUnsettled().length) return;
+    await sleep(300);
+  }
 }
 
 async function waitIfPausedOrStopped() {
@@ -551,8 +602,21 @@ async function processRoom(tabId, room) {
       const finalRoomName = cleanName(response?.roomName || guessedRoomName);
 
       result.roomName = finalRoomName;
-      result.status = response?.ok ? "Success/Attempted" : "Failed";
-      result.reason = response?.reason || (response?.ok ? "Download click attempted" : "Unknown failure");
+      // "Complete (Empty)" is its own outcome, not folded into "Failed" -
+      // an empty room isn't a failure, it's a correctly-determined
+      // terminal state with nothing to download. Kept separate from
+      // "Success/Attempted"/"Failed" so parseUploadedCsv() in content.js
+      // can treat it as already-done on a CSV-upload resume (alongside
+      // "Downloaded") instead of re-visiting a room already confirmed
+      // empty, and so the panel's breakdown can count it distinctly
+      // rather than mixing it into either bucket.
+      if (response?.empty) {
+        result.status = "Complete (Empty)";
+        result.reason = response?.reason || "Room is empty";
+      } else {
+        result.status = response?.ok ? "Success/Attempted" : "Failed";
+        result.reason = response?.reason || (response?.ok ? "Download click attempted" : "Unknown failure");
+      }
       result.time = new Date().toISOString();
       // Uses the precomputed, collision-disambiguated folder name (keyed
       // by roomId), not finalRoomName - onDeterminingFilename below only
@@ -570,7 +634,11 @@ async function processRoom(tabId, room) {
       // Real signal instead of a flat guess: wait for
       // chrome.downloads.onDeterminingFilename to actually fire for this
       // room (up to 15s) rather than always paying a fixed 4.5s.
-      if (response?.ok && !STATE.stopped) {
+      // Skipped for an empty room (!response?.empty) - there's no
+      // download to wait for, and waiting anyway would burn up to 15s per
+      // empty room for nothing, exactly the wasted time this whole
+      // "Complete (Empty)" status was added to avoid.
+      if (response?.ok && !response?.empty && !STATE.stopped) {
         await waitForDownloadStart(roomId, 15000);
       }
 
@@ -691,12 +759,28 @@ async function runQueue() {
   // nothing left to resume either way.
   await clearPersistedJob();
 
-  await createReport().catch(() => "");
-  // Same "both finished and Stopped end up here" reasoning as
-  // clearPersistedJob() above - one call after createReport() covers
-  // both. .catch() so a failure here (e.g. the storage-quota risk noted
-  // in Decision 15) can't prevent the run from being reported as done.
-  await createEventLogReport().catch(() => "");
+  // See waitForInFlightDownloadsToSettle()'s own comment - closes the gap
+  // between "every worker ran out of rooms to claim" and "every download
+  // that was ever started has actually finished," so the reports below
+  // reflect reality as closely as reasonably possible instead of a
+  // snapshot taken slightly too early.
+  await waitForInFlightDownloadsToSettle();
+
+  // Logged, not silently swallowed - a bare `.catch(() => "")` here would
+  // mean a genuinely failed report (the same safeEncodeURIComponent()
+  // scenario that made CSV export hang, or the storage-quota risk noted
+  // in Decision 15) leaves no trace anywhere that the run's report never
+  // got written at all. Still .catch()'d rather than awaited plainly -
+  // one failed report must not prevent the run from being marked done or
+  // block the other report from still being attempted.
+  await createReport().catch(err => {
+    console.error("[DSBD] createReport failed:", err);
+    logWorkerEvent("report_failed", { stage: "download_report", error: err?.message || String(err) });
+  });
+  await createEventLogReport().catch(err => {
+    console.error("[DSBD] createEventLogReport failed:", err);
+    logWorkerEvent("report_failed", { stage: "activity_log", error: err?.message || String(err) });
+  });
   await broadcastStatus();
 
   try {
@@ -835,28 +919,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === "DS_EXPORT_SCAN_LIST") {
-      const rooms = Array.isArray(message.rooms) ? message.rooms : [];
-
-      const rows = [
-        ["Room #", "Room Name", "Room ID", "Documents URL", "Created Date"]
-      ];
-
-      rooms.forEach((r, idx) => {
-        rows.push([
-          idx + 1,
-          r.roomName || "",
-          r.roomId || "",
-          r.documentsUrl || "",
-          String(r.createdDate || "").slice(0, 10)
-        ]);
-      });
-
-      const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
-      const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
-      const dateRangeLabel = typeof message.dateRangeLabel === "string" ? message.dateRangeLabel : null;
-      const filename = `Docusign Rooms/_Scan Lists/${labeledFilename("Scan List", dateRangeLabel)}.csv`;
-
+      // Wraps the ENTIRE handler, not just the chrome.downloads.download()
+      // call below - confirmed live as the actual bug behind an 8000-room
+      // scan's CSV export hanging forever with no error shown. Building
+      // `rows`/`csv`/`dataUrl` used to sit outside any try/catch; if any
+      // of that throws (the safeEncodeURIComponent() comment above
+      // explains the specific, confirmed cause), sendResponse() never
+      // gets called, the message channel is never told anything went
+      // wrong, and chrome.runtime.sendMessage() on the content.js side
+      // just hangs indefinitely - it only rejects when the channel itself
+      // closes, not merely because the handler threw internally.
       try {
+        const rooms = Array.isArray(message.rooms) ? message.rooms : [];
+
+        const rows = [
+          ["Room #", "Room Name", "Room ID", "Documents URL", "Created Date"]
+        ];
+
+        rooms.forEach((r, idx) => {
+          rows.push([
+            idx + 1,
+            r.roomName || "",
+            r.roomId || "",
+            r.documentsUrl || "",
+            String(r.createdDate || "").slice(0, 10)
+          ]);
+        });
+
+        const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
+        const dataUrl = "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
+        const dateRangeLabel = typeof message.dateRangeLabel === "string" ? message.dateRangeLabel : null;
+        const filename = `Docusign Rooms/_Scan Lists/${labeledFilename("Scan List", dateRangeLabel)}.csv`;
+
         await chrome.downloads.download({
           url: dataUrl,
           filename,
@@ -1120,6 +1214,8 @@ if (typeof module !== "undefined" && module.exports) {
     DEFAULT_WORKER_TAB_COUNT,
     MIN_WORKER_TAB_COUNT,
     MAX_WORKER_TAB_COUNT,
-    labeledFilename
+    labeledFilename,
+    safeEncodeURIComponent,
+    waitForInFlightDownloadsToSettle
   };
 }

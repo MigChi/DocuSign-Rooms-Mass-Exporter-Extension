@@ -117,11 +117,43 @@ function getRoomCardsAndLinks() {
 }
 
 /**
+ * Spin-waits while `scanControl.paused` is true (mirrors background.js's
+ * waitIfPausedOrStopped() for the download-run phase - same pattern, this
+ * is the scan-phase equivalent). Returns false once `scanControl.stopped`
+ * is true, true otherwise. `scanControl` is optional and client-side only
+ * (no chrome.storage.local persistence) - a scan is a single content-script
+ * execution with no natural resume-after-reload point the way a download
+ * run has, so Stop/Pause here only ever apply within one page session.
+ */
+async function waitIfScanPausedOrStopped(scanControl, updateStatus) {
+  if (!scanControl) return true;
+
+  while (scanControl.paused && !scanControl.stopped) {
+    updateStatus?.("Scan paused.");
+    await sleep(500);
+  }
+
+  return !scanControl.stopped;
+}
+
+/**
  * Entry point for scanning - called from content.js's injectPanel() when
  * Scan/Start is clicked, passing the date range read from the panel's own
  * date inputs (`{ start: Date, end: Date }`) - this used to be a pair of
  * hardcoded module constants; now the caller controls batch size directly
  * instead of needing a code edit per run.
+ *
+ * `scanControl` (optional, `{ stopped, paused }`) lets content.js's
+ * Start/Stop and Pause/Resume buttons interrupt a long scan - confirmed
+ * live as a real gap at real scale: an 8000-room scan has no way to stop
+ * or pause it once started, only Ctrl+scroll-and-wait. Checked once per
+ * loop iteration (before the next scroll), not continuously - pausing or
+ * stopping takes effect within one scroll cycle (~1.5-2s), not instantly,
+ * which is a fine tradeoff against polling more aggressively. Stopping
+ * mid-scan still returns whatever rooms were collected up to that point
+ * (the same `getRoomCardsAndLinks().filter(...)` call after the loop runs
+ * whether the loop finished naturally or was interrupted) rather than an
+ * empty list - a stopped scan's partial results are still usable.
  *
  * Forces List View via ensureListView() first (Grid View has no readable
  * rows for getRoomCardsAndLinks()), then attempts to set the sort to
@@ -137,7 +169,7 @@ function getRoomCardsAndLinks() {
  * only because the list is confirmed ascending by this point. Returns
  * the final list, filtered to [dateRange.start, dateRange.end].
  */
-async function autoScrollAndCollectRooms(updateStatus, dateRange) {
+async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = null) {
     ensureListView();
     await sleep(500);
 
@@ -160,6 +192,11 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange) {
     let outOfRangeStreak = 0
 
     while (noNewRoomAttempts < 7 && totalScrolls < 400) {
+      if (!(await waitIfScanPausedOrStopped(scanControl, updateStatus))) {
+        updateStatus?.("Scan stopped.");
+        break;
+      }
+
       const rooms = getRoomCardsAndLinks();
       const currentCount = rooms.length;
 

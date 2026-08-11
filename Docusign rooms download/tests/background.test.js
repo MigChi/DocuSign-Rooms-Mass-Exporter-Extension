@@ -57,6 +57,37 @@ test("computeFolderNames falls back to a generated name when roomName is missing
   assert.equal(folderNames.get("99"), "Docusign Room 99");
 });
 
+// End-to-end regression, one level up from cleanName()'s own tests in
+// tests/utils.test.js - confirms the actual function background.js calls
+// to build the real download path (STATE.folderNames.get(roomId), used by
+// both processRoom()'s reported filename and onDeterminingFilename's real
+// suggest() call) produces a safe folder name for every room name
+// confirmed live to have broken this. cleanName() being correct in
+// isolation doesn't guarantee computeFolderNames() passes its result
+// through untouched (e.g. the "(roomId)" disambiguation suffix logic
+// could theoretically reintroduce a trailing period some other way) -
+// this checks the thing background.js actually uses, not just its
+// building block.
+test("computeFolderNames produces a folder name with no trailing period/space for every room name confirmed live to have caused a misrouted download", () => {
+  const { computeFolderNames } = freshBackground();
+
+  const confirmedBadNames = [
+    "NJ-77, Bridgeton, NJ, USA.",
+    "124 Rosman Rd.",
+    "Greenberg - 156 Pine St.",
+    "1 Landmark Sq.",
+    "693 Squaw Brook Rd."
+  ];
+
+  const queue = confirmedBadNames.map((roomName, i) => ({ roomId: String(i + 1), roomName }));
+  const folderNames = computeFolderNames(queue);
+
+  queue.forEach(room => {
+    const folderName = folderNames.get(room.roomId);
+    assert.ok(!/[.\s]$/.test(folderName), `folder name for "${room.roomName}" must not end in a period/space (got "${folderName}")`);
+  });
+});
+
 test("csvEscape wraps every value in quotes and doubles internal quotes", () => {
   const { csvEscape } = freshBackground();
 
@@ -409,4 +440,97 @@ test("startup resume falls back to null runDateRangeLabel for a job persisted be
   await flushAsync();
 
   assert.equal(STATE.runDateRangeLabel, null);
+});
+
+test("safeEncodeURIComponent behaves identically to encodeURIComponent for normal strings", () => {
+  const { safeEncodeURIComponent } = freshBackground();
+
+  assert.equal(safeEncodeURIComponent("hello world"), encodeURIComponent("hello world"));
+  assert.equal(safeEncodeURIComponent("Room, with a comma"), encodeURIComponent("Room, with a comma"));
+});
+
+test("safeEncodeURIComponent preserves a valid surrogate pair (e.g. an emoji in a room name)", () => {
+  const { safeEncodeURIComponent } = freshBackground();
+
+  assert.equal(safeEncodeURIComponent("Room 😀 Name"), encodeURIComponent("Room 😀 Name"));
+});
+
+test("safeEncodeURIComponent doesn't throw on a lone surrogate, where encodeURIComponent would (regression: this hung an 8000-room CSV export live, with no error ever shown)", () => {
+  const { safeEncodeURIComponent } = freshBackground();
+
+  // A bare high surrogate with no matching low surrogate - real
+  // encodeURIComponent throws URIError: "URI malformed" on this.
+  assert.throws(() => encodeURIComponent("bad\uD800name"), URIError);
+  assert.doesNotThrow(() => safeEncodeURIComponent("bad\uD800name"));
+});
+
+test("safeEncodeURIComponent replaces only the lone surrogate, leaving the rest of the string and any valid pairs intact", () => {
+  const { safeEncodeURIComponent } = freshBackground();
+
+  const input = "good😀text\uD800end";
+  const result = safeEncodeURIComponent(input);
+
+  assert.ok(result.includes(encodeURIComponent("good")));
+  assert.ok(result.includes(encodeURIComponent("😀")), "the valid surrogate pair must survive untouched");
+  assert.ok(result.includes(encodeURIComponent("text")));
+  assert.ok(result.includes(encodeURIComponent("end")));
+  assert.ok(!result.includes("D800"), "the lone surrogate itself must not appear unescaped/unreplaced");
+});
+
+test("waitForInFlightDownloadsToSettle resolves immediately when nothing is in flight, without logging anything", async () => {
+  const { STATE, waitForInFlightDownloadsToSettle } = freshBackground();
+  // Let the startup resume IIFE's own logWorkerEvent calls (see
+  // "flushAsync" above) land first - otherwise they can arrive during
+  // this test's own `await` below and be mistaken for something this
+  // function logged.
+  await flushAsync();
+
+  STATE.downloads = {
+    1: { roomId: "1", completedAt: new Date().toISOString() },
+    2: { roomId: "2", error: "some error" }
+  };
+  const eventsBefore = STATE.workerEvents.length;
+
+  const start = Date.now();
+  await waitForInFlightDownloadsToSettle(5000);
+  const elapsedMs = Date.now() - start;
+
+  assert.ok(elapsedMs < 100, `expected an immediate return, took ${elapsedMs}ms`);
+  assert.equal(STATE.workerEvents.length, eventsBefore, "should not log a wait event when there was nothing to wait for");
+});
+
+test("waitForInFlightDownloadsToSettle resolves as soon as the remaining download settles, not waiting out the full timeout (regression: this closes the CSV-status race - a room could show 'Success/Attempted' instead of 'Downloaded' even though its ZIP had actually finished)", async () => {
+  const { STATE, waitForInFlightDownloadsToSettle } = freshBackground();
+
+  STATE.downloads = {
+    1: { roomId: "1" } // in flight - no completedAt or error yet
+  };
+
+  setTimeout(() => {
+    STATE.downloads[1].completedAt = new Date().toISOString();
+  }, 150);
+
+  const start = Date.now();
+  await waitForInFlightDownloadsToSettle(5000);
+  const elapsedMs = Date.now() - start;
+
+  assert.ok(elapsedMs < 1000, `expected to return shortly after settling (~150-450ms), took ${elapsedMs}ms - the timeout is 5000ms, so a much longer wait would mean it ignored the settle and waited out the timeout instead`);
+
+  const logged = STATE.workerEvents.find(e => e.type === "waiting_for_downloads_to_settle");
+  assert.ok(logged, "expected a waiting_for_downloads_to_settle event");
+  assert.equal(logged.count, 1);
+});
+
+test("waitForInFlightDownloadsToSettle gives up after the timeout if nothing ever settles, instead of hanging run completion indefinitely", async () => {
+  const { STATE, waitForInFlightDownloadsToSettle } = freshBackground();
+
+  STATE.downloads = {
+    1: { roomId: "1" } // never settles in this test
+  };
+
+  const start = Date.now();
+  await waitForInFlightDownloadsToSettle(400);
+  const elapsedMs = Date.now() - start;
+
+  assert.ok(elapsedMs >= 350 && elapsedMs < 2000, `expected to return around the 400ms timeout, took ${elapsedMs}ms`);
 });
