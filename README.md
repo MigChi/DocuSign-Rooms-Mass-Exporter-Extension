@@ -319,6 +319,7 @@ summary of it, not a second copy that can drift.
 | 5o. Exported CSVs get their real filename | Fix every exported report landing on disk as generic "download.csv"/"download (1).csv" instead of its labeled name | Done | `chrome.downloads.download()`'s `filename` option wasn't being reliably honored for `data:` URLs - confirmed directly against the account's own files. Fixed by suggesting the real filename explicitly via `onDeterminingFilename` (the same mechanism already proven for room ZIPs), checked before any room-matching logic runs. Verified end-to-end by driving the real export message path and confirming `suggest()` received the correct labeled name, not a fallback. See `DESIGN.md` Decision 30. |
 | 5p. Custom confirm dialog replaces native `confirm()` | Fix "Continue?" dialogs silently disappearing (never starting a run) when the panel window wasn't focused | Done | Found via a real Chrome console warning: native `confirm()`/`alert()`/`prompt()` are silently suppressed whenever the calling window isn't the frontmost one - and `panel.html` is a standalone popup window that a user reasonably switches away from during a multi-minute scan, right when the post-scan "Continue?" dialog would fire. Replaced with a custom in-page overlay (just page content, immune to window-focus suppression by construction) returning a `Promise<boolean>` instead of a synchronous value - `beginRun()` and the Start/Stop button's handler both became `async` accordingly. A real regression the native dialog couldn't have had was caught and fixed before shipping: unlike a truly OS-blocking `confirm()`, two Promise-based dialogs could overlap and cross-resolve if triggered close together - fixed by serializing every call through a shared promise chain. See `DESIGN.md` Decision 31. |
 | 5q. Docs moved to repo root, plain-text guide added, "Failed" wording rewritten | Reflect a manual doc reorganization, add a Notepad/TextEdit-friendly guide, and fix a misleading "Failed" explanation | Done | `DESIGN.md` and `HOW_TO_USE.md` moved from inside `Docusign rooms download/` up to the repo root - every relative link between the three docs updated accordingly (and one, `../../../README.md#roadmap` in `DESIGN.md`, turned out to have already been broken before the move). Extension code untouched by the move, confirmed with `node --check` on every `.js` file plus a full 97/97 `npm test` pass, not assumed safe. Added `HOW_TO_USE.txt`, a plain-text rendering of the same guide with headers/links converted to plain prose, for readers opening it outside GitHub. Rewrote the "Failed" explanation in `HOW_TO_USE.md`, `HOW_TO_USE.txt`, and the published Artifact: it almost always just means no Bulk Download button existed for that room (per `content.js`'s own failure reasons), not a real problem, and failed rooms can generally be ignored rather than investigated. See `DESIGN.md` Decision 32. |
+| 5r. Two ways a scan could silently hang forever, fixed | Audit the full scan relay end-to-end for anything that could make a scan "just stop" with no explanation, after being asked to double-check it | Done | Two real gaps, same failure shape as Decision 26/28's `STATE.running`/`scanning` fixes: (1) `content.js`'s `DS_BEGIN_SCAN` handler had no try/catch around the actual scan call - an uncaught throw inside it skipped the `DS_SCAN_COMPLETE` send entirely, leaving `STATE.scanning` stuck `true` forever with the panel frozen on its last progress line; (2) only the scan tab being *closed* was handled (`chrome.tabs.onRemoved`) - a navigation or reload of that same tab destroys the content script's execution context just as fatally, but the tab never closes, so nothing caught it. Fixed with a try/catch/finally in `content.js` that reports a real error instead of pretending 0 rooms were found, and a new `chrome.tabs.onUpdated` listener that catches the reload/navigation case the same way `onRemoved` already catches tab-close - both route through the existing `DS_SCAN_FAILED` broadcast the panel already understood. Also made `content/scan.js`'s two previously-silent scroll-loop exits (no new rooms; the 400-scroll hard cap) report explicitly why the loop ended, so a capped scan is visibly flagged instead of quietly returning a partial list that looks complete. Verified with 4 new regression tests that drive `background.js`'s actual message/tab-lifecycle listeners directly (`tests/helpers/chrome-stub.js` upgraded from silent no-op listener stubs to ones that actually capture and expose them) - not just code review. Full suite: 101/101. See `DESIGN.md` Decision 33. |
 | 6. Adaptive concurrency suggestion | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | The bounds half of this landed early, in phase 5d - what's left is the *measured, suggested* half. Depends on real timing data, which now exists to build against. |
 
 Every issue above is one line here and a full paragraph in either
@@ -933,6 +934,26 @@ practical at 10,000+ rooms instead of a few dozen.
     means in the common case: no Bulk Download button existed for that
     room, not a real problem, and generally safe to ignore rather than
     chase down. Full reasoning in `DESIGN.md`'s Decision 32.
+  - **Audited the full scan relay end-to-end and fixed two ways a scan
+    could silently hang forever** - asked directly to double-check
+    that the scanning feature doesn't "suddenly stop." Found the same
+    class of stuck-`STATE` bug the queue side already had fixed
+    (Decision 26/28), but not yet closed on the scan side: an uncaught
+    throw inside `autoScrollAndCollectRooms()` skipped the completion
+    message entirely, and only the scan tab being *closed* was
+    handled, not navigated away or reloaded - both left `STATE.scanning`
+    stuck `true` forever with the panel frozen on its last progress
+    line and no error shown. Fixed both, routed through the existing
+    `DS_SCAN_FAILED` broadcast the panel already understood from the
+    tab-closed case. Also gave `content/scan.js`'s two previously-silent
+    scroll-loop exits (no new rooms; the 400-scroll hard cap) an actual
+    status message, so a capped scan is visibly flagged instead of
+    quietly returning a partial list that looks complete. Verified with
+    4 new regression tests that drive `background.js`'s real message
+    and tab-lifecycle listeners directly - `tests/helpers/chrome-stub.js`
+    upgraded from silent no-op listener stubs to ones that capture and
+    expose them, closing a real test-coverage gap in the same pass, not
+    just reviewed by eye. Full reasoning in `DESIGN.md`'s Decision 33.
 
 ---
 

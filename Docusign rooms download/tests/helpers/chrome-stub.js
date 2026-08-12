@@ -8,11 +8,26 @@
  **************************************************************/
 
 function makeChromeStub() {
-  return {
-    runtime: {
-      onMessage: { addListener() {} },
-      sendMessage: async () => ({})
+  // `runtime.onMessage`/`tabs.onRemoved`/`tabs.onUpdated` capture whatever
+  // listener background.js registers (via `this._listener = fn`, `this`
+  // being the specific onX object each is called on) rather than silently
+  // discarding it like the old no-op stub did - lets tests drive
+  // background.js's actual message-dispatch and tab-lifecycle logic
+  // directly instead of only the pure functions it calls into. Every
+  // outbound chrome.runtime.sendMessage() call is collected in
+  // `runtime.sentMessages` so tests can assert on exactly what got
+  // broadcast to the panel, in order.
+  const runtime = {
+    onMessage: { addListener(fn) { this._listener = fn; } },
+    sendMessage: async message => {
+      runtime.sentMessages.push(message);
+      return {};
     },
+    sentMessages: []
+  };
+
+  return {
+    runtime,
     downloads: {
       onDeterminingFilename: { addListener() {} },
       onChanged: { addListener() {} },
@@ -35,7 +50,8 @@ function makeChromeStub() {
       update: async () => ({}),
       create: async () => ({ id: 1 }),
       sendMessage: async () => ({}),
-      onRemoved: { addListener() {} }
+      onRemoved: { addListener(fn) { this._listener = fn; } },
+      onUpdated: { addListener(fn) { this._listener = fn; } }
     },
     // Needed since the detached panel window (see DESIGN.md) - chrome.
     // action.onClicked.addListener() runs at require() time, same as the

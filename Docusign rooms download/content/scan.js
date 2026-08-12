@@ -192,10 +192,12 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
     let noNewRoomAttempts = 0;
     let totalScrolls = 0;
     let outOfRangeStreak = 0
+    let stoppedEarly = false;
 
     while (noNewRoomAttempts < 7 && totalScrolls < 400) {
       if (!(await waitIfScanPausedOrStopped(scanControl, updateStatus))) {
         updateStatus?.("Scan stopped.");
+        stoppedEarly = true;
         break;
       }
 
@@ -215,6 +217,7 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
 
       if (outOfRangeStreak >= 5) {
         updateStatus?.(`Stopping scroll: ${outOfRangeStreak} consecutive rooms out of date range.`);
+        stoppedEarly = true;
         break;
       }
 
@@ -232,6 +235,21 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
 
       await sleep(1500);
       totalScrolls++;
+    }
+
+    // The two loop-condition exits (as opposed to a `break` above) were
+    // previously silent - no updateStatus() call at all, unlike every other
+    // way the loop can end. That made a scan that legitimately ran out of
+    // new rooms to load indistinguishable, from the panel's perspective,
+    // from one that just stopped updating for no visible reason - exactly
+    // the kind of thing worth surfacing explicitly rather than leaving the
+    // user to guess whether something went wrong.
+    if (!stoppedEarly) {
+      if (noNewRoomAttempts >= 7) {
+        updateStatus?.(`Finished scrolling: no new rooms loaded after ${noNewRoomAttempts} attempts (${lastCount} found so far).`);
+      } else if (totalScrolls >= 400) {
+        updateStatus?.(`Stopping scroll: hit the ${totalScrolls}-scroll safety cap (${lastCount} found so far) - if this account has more rooms than that in range, narrow the date range and run in smaller batches.`);
+      }
     }
 
     return getRoomCardsAndLinks().filter(room => {

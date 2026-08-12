@@ -415,6 +415,92 @@ test("startup resume logs run_resumed when the persisted job has pending rooms",
   assert.equal(STATE.running, true);
 });
 
+test("DS_SCAN_COMPLETE with an error resets STATE.scanning and broadcasts DS_SCAN_FAILED instead of treating it as 0 rooms found (regression: content.js's autoScrollAndCollectRooms() throwing used to leave STATE.scanning stuck true forever with no signal to the panel at all - see DESIGN.md)", async () => {
+  const { STATE } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "start";
+  STATE.scanDateRangeLabel = "2021-01-01 to 2022-12-31";
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_COMPLETE", rooms: [], error: "boom" },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.equal(STATE.scanning, false);
+  assert.equal(STATE.scanTabId, null);
+  assert.equal(STATE.scanMode, null);
+
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.ok(failed, "expected a DS_SCAN_FAILED broadcast");
+  assert.match(failed.reason, /boom/);
+
+  const result = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_RESULT");
+  assert.equal(result, undefined, "a scan that actually threw should never be reported as a normal result");
+});
+
+test("a real DS_SCAN_COMPLETE (no error) still reports DS_SCAN_RESULT normally", async () => {
+  const { STATE } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "start";
+  STATE.scanDateRangeLabel = null;
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_COMPLETE", rooms: [{ roomId: "1" }] },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.equal(STATE.scanning, false);
+
+  const result = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_RESULT");
+  assert.ok(result, "expected a DS_SCAN_RESULT broadcast");
+  assert.equal(result.mode, "start");
+  assert.equal(result.rooms.length, 1);
+
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.equal(failed, undefined, "a successful scan should never be reported as failed");
+});
+
+test("chrome.tabs.onUpdated resets a stuck scan when the scan tab navigates or reloads mid-scan (regression: only tab CLOSE was previously handled via chrome.tabs.onRemoved - a reload/navigation destroys the content script's execution context the same way but never fires that event, since the tab itself never closes)", async () => {
+  const { STATE } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "start";
+  STATE.scanDateRangeLabel = "label";
+
+  global.chrome.tabs.onUpdated._listener(7, { status: "loading" });
+  await flushAsync();
+
+  assert.equal(STATE.scanning, false);
+  assert.equal(STATE.scanTabId, null);
+  assert.equal(STATE.scanMode, null);
+
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.ok(failed, "expected a DS_SCAN_FAILED broadcast");
+  assert.match(failed.reason, /reloaded or navigated/);
+});
+
+test("chrome.tabs.onUpdated ignores updates for a different tab, or a status that isn't a real navigation, so it can't misfire on the scan tab's ordinary in-app activity", () => {
+  const { STATE } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+
+  global.chrome.tabs.onUpdated._listener(99, { status: "loading" });
+  global.chrome.tabs.onUpdated._listener(7, { status: "complete" });
+
+  assert.equal(STATE.scanning, true, "an unrelated tab's navigation shouldn't touch an active scan");
+  assert.equal(STATE.scanTabId, 7);
+});
+
 test("clampWorkerTabCount passes through an in-range integer unchanged", () => {
   const { clampWorkerTabCount } = freshBackground();
 

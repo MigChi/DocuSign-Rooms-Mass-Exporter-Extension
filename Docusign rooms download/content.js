@@ -229,10 +229,32 @@
           end: new Date(message.dateRange.end)
         };
 
-        const rooms = await autoScrollAndCollectRooms(reportProgress, dateRange, scanControl);
-        scanControl = null;
-
-        chrome.runtime.sendMessage({ type: "DS_SCAN_COMPLETE", rooms }).catch(() => {});
+        // Confirmed directly (same class of bug as background.js's
+        // STATE.running/STATE.scanning stuck-forever fixes) that an
+        // uncaught throw anywhere inside autoScrollAndCollectRooms() - an
+        // unexpected page-structure change, a DOM call failing in a way
+        // this code didn't anticipate - would otherwise skip straight past
+        // the DS_SCAN_COMPLETE send below with no error and no signal at
+        // all. background.js's STATE.scanning would stay stuck `true`
+        // forever (nothing else resets it once a scan has actually
+        // started), and the panel would just sit frozen on its last
+        // progress line, looking exactly like a scan that silently died.
+        // Reported as a real failure instead of pretending nothing
+        // happened - background.js's DS_SCAN_COMPLETE handler checks
+        // `message.error` and forwards it as DS_SCAN_FAILED, the same path
+        // already used when the scan tab gets closed mid-scan.
+        try {
+          const rooms = await autoScrollAndCollectRooms(reportProgress, dateRange, scanControl);
+          chrome.runtime.sendMessage({ type: "DS_SCAN_COMPLETE", rooms }).catch(() => {});
+        } catch (error) {
+          chrome.runtime.sendMessage({
+            type: "DS_SCAN_COMPLETE",
+            rooms: [],
+            error: String(error?.message || error)
+          }).catch(() => {});
+        } finally {
+          scanControl = null;
+        }
       })();
 
       return;

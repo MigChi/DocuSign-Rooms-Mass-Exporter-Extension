@@ -1357,6 +1357,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       STATE.scanMode = null;
       STATE.scanDateRangeLabel = null;
 
+      // content.js sets this when autoScrollAndCollectRooms() itself threw
+      // (see its DS_BEGIN_SCAN handler) - state is already cleaned up above
+      // either way, but a thrown scan is not the same as a scan that
+      // legitimately found 0 rooms, so it gets routed through the same
+      // DS_SCAN_FAILED path the panel already understands (used today when
+      // the scan tab gets closed mid-scan) rather than silently proceeding
+      // as if nothing were wrong.
+      if (message.error) {
+        logWorkerEvent("scan_failed", { error: message.error });
+        chrome.runtime.sendMessage({ type: "DS_SCAN_FAILED", reason: `Scan failed: ${message.error}` }).catch(() => {});
+        return;
+      }
+
       const rooms = Array.isArray(message.rooms) ? message.rooms : [];
 
       if (mode === "export") {
@@ -1609,6 +1622,30 @@ chrome.tabs.onRemoved.addListener(tabId => {
 
   logWorkerEvent("scan_tab_closed", { tabId });
   chrome.runtime.sendMessage({ type: "DS_SCAN_FAILED", reason: "The Docusign tab was closed while scanning." }).catch(() => {});
+});
+
+// A full navigation or reload of the scan tab is just as fatal to an
+// in-flight scan as closing it outright - it destroys and replaces the
+// content script's entire JS execution context, silently taking
+// scanControl and the whole autoScrollAndCollectRooms() call with it, with
+// no error and no chrome.tabs.onRemoved event (the tab itself never
+// closes, only its page does). Without this listener, STATE.scanning would
+// stay stuck `true` forever exactly like the closed-tab case above, but
+// with no event to catch it - confirmed there was genuinely no other
+// signal available for this case. changeInfo.status === "loading" only
+// fires on a real navigation/reload (a new document being requested), not
+// on Docusign's own client-side route changes within the page, so this
+// can't misfire on ordinary in-app navigation.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (tabId !== STATE.scanTabId || changeInfo.status !== "loading") return;
+
+  STATE.scanning = false;
+  STATE.scanTabId = null;
+  STATE.scanMode = null;
+  STATE.scanDateRangeLabel = null;
+
+  logWorkerEvent("scan_tab_navigated", { tabId });
+  chrome.runtime.sendMessage({ type: "DS_SCAN_FAILED", reason: "The Docusign tab was reloaded or navigated away while scanning." }).catch(() => {});
 });
 
 // Module-level, not STATE - a live browser resource (a window either
