@@ -227,7 +227,7 @@ async function clearPersistedJob() {
 // need the (roomId) suffix; only a same-name collision *within* the same
 // year folder does. roomCreatedYear() (content/utils.js) is what decides
 // the year - see its own comment for why it's UTC-based, and why a room
-// with no usable createdDate falls into "Unknown Year" rather than being
+// with no usable createdDate falls into "Unassigned" rather than being
 // silently misfiled or dropped.
 function computeFolderNames(queue) {
   const keyCounts = new Map();
@@ -773,7 +773,7 @@ async function processRoom(tabId, room) {
       // room name differs slightly from what was in the original scan.
       const folderInfo = STATE.folderNames.get(roomId);
       const roomFolderName = folderInfo?.roomFolderName || finalRoomName;
-      const yearFolder = folderInfo?.year || "Unknown Year";
+      const yearFolder = folderInfo?.year || "Unassigned";
       result.downloadedFilename = `Docusign Rooms/${yearFolder}/${roomFolderName}/${roomFolderName}.zip`;
 
       STATE.results.push(result);
@@ -1034,7 +1034,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             // ISO string once it's round-tripped through an uploaded CSV
             // (parseUploadedCsv() in content/utils.js); roomCreatedYear()
             // accepts either. Previously dropped entirely here, which
-            // would have silently sent every room to "Unknown Year."
+            // would have silently sent every room to "Unassigned."
             createdDate: room.createdDate || null,
             // The room's own prior status, from parseUploadedCsv() - only
             // read below to decide which rooms are worth verifying against
@@ -1368,6 +1368,44 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
       filename: downloadItem.filename,
       currentRoomsInFlight: Object.values(STATE.currentRooms)
     });
+
+    // onDeterminingFilename fires for every download in the entire
+    // browser, not just this extension's - most "unmatched" downloads
+    // are something totally unrelated (a PDF from Gmail in some other
+    // tab, this extension's own CSV report exports via data: URLs) and
+    // must be left completely alone, exactly as before this check
+    // existed. Redirecting an unrelated download into this extension's
+    // folder just because a room lookup failed would be a much worse bug
+    // than the one being fixed here. Only a download whose URL actually
+    // matches the same /rooms/<id>/ or /transaction/<id>/ pattern
+    // findCurrentRoomForDownload() itself checks is treated as "ours,
+    // but unidentifiable" - a real Docusign document download that
+    // genuinely couldn't be matched to a tracked room (e.g. its
+    // STATE.currentRooms entry was already cleared by the time this
+    // fired - a timing edge case, not the common case). That one real
+    // gap used to mean the file silently escaped the Docusign Rooms
+    // folder entirely, landing in Chrome's flat default location instead.
+    // Tests all three candidate fields independently, not just whichever
+    // is truthy first - mirrors findCurrentRoomForDownload()'s own
+    // referrer/url/finalUrl loop above, so this check can't miss a match
+    // in url/finalUrl just because referrer happened to be a non-empty
+    // string that itself doesn't match (referrer is normally empty for a
+    // real Docusign download - see that function's comment - but nothing
+    // here should depend on that always holding true).
+    const looksLikeOurs = [downloadItem.referrer, downloadItem.url, downloadItem.finalUrl].some(
+      candidate => /\/(?:rooms|transaction)\/\d+/i.test(String(candidate || ""))
+    );
+
+    if (!looksLikeOurs) return;
+
+    const fallbackLeafName = downloadItem.filename
+      ? cleanName(String(downloadItem.filename).split("/").pop())
+      : `Unassigned Download ${downloadItem.id}`;
+    const filename = `Docusign Rooms/Unassigned/${fallbackLeafName}`;
+
+    logWorkerEvent("unassigned_download", { downloadId: downloadItem.id, filename });
+
+    suggest({ filename, conflictAction: "uniquify" });
     return;
   }
 
@@ -1384,7 +1422,7 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
   // can never disagree about where a given room's ZIP actually landed.
   const folderInfo = STATE.folderNames.get(currentRoom.roomId);
   const roomFolderName = folderInfo?.roomFolderName || roomName;
-  const yearFolder = folderInfo?.year || "Unknown Year";
+  const yearFolder = folderInfo?.year || "Unassigned";
   const filename = `Docusign Rooms/${yearFolder}/${roomFolderName}/${roomFolderName}.zip`;
 
   STATE.downloads[downloadItem.id] = {

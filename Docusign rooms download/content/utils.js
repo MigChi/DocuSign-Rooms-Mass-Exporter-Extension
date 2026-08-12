@@ -209,15 +209,22 @@ function formatCreatedDateForCsv(createdDate) {
  * a room created right at a year boundary into the wrong year depending
  * on which side of UTC the browser's timezone falls - the same class of
  * mismatch formatCreatedDateForCsv() above avoids by using toISOString()
- * rather than toString(). Falls back to "Unknown Year" (not, say,
- * silently grouping with some other year, or throwing) for a room with
- * no usable createdDate at all - only possible today for a room queued
- * from a Download Report CSV that predates this column, or one a user
- * hand-edited to drop it.
+ * rather than toString(). Falls back to "Unassigned" (not, say, silently
+ * grouping with some other year, or throwing) for a room with no usable
+ * createdDate at all - only possible today for a room queued from a
+ * Download Report CSV that predates this column, or one a user
+ * hand-edited to drop it. Shares its name with the separate "Unassigned"
+ * bucket background.js's onDeterminingFilename listener routes a
+ * download into when it can't even identify which room a download
+ * belongs to at all (see its own comment) - two different kinds of "not
+ * enough information," deliberately landing in the same top-level
+ * Docusign Rooms/Unassigned/ folder rather than two differently-named
+ * ones, since both mean the same thing to whoever's looking at the
+ * folder afterward: this one needs a human to sort out.
  */
 function roomCreatedYear(createdDate) {
     const date = coerceCreatedDate(createdDate);
-    return date ? String(date.getUTCFullYear()) : "Unknown Year";
+    return date ? String(date.getUTCFullYear()) : "Unassigned";
 }
 
 /**
@@ -268,6 +275,8 @@ function describeWorkerEvent(evt) {
         return `Scan cancelled: tab ${evt.tabId} was closed`;
       case "verified_existing_downloads":
         return `Verified ${evt.count} room${evt.count === 1 ? "" : "s"} already downloaded (found in Chrome's download history) - not re-downloaded${evt.stage === "csv_resume" ? "" : " before writing the report"}`;
+      case "unassigned_download":
+        return `Download ${evt.downloadId} looked like a Docusign document but couldn't be matched to a room - saved to Docusign Rooms/Unassigned/ instead`;
       default:
         return evt.type;
     }
@@ -298,7 +307,7 @@ function describeWorkerEvent(evt) {
  * room re-queued from either kind of CSV still carries the date its
  * Docusign-Rooms/<year>/... folder is computed from (computeFolderNames()
  * in background.js) - without it, every room resumed from a CSV upload
- * would fall back to the "Unknown Year" bucket regardless of when it was
+ * would fall back to the "Unassigned" bucket regardless of when it was
  * actually created. Attached to priorResults rows too for consistency,
  * though it isn't actually load-bearing there - an already-`Downloaded`/
  * `Complete (Empty)` room never gets re-downloaded, so nothing ever

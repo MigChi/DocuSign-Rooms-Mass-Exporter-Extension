@@ -69,8 +69,18 @@ is a nice-to-have refinement, not a gap in core functionality.
   "created" date already captured during scanning and used for the
   From/To filter, not the date you happened to run the download. A room
   with no usable created date (only possible from an older-format CSV
-  upload) falls into an `Unknown Year` folder rather than being silently
+  upload) falls into an `Unassigned` folder rather than being silently
   misfiled or dropped. See `DESIGN.md` Decision 25.
+- **An `Unassigned` catch-all for what genuinely can't be placed** — a
+  room with no usable created date lands here (above), and separately, a
+  real Docusign document download that couldn't be matched to any tracked
+  room lands as a flat file directly under `Docusign Rooms/Unassigned/`
+  instead of silently escaping the folder structure to Chrome's own
+  default download location. Scoped narrowly on purpose — only a download
+  whose URL actually looks like a Docusign document is ever redirected
+  this way; anything else (an unrelated download from some other tab,
+  this extension's own CSV report exports) is left completely alone. See
+  `DESIGN.md` Decision 27.
 - **Download report CSV** after every run (or Stop) — one row per room
   that was ever queued, with its outcome (`Downloaded`, `Complete
   (Empty)` for a room with nothing to download, `Failed`, `Download
@@ -141,7 +151,7 @@ is a nice-to-have refinement, not a gap in core functionality.
 | Download Report CSV (after Start finishes or Stop) | `Downloads/Docusign Rooms/_Download Reports/Docusign Rooms Download Report (<date range>) <timestamp>.csv` |
 | Activity Log CSV (after Start finishes or Stop) | `Downloads/Docusign Rooms/_Activity Logs/Activity Log (<date range>) <timestamp>.csv` |
 
-`<Year Created>` is the room's own created date (or `Unknown Year` if
+`<Year Created>` is the room's own created date (or `Unassigned` if
 that's ever unavailable), not the date you ran the download — see
 `DESIGN.md` Decision 25. The three CSV report categories themselves stay
 flat under `_Scan Lists`/`_Download Reports`/`_Activity Logs`, not
@@ -289,6 +299,7 @@ summary of it, not a second copy that can drift.
 | 5i. Detached panel window | Move the control panel out of the Docusign page into its own standalone window, raised as a design problem (not a bug) once long runs made refresh/tab-switch fragility actually matter | Done | The panel and the scan it triggers structurally can't share one execution context - a standalone window has no DOM access, and scanning must run as DOM automation inside an actual Docusign tab. Solved with a message relay through `background.js` (`chrome.tabs.sendMessage` reaches a tab but not other extension pages; `chrome.runtime.sendMessage` reaches the reverse) - four hops for one logical scan request. Found two gaps via code review before calling it done, not live testing: a synchronous-guard race on `STATE.scanning` (same class of bug already fixed once for `STATE.running`), and no recovery if the Docusign tab closes mid-scan (fixed with a `chrome.tabs.onRemoved` listener and a new `DS_SCAN_FAILED` message). See `DESIGN.md` Decision 24. |
 | 5j. Year-based folder organization | Route each room's ZIP into `Docusign Rooms/<Year Created>/<Room Name>/...` instead of a flat `Docusign Rooms/<Room Name>/...`, requested directly by the user | Done | Building this exposed a real, pre-existing bug: the Scan List CSV's "Created Date" column used `String(date).slice(0, 10)`, which silently produces a weekday/day fragment with no year at all on any non-UTC-midnight machine (confirmed directly: "2021-01-04" became "Sun Jan 03") - fixed with a proper `toISOString()`-based helper before building the year-folder logic on top of it, since the feature depended on that column actually being trustworthy. Collision disambiguation (the "(roomId)" suffix for two same-named rooms) was rescoped to per-(year, name) rather than per-name - two identically-named rooms created in different years no longer need it, since they're not actually sharing a folder anymore. The Download Report CSV gained its own new "Created Date" column so a CSV-upload resume still knows which year folder a re-queued room belongs in. See `DESIGN.md` Decision 25. |
 | 5k. Verify-before-re-download | Stop re-uploaded CSVs from blindly re-triggering rooms that actually already finished, raised after investigating "why does it say 1085 still Waiting when the previous CSV said it was complete" | Done | Root cause of the *specific* 1085 turned out to be a run stopped ~5.5 minutes after it started (confirmed via the Activity Log's timestamps, not guessed) - not a queue bug. But the underlying complaint was real: a "Success/Attempted" room sometimes already has a real file on disk, and re-clicking Download for it risks a genuine duplicate. Fixed with `chrome.downloads.search()` (already covered by the existing "downloads" permission) matching a room's expected filename against Chrome's own download history - scoped to `Success/Attempted` only, not `Failed` (nothing was ever downloaded for a Failed room to verify), per direct correction mid-conversation. Runs automatically before the very first report is written, not only on a CSV re-upload, per a follow-up request - so the first report is already accurate instead of needing a second pass just to reconcile. The "Done" status message was also fixed to say how many rooms still need attention instead of a flat "Done" regardless of outcome. See `DESIGN.md` Decision 26. |
+| 5l. "Unassigned" catch-all | Give both "can't determine a year" and "can't identify the room at all" a real landing spot instead of a silent fallback or an escape from the folder structure entirely | Done | Renamed the existing year-fallback bucket from "Unknown Year" to "Unassigned" - no logic change, just a shared name for both failure modes. The real risk was the second case: `onDeterminingFilename` fires for *every* download in the browser, not just this extension's, so routing every "unmatched" download into `Docusign Rooms/Unassigned/` would have redirected a user's unrelated download (e.g. a Gmail attachment) into this extension's folder - a worse bug than the one being fixed. Scoped narrowly: only a download whose URL actually matches the same `/rooms/<id>/`/`/transaction/<id>/` pattern `findCurrentRoomForDownload()` already checks is treated as "ours, but unidentifiable"; that existing function itself (already corrected twice - Decision 2) was left untouched rather than refactored, to avoid risking a third regression in code with that history. See `DESIGN.md` Decision 27. |
 | 6. Adaptive concurrency suggestion | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | The bounds half of this landed early, in phase 5d - what's left is the *measured, suggested* half. Depends on real timing data, which now exists to build against. |
 
 Every issue above is one line here and a full paragraph in either
@@ -808,6 +819,21 @@ practical at 10,000+ rooms instead of a few dozen.
     also fixed to report how many rooms still need attention instead of a
     flat "Done" regardless of what actually happened. Full reasoning in
     `DESIGN.md`'s Decision 26.
+  - **Added an `Unassigned` catch-all**, requested directly as a
+    follow-up. Renamed the existing "Unknown Year" fallback to
+    "Unassigned" (no behavior change), and separately gave a real
+    Docusign document download that can't be matched to any tracked room
+    a landing spot inside `Docusign Rooms/Unassigned/` instead of letting
+    it silently escape the folder structure to Chrome's own default
+    download location. Deliberately narrow: `onDeterminingFilename` fires
+    for every download in the browser, not just this extension's, so only
+    a download whose URL actually matches the same Docusign
+    document-download pattern `findCurrentRoomForDownload()` already
+    checks gets redirected this way - anything else (an unrelated
+    download from some other tab, this extension's own CSV exports) is
+    left completely alone, since blindly redirecting *every* unmatched
+    download would have been a worse bug than the one being fixed. Full
+    reasoning in `DESIGN.md`'s Decision 27.
 
 ---
 

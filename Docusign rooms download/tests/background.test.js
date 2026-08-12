@@ -63,7 +63,7 @@ test("computeFolderNames does NOT disambiguate two same-named rooms created in d
   assert.deepEqual(folderNames.get("2"), { year: "2024", roomFolderName: "Main St Listing" });
 });
 
-test("computeFolderNames falls back to \"Unknown Year\" for a room with no usable createdDate, without dropping the room", () => {
+test("computeFolderNames falls back to \"Unassigned\" for a room with no usable createdDate, without dropping the room", () => {
   const { computeFolderNames } = freshBackground();
 
   const folderNames = computeFolderNames([
@@ -71,8 +71,8 @@ test("computeFolderNames falls back to \"Unknown Year\" for a room with no usabl
     { roomId: "2", roomName: "Bad Date Room", createdDate: "not a date" }
   ]);
 
-  assert.deepEqual(folderNames.get("1"), { year: "Unknown Year", roomFolderName: "No Date Room" });
-  assert.deepEqual(folderNames.get("2"), { year: "Unknown Year", roomFolderName: "Bad Date Room" });
+  assert.deepEqual(folderNames.get("1"), { year: "Unassigned", roomFolderName: "No Date Room" });
+  assert.deepEqual(folderNames.get("2"), { year: "Unassigned", roomFolderName: "Bad Date Room" });
 });
 
 test("computeFolderNames falls back to a generated name when roomName is missing", () => {

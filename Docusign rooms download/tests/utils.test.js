@@ -204,11 +204,11 @@ test("roomCreatedYear extracts the year from a Date object or an ISO date string
   assert.equal(utils.roomCreatedYear("2023-11-02"), "2023");
 });
 
-test("roomCreatedYear falls back to 'Unknown Year' for null/undefined/unparseable input, never throws", () => {
-  assert.equal(utils.roomCreatedYear(null), "Unknown Year");
-  assert.equal(utils.roomCreatedYear(undefined), "Unknown Year");
-  assert.equal(utils.roomCreatedYear(""), "Unknown Year");
-  assert.equal(utils.roomCreatedYear("not a date"), "Unknown Year");
+test("roomCreatedYear falls back to 'Unassigned' for null/undefined/unparseable input, never throws", () => {
+  assert.equal(utils.roomCreatedYear(null), "Unassigned");
+  assert.equal(utils.roomCreatedYear(undefined), "Unassigned");
+  assert.equal(utils.roomCreatedYear(""), "Unassigned");
+  assert.equal(utils.roomCreatedYear("not a date"), "Unassigned");
 });
 
 test("roomCreatedYear is UTC-based, not local-time-based, so a date-only string's year never shifts across a timezone boundary", () => {
@@ -301,6 +301,10 @@ test("describeWorkerEvent describes every logWorkerEvent() type background.js ac
   assert.equal(
     utils.describeWorkerEvent({ type: "verified_existing_downloads", count: 3, stage: "csv_resume" }),
     "Verified 3 rooms already downloaded (found in Chrome's download history) - not re-downloaded"
+  );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "unassigned_download", downloadId: 7, filename: "Docusign Rooms/Unassigned/mystery.zip" }),
+    "Download 7 looked like a Docusign document but couldn't be matched to a room - saved to Docusign Rooms/Unassigned/ instead"
   );
 });
 
@@ -415,7 +419,7 @@ test("parseUploadedCsv treats a plain Scan List CSV (no Status column) as everyt
 
 // Regression: without this, a room re-queued from a CSV upload would
 // lose its createdDate entirely, and background.js's computeFolderNames()
-// would file it under "Unknown Year" regardless of when it was actually
+// would file it under "Unassigned" regardless of when it was actually
 // created - even though the CSV had the real date sitting right there.
 test("parseUploadedCsv carries a 'Created Date' column through onto queued rooms (Scan List CSV)", () => {
   const rows = [
