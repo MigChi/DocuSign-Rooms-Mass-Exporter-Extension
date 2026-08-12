@@ -6,7 +6,8 @@
   "permissions": [
     "downloads",
     "tabs",
-    "storage"
+    "storage",
+    "power"
   ],
   "host_permissions": [
     "https://rooms.docusign.com/*"

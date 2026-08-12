@@ -386,6 +386,38 @@ function labeledFilename(baseName, dateRangeLabel) {
   return `${baseName}${label} ${nowStamp()}`;
 }
 
+// chrome.power.requestKeepAwake("display") tells the OS not to sleep, dim,
+// or lock the display for as long as it's held - a direct mitigation for a
+// real, reported failure: a scan stalling out (or, worse, a run's report
+// getting misrouted - see the DS_SCAN_COMPLETE mode-loss risk this same
+// incident surfaced) because the computer's screen locked partway through,
+// despite the user's own OS-level sleep/lock settings supposedly being
+// disabled. Those settings can fail to hold - reset by a software update,
+// overridden by a battery-vs-power-adapter profile switch, a policy on a
+// managed device - in ways this extension has no visibility into and can't
+// rely on; asking the OS directly, for as long as real work is actually
+// happening, doesn't depend on any of that. requestKeepAwake()/
+// releaseKeepAwake() are idempotent per Chrome's own documented behavior,
+// so calling either redundantly is harmless - called after every
+// STATE.running/STATE.scanning transition rather than tracked as a third
+// flag of its own, so it can never drift out of sync with what's actually
+// active. Wrapped defensively even though neither call is documented to
+// throw - chrome.power is a newly-declared permission (manifest.json) and
+// this shouldn't be the one line standing between an unrelated failure and
+// STATE getting stuck the same way every fix in Decision 33/34 exists to
+// prevent.
+function updateKeepAwake() {
+  try {
+    if (STATE.running || STATE.scanning) {
+      chrome.power.requestKeepAwake("display");
+    } else {
+      chrome.power.releaseKeepAwake();
+    }
+  } catch (e) {
+    console.warn("updateKeepAwake failed", e);
+  }
+}
+
 async function broadcastStatus() {
   const payload = {
     type: "DS_BULK_STATUS",
@@ -981,6 +1013,7 @@ async function runWorker(tabId) {
 async function runQueue() {
   try {
     STATE.running = true;
+    updateKeepAwake();
     STATE.stopped = false;
     STATE.finishedAt = null;
     // Not unconditional - a resumed run already has a real startedAt
@@ -1001,6 +1034,7 @@ async function runQueue() {
     await Promise.all(tabIds.map(id => runWorker(id)));
 
     STATE.running = false;
+    updateKeepAwake();
     STATE.currentRooms = {};
 
     // Covers both ways the workers can all stop - running out of pending
@@ -1047,6 +1081,7 @@ async function runQueue() {
     } catch (e) {}
   } catch (error) {
     STATE.running = false;
+    updateKeepAwake();
     STATE.currentRooms = {};
     logWorkerEvent("run_queue_failed", { error: error?.message || String(error) });
     console.error("[DSBD] runQueue failed unexpectedly:", error);
@@ -1157,6 +1192,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // also pass the guard above and end up running two worker pools
       // concurrently over the same STATE.pending.
       STATE.running = true;
+      updateKeepAwake();
 
       // Everything from here through sendResponse() is wrapped in try/catch
       // as a safety net, not because any single line here is expected to
@@ -1303,6 +1339,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: true, total: STATE.queue.length });
       } catch (error) {
         STATE.running = false;
+        updateKeepAwake();
         console.error("[DSBD] DS_START_QUEUE failed unexpectedly:", error);
         logWorkerEvent("start_queue_failed", { error: error?.message || String(error) });
         sendResponse({ ok: false, reason: "Could not start - see the service worker console for details." });
@@ -1388,6 +1425,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // running autoScrollAndCollectRooms() twice concurrently in the
       // same tab.
       STATE.scanning = true;
+      updateKeepAwake();
 
       // Widened to cover chrome.tabs.query() too, not just
       // chrome.tabs.sendMessage() below - confirmed directly (the same
@@ -1405,6 +1443,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         if (!targetTab) {
           STATE.scanning = false;
+          updateKeepAwake();
           sendResponse({ ok: false, reason: "No Docusign Rooms tab is open. Open the Rooms list page first." });
           return;
         }
@@ -1421,6 +1460,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: true });
       } catch (error) {
         STATE.scanning = false;
+        updateKeepAwake();
         STATE.scanTabId = null;
         STATE.scanMode = null;
         STATE.scanDateRangeLabel = null;
@@ -1441,6 +1481,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === "DS_SCAN_COMPLETE") {
       STATE.scanning = false;
+      updateKeepAwake();
       STATE.scanTabId = null;
       const mode = STATE.scanMode;
       const dateRangeLabel = STATE.scanDateRangeLabel;
@@ -1706,6 +1747,7 @@ chrome.tabs.onRemoved.addListener(tabId => {
   if (STATE.scanTabId !== tabId) return;
 
   STATE.scanning = false;
+  updateKeepAwake();
   STATE.scanTabId = null;
   STATE.scanMode = null;
   STATE.scanDateRangeLabel = null;
@@ -1730,6 +1772,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (tabId !== STATE.scanTabId || changeInfo.status !== "loading") return;
 
   STATE.scanning = false;
+  updateKeepAwake();
   STATE.scanTabId = null;
   STATE.scanMode = null;
   STATE.scanDateRangeLabel = null;
@@ -1839,6 +1882,7 @@ chrome.action.onClicked.addListener(async () => {
     return;
   }
   STATE.running = true;
+  updateKeepAwake();
 
   STATE.queue = job.queue;
   STATE.folderNames = computeFolderNames(STATE.queue);

@@ -70,6 +70,16 @@ function makeChromeStub() {
       get: async () => null,
       update: async () => ({}),
       create: async () => ({ id: 1 })
+    },
+    // updateKeepAwake() calls these synchronously (not awaited) on every
+    // STATE.running/STATE.scanning transition. Calls recorded in `calls`
+    // (a single ordered log of "request"/"release" strings, not separate
+    // counters) so a test can assert not just that each was called, but in
+    // what order relative to STATE actually changing.
+    power: {
+      calls: [],
+      requestKeepAwake(level) { this.calls.push(`request:${level}`); },
+      releaseKeepAwake() { this.calls.push("release"); }
     }
   };
 }

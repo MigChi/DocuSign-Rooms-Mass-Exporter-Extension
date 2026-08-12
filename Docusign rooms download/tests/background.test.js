@@ -594,6 +594,59 @@ test("a normal run (no error) still completes without broadcasting DS_RUN_FAILED
   assert.equal(failedEvent, undefined);
 });
 
+test("a download run requests chrome.power.requestKeepAwake while active and releases it when done (regression: a real scan stalled out after the computer's screen locked despite the user's own OS sleep settings being disabled - see DESIGN.md)", async () => {
+  const { STATE } = freshBackground();
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_START_QUEUE",
+      rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }],
+      priorResults: [],
+      workerTabCount: 1
+    },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => global.chrome.power.calls.includes("request:display"));
+  assert.equal(STATE.running, true, "keep-awake should be requested while the run is actually active, not before");
+
+  await waitUntil(() => STATE.running === false && STATE.finishedAt !== null);
+  await waitUntil(() => global.chrome.power.calls.at(-1) === "release");
+});
+
+test("a crashed run still releases chrome.power's keep-awake lock, not just a normal completion", async () => {
+  const { STATE } = freshBackground();
+  global.chrome.tabs.create = async () => { throw new Error("tab creation boom"); };
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_START_QUEUE",
+      rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }],
+      priorResults: [],
+      workerTabCount: 1
+    },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => STATE.running === false);
+  assert.equal(global.chrome.power.calls.at(-1), "release");
+});
+
+test("DS_RUN_SCAN requests keep-awake, and a failed scan (no Docusign tab open) still releases it", async () => {
+  const { STATE } = freshBackground();
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_RUN_SCAN", dateRange: { start: "2024-01-01", end: "2024-12-31" }, mode: "start" },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => STATE.scanning === false);
+  assert.deepEqual(global.chrome.power.calls, ["request:display", "release"]);
+});
+
 test("clampWorkerTabCount passes through an in-range integer unchanged", () => {
   const { clampWorkerTabCount } = freshBackground();
 

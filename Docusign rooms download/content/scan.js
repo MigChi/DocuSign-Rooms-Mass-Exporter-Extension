@@ -186,8 +186,22 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
     const sortLabel = getSortLabel();
 
     if (sortLabel !== "Created (Oldest)") {
-      updateStatus?.(`Stopped: set the sort dropdown to "Created (Oldest)" before scanning (currently: ${sortLabel || "unknown"}).`);
-      return [];
+      // Thrown, not returned as an empty result - confirmed live as a real,
+      // confusing gap: a `return []` here was indistinguishable downstream
+      // from a genuine "this date range really has zero rooms" outcome,
+      // since content.js's DS_BEGIN_SCAN handler only treats a *throw* as a
+      // failure worth reporting (see its own comment) - an empty array
+      // takes the normal success path straight through to a real, silently
+      // unhelpful 0-room CSV export. This case isn't "no rooms match" at
+      // all; it means the scan couldn't even start, most often because the
+      // page isn't in the state a scan needs it to be in - logged out,
+      // reloaded, or reset to a different sort/view since the panel was
+      // last used, which can happen after the tab sat backgrounded through
+      // a system sleep/lock-screen interruption. Throwing routes this
+      // through the existing DS_SCAN_FAILED path instead, which reports a
+      // real, visible reason rather than a status line easy to miss if
+      // nobody's watching when it happens.
+      throw new Error(`Set the sort dropdown to "Created (Oldest)" before scanning (currently: ${sortLabel || "unknown"}) - if you weren't expecting this, make sure you're still logged into Docusign and on the Rooms list page.`);
     }
 
     const { start: dateStart, end: dateEnd } = dateRange;
