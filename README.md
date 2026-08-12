@@ -12,7 +12,7 @@ naive single-tab/fixed-delay approaches become impractical (the original
 design's runtime projected to 55-70 hours). The full reasoning behind
 every architectural decision — including the ones that were later
 reversed or corrected once real testing exposed a wrong assumption — is
-documented in [`Docusign rooms download/Claude Code/DESIGN.md`](Docusign%20rooms%20download/Claude%20Code/DESIGN.md).
+documented in [`Claude Code/DESIGN.md`](Claude%20Code/DESIGN.md).
 
 **Status: feature-complete.** Confirmed working at real scale (an
 8000-room production run), including crash/service-worker-restart
@@ -21,7 +21,7 @@ suggesting a worker-tab count instead of only accepting a manual one —
 is a nice-to-have refinement, not a gap in core functionality.
 
 **New to this tool, or setting it up for someone non-technical?** Start
-with [`Docusign rooms download/HOW_TO_USE.md`](Docusign%20rooms%20download/HOW_TO_USE.md)
+with [`HOW_TO_USE.md`](HOW_TO_USE.md)
 instead of this README — it's a plain-language install and usage guide
 with no engineering background assumed, written for other market
 centers to follow on their own. A formatted, share-friendly version of
@@ -186,7 +186,7 @@ Automated tests cover the project's pure logic (string/URL/CSV helpers,
 queue claiming, folder-name collision handling, download-to-room
 matching) — not the DOM-driving/browser-orchestration code, which is
 still verified by live testing against a real account, as it always has
-been. See `DESIGN.md`'s [Decision 13](Docusign%20rooms%20download/Claude%20Code/DESIGN.md#decision-13-automated-testing-strategy)
+been. See `DESIGN.md`'s [Decision 13](Claude%20Code/DESIGN.md#decision-13-automated-testing-strategy)
 for the reasoning behind what is and isn't covered this way.
 
 Requires [Node.js](https://nodejs.org) (v18+; built with v24 LTS) — no
@@ -199,6 +199,11 @@ npm test
 
 ## Project structure
 
+Paths are relative to `Docusign rooms download/` (the folder you actually
+load as the unpacked extension), except the last two rows, which live at
+the repo root alongside this README so they're easy to find without
+opening the extension folder at all.
+
 | File | Responsibility |
 |---|---|
 | `manifest.json` | MV3 config: permissions, content script load order, service worker registration |
@@ -208,12 +213,13 @@ npm test
 | `content/room.js` | Room-page helpers (currently just reading the room name from its Details page) |
 | `content.js` | DOM automation only — the single-room download pipeline (Select All → Bulk Download → confirm → wait) and the scan relay (`DS_BEGIN_SCAN`/`DS_SCAN_STOP`/`DS_SCAN_PAUSE`/`DS_SCAN_RESUME`) that lets the standalone panel trigger and control a scan it has no DOM access to run itself |
 | `panel.html` / `panel.js` | The standalone control panel window (opened via the toolbar icon), replacing the old in-page panel that used to live inside `content.js` — see `DESIGN.md` Decision 24 |
-| `HOW_TO_USE.md` | Plain-language install/setup/usage guide for non-technical end users — separate from this README, which assumes an engineering audience |
 | `package.json` | Just a `test` script (`node --test`) — no dependencies, not part of the loaded extension, exists purely so `npm test` works |
 | `tests/utils.test.js` | Tests for `content/utils.js`'s pure helpers |
 | `tests/background.test.js` | Tests for `background.js`'s pure/`STATE`-driven logic, including regression tests for several real bugs found via live testing at scale (see `DESIGN.md`) |
 | `tests/helpers/` | Minimal `chrome.*` stub and a fresh-module-load helper, both test-only — see `DESIGN.md`'s Decision 13 |
-| `Claude Code/DESIGN.md` | The full architecture and decision-by-decision case study |
+| [`../HOW_TO_USE.md`](HOW_TO_USE.md) | Plain-language install/setup/usage guide for non-technical end users — separate from this README, which assumes an engineering audience |
+| [`../HOW_TO_USE.txt`](HOW_TO_USE.txt) | Same guide, plain text (no Markdown) — easier to read for anyone opening it outside GitHub, e.g. in Notepad or TextEdit |
+| [`../Claude Code/DESIGN.md`](Claude%20Code/DESIGN.md) | The full architecture and decision-by-decision case study |
 
 ## Architecture & Design
 
@@ -283,8 +289,8 @@ exactly which bugs were caught by which side of that process, is in
 
 A scannable map of *when* things were built and *what broke along the way*,
 before diving into the full blow-by-blow in Version History below. Phase
-numbering matches `DESIGN.md`'s [Final Build Plan](Docusign%20rooms%20download/Claude%20Code/DESIGN.md#final-build-plan-deliberately-risk-ordered)
-and [Current Implementation Status](Docusign%20rooms%20download/Claude%20Code/DESIGN.md#current-implementation-status)
+numbering matches `DESIGN.md`'s [Final Build Plan](Claude%20Code/DESIGN.md#final-build-plan-deliberately-risk-ordered)
+and [Current Implementation Status](Claude%20Code/DESIGN.md#current-implementation-status)
 tables, which is the canonical source of truth for status — this table is a
 summary of it, not a second copy that can drift.
 
@@ -312,6 +318,7 @@ summary of it, not a second copy that can drift.
 | 5n. "Failed" excluded from "still needs attention" | Fix the Done message counting real failures as if they were ambiguous/unconfirmed | Done | Found via real use immediately after 5m shipped: "the csv said 185 rooms needed attention but they all were just failed rooms." The message counted anything not Downloaded/Complete (Empty), including Failed - misleading, since a Failed room's outcome is already fully known, not ambiguous the way Success/Attempted or Waiting is. Now only those two count toward "still needs attention"; Failed is surfaced in its own clause instead. Verified against the exact reported scenario plus several other combinations before considering it fixed. See `DESIGN.md` Decision 29. |
 | 5o. Exported CSVs get their real filename | Fix every exported report landing on disk as generic "download.csv"/"download (1).csv" instead of its labeled name | Done | `chrome.downloads.download()`'s `filename` option wasn't being reliably honored for `data:` URLs - confirmed directly against the account's own files. Fixed by suggesting the real filename explicitly via `onDeterminingFilename` (the same mechanism already proven for room ZIPs), checked before any room-matching logic runs. Verified end-to-end by driving the real export message path and confirming `suggest()` received the correct labeled name, not a fallback. See `DESIGN.md` Decision 30. |
 | 5p. Custom confirm dialog replaces native `confirm()` | Fix "Continue?" dialogs silently disappearing (never starting a run) when the panel window wasn't focused | Done | Found via a real Chrome console warning: native `confirm()`/`alert()`/`prompt()` are silently suppressed whenever the calling window isn't the frontmost one - and `panel.html` is a standalone popup window that a user reasonably switches away from during a multi-minute scan, right when the post-scan "Continue?" dialog would fire. Replaced with a custom in-page overlay (just page content, immune to window-focus suppression by construction) returning a `Promise<boolean>` instead of a synchronous value - `beginRun()` and the Start/Stop button's handler both became `async` accordingly. A real regression the native dialog couldn't have had was caught and fixed before shipping: unlike a truly OS-blocking `confirm()`, two Promise-based dialogs could overlap and cross-resolve if triggered close together - fixed by serializing every call through a shared promise chain. See `DESIGN.md` Decision 31. |
+| 5q. Docs moved to repo root, plain-text guide added, "Failed" wording rewritten | Reflect a manual doc reorganization, add a Notepad/TextEdit-friendly guide, and fix a misleading "Failed" explanation | Done | `DESIGN.md` and `HOW_TO_USE.md` moved from inside `Docusign rooms download/` up to the repo root - every relative link between the three docs updated accordingly (and one, `../../../README.md#roadmap` in `DESIGN.md`, turned out to have already been broken before the move). Extension code untouched by the move, confirmed with `node --check` on every `.js` file plus a full 97/97 `npm test` pass, not assumed safe. Added `HOW_TO_USE.txt`, a plain-text rendering of the same guide with headers/links converted to plain prose, for readers opening it outside GitHub. Rewrote the "Failed" explanation in `HOW_TO_USE.md`, `HOW_TO_USE.txt`, and the published Artifact: it almost always just means no Bulk Download button existed for that room (per `content.js`'s own failure reasons), not a real problem, and failed rooms can generally be ignored rather than investigated. See `DESIGN.md` Decision 32. |
 | 6. Adaptive concurrency suggestion | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | The bounds half of this landed early, in phase 5d - what's left is the *measured, suggested* half. Depends on real timing data, which now exists to build against. |
 
 Every issue above is one line here and a full paragraph in either
@@ -910,6 +917,22 @@ practical at 10,000+ rooms instead of a few dozen.
     cross-resolve, something a truly OS-blocking `confirm()` never
     allowed - fixed by serializing every call through a shared promise
     chain. Full reasoning in `DESIGN.md`'s Decision 31.
+  - **Moved `DESIGN.md` and `HOW_TO_USE.md` to the repo root** (out of
+    `Docusign rooms download/`, the folder that's actually loaded as
+    the unpacked extension) for visibility, and fixed every relative
+    link between the three docs that the move broke - including one,
+    in `DESIGN.md`'s Roadmap link, that turned out to already be broken
+    (`../../../README.md`, one level above the repo root) even before
+    this move. Confirmed the reorg didn't touch anything the loaded
+    extension depends on with `node --check` on every `.js` file and a
+    full `npm test` pass (97/97), not assumed safe. Added
+    `HOW_TO_USE.txt`, a plain-text version of the guide for anyone
+    opening it outside GitHub (Notepad, TextEdit), and rewrote the
+    "Failed" explanation everywhere it appears (`HOW_TO_USE.md`,
+    `HOW_TO_USE.txt`, the published Artifact) to say what it actually
+    means in the common case: no Bulk Download button existed for that
+    room, not a real problem, and generally safe to ignore rather than
+    chase down. Full reasoning in `DESIGN.md`'s Decision 32.
 
 ---
 

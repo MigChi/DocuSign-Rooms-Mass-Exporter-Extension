@@ -1,0 +1,424 @@
+====================================================================
+DOCUSIGN ROOMS MASS EXPORTER -- SETUP & USAGE GUIDE
+====================================================================
+
+This guide is written for anyone using this tool, not just developers.
+No technical background is needed to follow it. If you get stuck, the
+TROUBLESHOOTING section near the bottom covers the most common issues.
+
+A formatted, easier-to-read version of this same guide is also
+available here:
+
+    https://claude.ai/code/artifact/42dafe6c-16d4-4a6d-8ef2-a5996fb486ca
+
+Share that link directly with other market centers -- it needs no
+GitHub account to view.
+
+For the engineering write-up behind this tool, see
+"Claude Code/DESIGN.md" and the main "README.md" in this same project
+folder instead -- this guide is purely about how to install and run it.
+
+
+--------------------------------------------------------------------
+1. WHAT THIS TOOL DOES
+--------------------------------------------------------------------
+
+This is a Chrome extension that automatically downloads every document
+from every room in a Docusign Rooms account, in bulk. Normally,
+downloading a room's documents means opening the room, selecting every
+document, clicking Download, and waiting -- one room at a time. For an
+account with hundreds or thousands of rooms, that would take days of
+manual clicking.
+
+This tool automates that entire process. You give it a date range,
+click Start, and it works through every room in that range on its own
+-- opening each one, selecting its documents, downloading them, and
+saving each room's files neatly organized by year. A run covering
+thousands of rooms can still take several hours, but it requires no
+manual clicking once it's started.
+
+
+--------------------------------------------------------------------
+2. BEFORE YOU BEGIN -- READ THIS FIRST
+--------------------------------------------------------------------
+
+These three things matter more than anything else in this guide.
+Skipping them is the most common way a run goes wrong.
+
+2.1 Use Google Chrome
+----------------------
+This tool only works in Google Chrome (it's a Chrome extension). It
+has not been tested in Safari, Firefox, or other browsers.
+
+2.2 Leave the computer alone for the entire run
+-------------------------------------------------
+Once a run starts, this tool takes over the browser -- it opens tabs,
+clicks buttons, and navigates pages on its own. If someone uses the
+mouse or keyboard on this computer while a run is active -- even just
+to check email or browse the web -- it can click something in one of
+the tool's browser tabs by accident and interrupt that room's
+download.
+
+Treat the computer as "in use" by the tool for the whole run. Don't
+use it for anything else until the run finishes. If the computer needs
+to be shared, plan the run for a time when nobody else needs the
+machine -- overnight or over a weekend works well for large accounts.
+
+2.3 Stop the computer from sleeping or locking
+-------------------------------------------------
+A run on a large account can take many hours. If the computer goes to
+sleep, the screen locks, or the display turns off in a way that pauses
+Chrome, the run can stall or stop entirely partway through.
+
+Before starting a large run, change your power settings so the
+computer stays fully awake the whole time:
+
+  ON WINDOWS:
+  1. Click the Start menu and open Settings.
+  2. Go to System -> Power & battery (older versions of Windows:
+     System -> Power & sleep).
+  3. Under "Screen and sleep," set every option ("Screen turns off
+     after," "When plugged in, put my device to sleep after") to
+     Never.
+  4. Plug the computer into power -- don't run this on battery.
+     Battery-saving settings can override your sleep settings even
+     after you change them.
+  5. If Windows Update has a restart scheduled, postpone it until
+     after the run finishes (Settings -> Windows Update -> Pause
+     updates).
+
+  ON MAC:
+  1. Open System Settings (the Apple menu, top-left).
+  2. Go to Lock Screen. Set "Turn display off" and "Start Screen
+     Saver when inactive" both to Never, or the longest option
+     available.
+  3. Go to Battery -> Options (or Energy Saver on older macOS). Turn
+     on "Prevent automatic sleeping on power adapter when the display
+     is off."
+  4. Plug the laptop into power for the duration of the run -- same
+     reason as Windows.
+  5. If a macOS software update is pending, postpone it until the run
+     finishes.
+
+If, despite these steps, the computer does sleep, crash, or restart
+mid-run -- see section 7, "What happens if something interrupts the
+run," below. The tool is built to recover from this, but it's a
+safety net, not something to rely on for a smooth run.
+
+
+--------------------------------------------------------------------
+3. INSTALLING THE EXTENSION
+--------------------------------------------------------------------
+
+1. Go to the project's GitHub page:
+   https://github.com/MigChi/DocuSign-Rooms-Mass-Exporter-Extension
+2. Click the green "Code" button, then "Download ZIP."
+3. Find the downloaded ZIP file (usually in your Downloads folder) and
+   unzip it -- on Windows, right-click it and choose "Extract All"; on
+   Mac, just double-click it.
+4. Open Google Chrome and go to this address: chrome://extensions
+5. In the top-right corner, turn on "Developer mode" (it's a toggle
+   switch).
+6. Click the "Load unpacked" button that appears.
+7. In the file picker, navigate into the unzipped folder and select
+   the "Docusign rooms download" folder specifically (the one that
+   directly contains a file called manifest.json) -- not the outer
+   folder, and not a folder further inside it.
+8. The extension should now appear in your extensions list as
+   "Docusign Rooms Mass Exporter."
+9. Click the puzzle-piece icon in Chrome's toolbar (top-right, next to
+   the address bar), find "Docusign Rooms Mass Exporter" in the list,
+   and click the pin icon next to it so its icon always stays visible
+   in the toolbar.
+
+You only need to do this once per computer. After that, the extension
+stays installed until you remove it.
+
+
+--------------------------------------------------------------------
+4. OPENING THE PANEL
+--------------------------------------------------------------------
+
+Click the extension's icon in the Chrome toolbar (the one you just
+pinned). A separate small window opens -- this is the control panel.
+
+This panel is its own window, separate from the Docusign page. You can
+move it anywhere on screen, and it stays open even if you refresh the
+Docusign page or switch to a different browser tab -- it won't
+disappear or lose your progress.
+
+
+--------------------------------------------------------------------
+5. STEP-BY-STEP: RUNNING AN EXPORT
+--------------------------------------------------------------------
+
+1. Log into Docusign Rooms in a regular Chrome tab, and navigate to
+   the main Rooms list page (the page that shows all your rooms, not
+   an individual room).
+2. Click the extension's toolbar icon to open the panel if it isn't
+   already open.
+3. Set the From and To dates. This controls which rooms are included,
+   based on when each room was created in Docusign -- not today's
+   date. For a full export of everything in the account, set From to
+   a date before the account's earliest room and To to today.
+4. (Recommended, especially the first time) Click "Scan & Export List
+   (CSV)." This scans the account and saves a list of every room that
+   would be processed, without downloading anything. Use this to
+   sanity-check the room count before committing to a full run.
+5. Click "Start." This first triggers a scan -- the tool automatically
+   scrolls through the Rooms list collecting every room in your date
+   range. For a large account (thousands of rooms), this can take
+   several minutes on its own. The panel's status line will update as
+   it works.
+6. When scanning finishes, a confirmation popup appears showing the
+   total number of rooms found and asking "Continue?" Check that the
+   number looks reasonable, then click OK to actually begin
+   downloading.
+7. The tool opens several new browser tabs ("worker tabs" -- explained
+   in section 8) and starts working through the room list
+   automatically: opening each room, selecting its documents, and
+   downloading them.
+8. Leave the computer alone from this point on. Don't use the mouse or
+   keyboard on this machine until the run finishes.
+9. When it's done, the panel's status line will say either:
+     - "Done -- every room downloaded or confirmed empty" (everything
+       succeeded), or
+     - a message listing how many rooms still need attention or
+       failed (see section 9, "If some rooms still need attention, or
+       failed," below).
+10. Find your files in File Explorer (Windows) or Finder (Mac), under
+    Downloads -> Docusign Rooms, organized by year.
+
+
+--------------------------------------------------------------------
+6. UNDERSTANDING THE PANEL
+--------------------------------------------------------------------
+
+  Status line (top)
+    A plain-language description of what's happening right now --
+    scanning, running, paused, or done.
+
+  Progress counter ("120 / 3,400")
+    How many rooms have been processed out of the total found.
+
+  Breakdown line
+    A quick tally, e.g. "Downloaded 120, Empty 5, In progress 3,
+    Failed 1, Waiting 3271" -- one number per outcome so far.
+
+  Worker rows
+    One line per active browser tab, showing which room it's
+    currently working on and how long it's been on that room.
+
+  Activity Log (collapsed by default -- click to expand)
+    A technical event history. Mainly useful for troubleshooting or
+    when reporting an issue -- safe to ignore during normal use.
+
+  From / To date fields
+    The date range controlling which rooms get included, based on the
+    room's created date.
+
+  Worker Tabs field
+    How many rooms are processed at the same time -- see section 8,
+    "What are Worker Tabs (Concurrency explained)," below.
+
+  Scan & Export List (CSV) button
+    Preview mode -- scans and saves a list of what would be
+    processed, without downloading anything.
+
+  Upload CSV to Run/Resume button
+    Skip the live scan and run (or resume) from a previously saved
+    CSV report instead -- see section 7, "What happens if something
+    interrupts the run," below.
+
+  Start / Stop button
+    Toggles between starting a scan/run and stopping whichever is
+    currently active.
+
+  Pause / Resume button
+    Temporarily pauses the current scan or run after its current
+    step, without losing progress.
+
+
+--------------------------------------------------------------------
+7. WHAT ARE "WORKER TABS"? (CONCURRENCY EXPLAINED)
+--------------------------------------------------------------------
+
+Instead of processing one room at a time, this tool opens several
+Docusign browser tabs and has them all working at the same time --
+like having several people doing the same job in parallel instead of
+just one. This is what makes exporting thousands of rooms practical
+instead of taking days.
+
+The Worker Tabs field in the panel controls how many tabs work
+simultaneously (from 1 to 8; the default is 3).
+
+- More tabs = faster overall, but also more strain on the computer and
+  your internet connection.
+- The default of 3 is a good starting point for most computers and
+  connections. There's usually no need to change it.
+- If the computer seems to be struggling (very slow, fans running
+  loudly, or the internet connection feels overloaded), lower this
+  number before your next run -- changing it while a run is already in
+  progress doesn't take effect until you start again.
+- The extra browser tabs that open are expected and normal -- don't
+  close them manually while a run is active. They'll stay open after a
+  run finishes too; you can close them yourself once everything is
+  done, or just leave them.
+
+
+--------------------------------------------------------------------
+8. WHAT HAPPENS IF SOMETHING INTERRUPTS THE RUN?
+--------------------------------------------------------------------
+
+This tool automatically saves its progress as it works -- after every
+single room, not just at the end. If Chrome crashes, the computer
+restarts unexpectedly, or the run gets interrupted some other way, the
+tool remembers exactly which rooms were already finished.
+
+Two ways to pick back up:
+
+1. Just reopen the panel. In many cases, the extension automatically
+   detects an interrupted run and continues it on its own the next
+   time Chrome (or the extension) wakes back up.
+2. Upload the report to resume manually. Every run saves a Download
+   Report CSV to Downloads -> Docusign Rooms -> _Download Reports --
+   even if the run was stopped early or interrupted. Open the panel,
+   click "Upload CSV to Run/Resume," and select that file. The tool
+   will skip everything already confirmed downloaded and pick up
+   exactly where it left off, including automatically double-checking
+   anything uncertain before re-doing any work.
+
+Important: this recovery ability is a safety net for the unexpected --
+it is NOT a substitute for keeping the computer awake and undisturbed
+during a run (see section 2, "Before you begin," above). A run that
+gets interrupted repeatedly will take much longer overall than one
+left alone from start to finish, since it has to reopen tabs and
+re-verify things each time it resumes.
+
+
+--------------------------------------------------------------------
+9. PAUSING AND STOPPING
+--------------------------------------------------------------------
+
+- Pause temporarily halts the run after its current step. Nothing is
+  lost -- click Resume any time to continue exactly where it left off.
+- Stop ends the run early and immediately saves a report covering
+  everything done so far. Use "Upload CSV to Run/Resume" afterward to
+  finish the rest whenever you're ready.
+
+Use Pause or Stop only when genuinely necessary (for example, the
+computer is urgently needed for something else). Otherwise, let a run
+finish on its own -- it's more efficient than repeatedly stopping and
+resuming.
+
+
+--------------------------------------------------------------------
+10. WHERE YOUR FILES END UP
+--------------------------------------------------------------------
+
+Downloads
+  Docusign Rooms
+    2021
+      <Room Name>
+        <Room Name>.zip
+    2022
+      <Room Name>
+        <Room Name>.zip
+    Unassigned
+      (a small number of rooms that couldn't be matched to a year,
+      or a specific room)
+    _Scan Lists
+      Scan List (2021-01-01 to 2022-12-31) 2026-08-12_10-30-00.csv
+    _Download Reports
+      Docusign Rooms Download Report (2021-01-01 to 2022-12-31)
+      2026-08-12_14-05-22.csv
+    _Activity Logs
+      Activity Log (2021-01-01 to 2022-12-31) 2026-08-12_14-05-22.csv
+
+- Year folders -- each room's ZIP is organized by the year the room
+  was created in Docusign, not the day you happened to run the
+  download.
+- Unassigned -- a small number of rooms may not have a clear creation
+  date, or a download couldn't be matched to a specific room. These
+  land here instead of being lost or scattered elsewhere. It's normal
+  to see a handful of items here; check this folder if something seems
+  to be missing from its expected year.
+- _Scan Lists / _Download Reports / _Activity Logs -- these are
+  records of the run itself, not room documents. Each filename
+  includes the date range it covered and the exact date/time it was
+  created, so they stay identifiable even after several runs pile up.
+  The Download Report is the one you'll re-upload if you ever need to
+  resume a run.
+
+
+--------------------------------------------------------------------
+11. IF SOME ROOMS STILL NEED ATTENTION, OR FAILED
+--------------------------------------------------------------------
+
+At the end of a run, the panel's status may mention rooms that still
+need attention, rooms that failed, or both -- these mean different
+things:
+
+- "Still needs attention" means the tool isn't fully certain those
+  rooms downloaded successfully (this is rare, but can happen, for
+  example if the browser closed at an unlucky moment). Re-upload the
+  Download Report CSV via "Upload CSV to Run/Resume" and run again --
+  the tool automatically double-checks these first and skips anything
+  it confirms was actually already downloaded, so this step is quick
+  even for a large account.
+
+- "Failed" almost always means the room simply has no Bulk Download
+  button to click -- its documents section is in a state where nothing
+  is available to download. This isn't a malfunction; the tool is
+  correctly reporting that there was nothing it could do for that
+  room. A normal run finishes with the large majority of rooms
+  downloaded and only a small number of these -- in general, FAILED
+  ROOMS CAN BE IGNORED. There's no need to investigate or re-run them
+  as routine cleanup. If you want to double-check a specific one
+  anyway, open it manually in Docusign and look at its Documents page
+  yourself.
+
+
+--------------------------------------------------------------------
+12. TROUBLESHOOTING
+--------------------------------------------------------------------
+
+The panel says "Could not reach the extension -- it may need to be
+reloaded."
+  Go to chrome://extensions, find "Docusign Rooms Mass Exporter," and
+  click its reload icon (a circular arrow). Then close and reopen the
+  panel.
+
+Clicking Start says no rooms were found, or scanning finds 0 rooms.
+  Make sure a Chrome tab is open on the main Docusign Rooms list page
+  (not inside an individual room), and that you're logged in.
+
+I need to run this on a different computer, or after reinstalling
+Chrome.
+  Just repeat the "Installing the extension" steps (section 3) on the
+  new machine. If you have a Download Report CSV from a previous run,
+  you can upload it there via "Upload CSV to Run/Resume" to continue
+  where you left off -- the report works on any computer, not just the
+  one that created it.
+
+The computer went to sleep / restarted / Chrome crashed during a run.
+  Reopen the panel -- it will often continue automatically. If not,
+  upload the most recent Download Report CSV from Downloads ->
+  Docusign Rooms -> _Download Reports via "Upload CSV to Run/Resume."
+
+
+--------------------------------------------------------------------
+13. QUICK CHECKLIST BEFORE STARTING A LARGE RUN
+--------------------------------------------------------------------
+
+  [ ] Chrome is installed and the extension is loaded
+      (chrome://extensions shows it)
+  [ ] Logged into Docusign Rooms, with the main Rooms list page open
+  [ ] Computer is plugged into power, not running on battery
+  [ ] Sleep and screen-lock settings are disabled (see section 2,
+      "Before you begin")
+  [ ] No pending system restarts or updates scheduled during the run
+      window
+  [ ] Nobody else needs to use this computer until the run finishes
+  [ ] From/To dates are set correctly
+  [ ] Ready to click Start and leave it alone

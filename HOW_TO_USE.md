@@ -6,7 +6,9 @@ This guide is written for anyone using this tool, not just developers. No techni
 **https://claude.ai/code/artifact/42dafe6c-16d4-4a6d-8ef2-a5996fb486ca**
 Share that link directly with other market centers — it needs no GitHub account to view.
 
-For the engineering write-up behind this tool, see [`Claude Code/DESIGN.md`](Claude%20Code/DESIGN.md) and the main [`README.md`](../README.md) instead — this guide is purely about how to install and run it.
+Prefer a plain text file (no Markdown formatting) instead? See [`HOW_TO_USE.txt`](HOW_TO_USE.txt) in this same folder.
+
+For the engineering write-up behind this tool, see [`Claude Code/DESIGN.md`](Claude%20Code/DESIGN.md) and the main [`README.md`](README.md) instead — this guide is purely about how to install and run it.
 
 ---
 
@@ -182,7 +184,7 @@ Downloads
 At the end of a run, the panel's status may mention rooms that still need attention, rooms that failed, or both — these mean different things:
 
 - **"Still needs attention"** means the tool isn't fully certain those rooms downloaded successfully (this is rare, but can happen, for example if the browser closed at an unlucky moment). **Re-upload the Download Report CSV** via "Upload CSV to Run/Resume" and run again — the tool automatically double-checks these first and skips anything it confirms was actually already downloaded, so this step is quick even for a large account.
-- **"Failed"** means the automation genuinely couldn't complete these rooms (for example, the page didn't load in time, or an expected button wasn't found). Re-running will retry them for real. If the same small number of rooms keep failing every time, that's often a quirk specific to that room — try opening it manually in Docusign to see if anything looks unusual about it.
+- **"Failed"** almost always means the room simply has no Bulk Download button to click — for example, its documents section is in a state where nothing is available to download. This isn't a malfunction; the tool is correctly reporting that there was nothing it could do for that room. A normal run finishes with the large majority of rooms downloaded and only a small number of these; **in general, failed rooms can be ignored** — there's no need to investigate or re-run them as routine cleanup. If you want to double-check a specific one anyway, open it manually in Docusign and look at its Documents page yourself.
 
 ---
 
