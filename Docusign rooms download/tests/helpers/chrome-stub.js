@@ -16,7 +16,8 @@ function makeChromeStub() {
     downloads: {
       onDeterminingFilename: { addListener() {} },
       onChanged: { addListener() {} },
-      download: async () => ({})
+      download: async () => ({}),
+      search: async () => []
     },
     storage: {
       local: {

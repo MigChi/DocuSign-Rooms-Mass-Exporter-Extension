@@ -114,6 +114,68 @@ test("computeFolderNames produces a folder name with no trailing period/space fo
   });
 });
 
+test("matchVerifiedDownloads matches a room to a completed download by plain filename", () => {
+  const { matchVerifiedDownloads } = freshBackground();
+
+  const items = [
+    { id: 1, filename: "/Users/x/Downloads/Docusign Rooms/2022/Room A/Room A.zip" }
+  ];
+  const rooms = [{ roomId: "1", roomName: "Room A" }];
+
+  const verified = matchVerifiedDownloads(items, rooms);
+
+  assert.equal(verified.size, 1);
+  assert.equal(verified.get("1"), items[0]);
+});
+
+test("matchVerifiedDownloads matches a room to a completed download using the '(roomId)' disambiguated filename", () => {
+  const { matchVerifiedDownloads } = freshBackground();
+
+  const items = [
+    { id: 1, filename: "/Users/x/Downloads/Docusign Rooms/Room A (42).zip" }
+  ];
+  const rooms = [{ roomId: "42", roomName: "Room A" }];
+
+  const verified = matchVerifiedDownloads(items, rooms);
+
+  assert.equal(verified.get("42"), items[0]);
+});
+
+test("matchVerifiedDownloads does not match a room with no corresponding download at all", () => {
+  const { matchVerifiedDownloads } = freshBackground();
+
+  const items = [{ id: 1, filename: "/Users/x/Downloads/Docusign Rooms/Some Other Room.zip" }];
+  const rooms = [{ roomId: "1", roomName: "Room A" }];
+
+  const verified = matchVerifiedDownloads(items, rooms);
+
+  assert.equal(verified.size, 0);
+});
+
+test("matchVerifiedDownloads matches on the leaf filename only, regardless of the old flat vs new year-folder path prefix", () => {
+  const { matchVerifiedDownloads } = freshBackground();
+
+  const items = [
+    { id: 1, filename: "/Users/x/Downloads/Docusign Rooms/Room A/Room A.zip" },
+    { id: 2, filename: "/Users/x/Downloads/Docusign Rooms/2023/Room B/Room B.zip" }
+  ];
+  const rooms = [
+    { roomId: "1", roomName: "Room A" },
+    { roomId: "2", roomName: "Room B" }
+  ];
+
+  const verified = matchVerifiedDownloads(items, rooms);
+
+  assert.equal(verified.size, 2);
+});
+
+test("matchVerifiedDownloads handles empty inputs without throwing", () => {
+  const { matchVerifiedDownloads } = freshBackground();
+
+  assert.equal(matchVerifiedDownloads([], []).size, 0);
+  assert.equal(matchVerifiedDownloads(null, null).size, 0);
+});
+
 test("csvEscape wraps every value in quotes and doubles internal quotes", () => {
   const { csvEscape } = freshBackground();
 

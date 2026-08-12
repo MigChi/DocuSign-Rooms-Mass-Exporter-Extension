@@ -250,6 +250,69 @@ function computeFolderNames(queue) {
   return folderNames;
 }
 
+// Pure matching logic, factored out from findVerifiedExistingDownloads()
+// below so it's testable without mocking chrome.downloads.search() - given
+// a list of already-fetched DownloadItems and a list of "Success/
+// Attempted" rooms (either this run's own results, checked right before
+// the report is written, or rooms coming off an uploaded CSV on a
+// resume - see the two call sites), returns roomId -> the matched
+// DownloadItem for every room whose expected filename (with or without
+// the "(roomId)" disambiguation suffix - whichever computeFolderNames()
+// would have used depends on what else was in whatever run originally
+// downloaded it, which this function doesn't know or need to) shows up
+// as a real, complete, still-existing file. Matches on the leaf filename
+// only, not the full path - deliberately, so this works whether the file
+// landed under the old flat Docusign Rooms/<name>/ structure or the new
+// Docusign Rooms/<year>/<name>/ one (Decision 25) - this check doesn't
+// care where the file is, only that it's really there.
+function matchVerifiedDownloads(existingItems, rooms) {
+  const byLeafName = new Map();
+  (existingItems || []).forEach(item => {
+    const leaf = String(item.filename || "").split("/").pop();
+    if (leaf) byLeafName.set(leaf, item);
+  });
+
+  const verified = new Map();
+  (rooms || []).forEach(room => {
+    const name = cleanName(room.roomName || `Docusign Room ${room.roomId}`);
+    const match = byLeafName.get(`${name}.zip`) || byLeafName.get(`${name} (${room.roomId}).zip`);
+    if (match) verified.set(room.roomId, match);
+  });
+
+  return verified;
+}
+
+// Queries Chrome's own persistent download history (chrome.downloads.search -
+// already covered by this extension's existing "downloads" permission, no
+// manifest change needed) for every completed, still-on-disk download
+// whose filename mentions "Docusign Rooms," then matches it against a set
+// of "Success/Attempted" rooms - one that genuinely had a download
+// triggered, just never confirmed complete, sometimes really did finish
+// (the completion event was never recorded at all - the tab closed or
+// crashed right after triggering it, or the service worker restarted
+// before that event fired) - re-clicking Select All/Download for a room
+// that already has a real file risks a genuine duplicate ZIP rather than
+// fixing anything. Two callers: verifySuccessAttemptedResults() checks
+// this run's own results right before the report is written, and
+// DS_START_QUEUE checks rooms coming off an uploaded CSV before queueing
+// them for reprocessing (catches older reports predating the first
+// check, or where the gap was never caught the first time). One bulk
+// search, not one per room - chrome.downloads history can be large, and
+// a native call per room would add up needlessly. Never throws: a
+// failed/unavailable search just means nothing gets verified, degrading
+// to the pre-existing behavior rather than blocking anything.
+async function findVerifiedExistingDownloads(rooms) {
+  if (!rooms.length) return new Map();
+
+  const items = await chrome.downloads.search({
+    state: "complete",
+    exists: true,
+    filenameRegex: "Docusign Rooms"
+  }).catch(() => []);
+
+  return matchVerifiedDownloads(items, rooms);
+}
+
 function nowStamp() {
   const d = new Date();
   const pad = n => String(n).padStart(2, "0");
@@ -537,6 +600,53 @@ async function waitForInFlightDownloadsToSettle(timeoutMs = 20000) {
   }
 }
 
+// Reconciles this run's own "Success/Attempted" results against Chrome's
+// download history before the report gets written, so the very first
+// report already reflects reality instead of requiring a separate
+// CSV-upload pass just to catch up. waitForInFlightDownloadsToSettle()
+// above only covers downloads still tracked in this session's in-memory
+// STATE.downloads - it can't catch a download that genuinely finished but
+// whose "complete" event was never recorded at all (the tab closed or
+// crashed right after triggering it, or the service worker restarted
+// before that event fired) - this check covers exactly that gap. Only
+// "Success/Attempted" results are checked, never "Failed" - see
+// findVerifiedExistingDownloads()'s own comment for why. Mutates
+// STATE.results in place (the same array createReport() reads right
+// after this returns) rather than returning a new list, since every
+// caller already holds a reference to the live STATE.results.
+//
+// Deliberately does NOT call persistJob() - its one call site in
+// runQueue() runs after clearPersistedJob() has already run for this
+// completed job, and persisting again here would resurrect a "job" entry
+// in chrome.storage.local the instant after it was cleared, which a
+// later service-worker restart could mistake for an interrupted run
+// still needing resume. Nothing needs to survive a crash between this
+// point and createReport() reading STATE.results right after it - both
+// happen synchronously within the same already-completed runQueue() call.
+async function verifySuccessAttemptedResults() {
+  const candidates = STATE.results.filter(r => r.status === "Success/Attempted");
+  if (!candidates.length) return;
+
+  const verified = await findVerifiedExistingDownloads(candidates);
+  if (!verified.size) return;
+
+  let count = 0;
+  STATE.results.forEach(r => {
+    const match = verified.get(r.roomId);
+    if (r.status === "Success/Attempted" && match) {
+      r.status = "Downloaded";
+      r.reason = "Verified already on disk via Chrome's download history";
+      r.downloadedFilename = match.filename || r.downloadedFilename;
+      r.downloadId = match.id != null ? String(match.id) : r.downloadId;
+      count++;
+    }
+  });
+
+  if (count) {
+    logWorkerEvent("verified_existing_downloads", { count, stage: "pre_report" });
+  }
+}
+
 async function waitIfPausedOrStopped() {
   while (STATE.paused && !STATE.stopped) {
     await broadcastStatus();
@@ -804,6 +914,12 @@ async function runQueue() {
   // snapshot taken slightly too early.
   await waitForInFlightDownloadsToSettle();
 
+  // Catches what the wait above structurally can't - a "Success/
+  // Attempted" result whose download genuinely finished but whose
+  // completion was never recorded at all (not just not-yet-settled). See
+  // verifySuccessAttemptedResults()'s own comment.
+  await verifySuccessAttemptedResults();
+
   // Logged, not silently swallowed - a bare `.catch(() => "")` here would
   // mean a genuinely failed report (the same safeEncodeURIComponent()
   // scenario that made CSV export hang, or the storage-quota risk noted
@@ -919,7 +1035,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             // (parseUploadedCsv() in content/utils.js); roomCreatedYear()
             // accepts either. Previously dropped entirely here, which
             // would have silently sent every room to "Unknown Year."
-            createdDate: room.createdDate || null
+            createdDate: room.createdDate || null,
+            // The room's own prior status, from parseUploadedCsv() - only
+            // read below to decide which rooms are worth verifying against
+            // Chrome's download history before re-processing (a "Failed"
+            // room never had a download triggered at all, nothing to
+            // check; undefined for a room fresh off a live scan, same
+            // effect). Not otherwise used - processRoom() always computes
+            // this run's own fresh status from what actually happens.
+            status: room.status || null
           };
         })
         .filter(Boolean);
@@ -946,11 +1070,50 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         createdDate: r.createdDate || null
       }));
 
-      STATE.queue = [...priorRoomsForQueue, ...normalized];
+      // Before queueing anything for real DOM reprocessing, check whether
+      // a "Success/Attempted" room (one that genuinely had a download
+      // triggered, just never confirmed complete) actually already has a
+      // real file sitting in Chrome's download history - see
+      // findVerifiedExistingDownloads()'s own comment for why this
+      // happens and why re-clicking Download for it risks a real
+      // duplicate. Scoped to Success/Attempted only, not Failed - a
+      // Failed room never had a download start in the first place, so
+      // there's nothing there to verify.
+      const successAttempted = normalized.filter(r => r.status === "Success/Attempted");
+      const verifiedMatches = await findVerifiedExistingDownloads(successAttempted);
+
+      const stillNeedsProcessing = [];
+      const verifiedRoomsForQueue = [];
+      const verifiedResults = [];
+
+      normalized.forEach(room => {
+        const match = verifiedMatches.get(room.roomId);
+        if (match) {
+          verifiedRoomsForQueue.push(room);
+          verifiedResults.push({
+            roomId: room.roomId,
+            roomName: room.roomName,
+            documentsUrl: room.documentsUrl,
+            status: "Downloaded",
+            reason: "Verified already on disk via Chrome's download history - not re-downloaded",
+            downloadedFilename: match.filename || "",
+            downloadId: match.id != null ? String(match.id) : "",
+            time: new Date().toISOString()
+          });
+        } else {
+          stillNeedsProcessing.push(room);
+        }
+      });
+
+      if (verifiedResults.length) {
+        logWorkerEvent("verified_existing_downloads", { count: verifiedResults.length, stage: "csv_resume" });
+      }
+
+      STATE.queue = [...priorRoomsForQueue, ...verifiedRoomsForQueue, ...stillNeedsProcessing];
       STATE.folderNames = computeFolderNames(STATE.queue);
-      STATE.pending = normalized;
+      STATE.pending = stillNeedsProcessing;
       STATE.index = 0;
-      STATE.results = priorResults.slice();
+      STATE.results = [...priorResults, ...verifiedResults];
       // clampWorkerTabCount() handles a missing field the same as an
       // invalid one (falls back to DEFAULT_WORKER_TAB_COUNT) - covers both
       // an older panel that doesn't send this field yet and a genuinely
@@ -1456,6 +1619,7 @@ if (typeof module !== "undefined" && module.exports) {
     MAX_WORKER_TAB_COUNT,
     labeledFilename,
     safeEncodeURIComponent,
-    waitForInFlightDownloadsToSettle
+    waitForInFlightDownloadsToSettle,
+    matchVerifiedDownloads
   };
 }

@@ -266,6 +266,8 @@ function describeWorkerEvent(evt) {
         return `Waiting for ${evt.count} download${evt.count === 1 ? "" : "s"} to finish before writing the report`;
       case "scan_tab_closed":
         return `Scan cancelled: tab ${evt.tabId} was closed`;
+      case "verified_existing_downloads":
+        return `Verified ${evt.count} room${evt.count === 1 ? "" : "s"} already downloaded (found in Chrome's download history) - not re-downloaded${evt.stage === "csv_resume" ? "" : " before writing the report"}`;
       default:
         return evt.type;
     }
@@ -343,7 +345,15 @@ function parseUploadedCsv(rows) {
           time: timeIdx === -1 ? "" : (r[timeIdx] || "")
         });
       } else {
-        rooms.push({ roomId, roomName, documentsUrl, createdDate });
+        // status carried through (not just for Downloaded/Complete (Empty)
+        // rows above) so background.js's DS_START_QUEUE handler can tell a
+        // "Success/Attempted" room - one that genuinely had a download
+        // triggered, just never confirmed - from a "Failed" one, where
+        // nothing was ever downloaded in the first place. Only the former
+        // is worth checking against Chrome's download history before
+        // re-processing it (see findVerifiedExistingDownloads() there) -
+        // a Failed room has nothing to verify.
+        rooms.push({ roomId, roomName, documentsUrl, createdDate, status });
       }
     });
 

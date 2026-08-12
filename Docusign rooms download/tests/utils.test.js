@@ -294,6 +294,14 @@ test("describeWorkerEvent describes every logWorkerEvent() type background.js ac
     utils.describeWorkerEvent({ type: "scan_tab_closed", tabId: 42 }),
     "Scan cancelled: tab 42 was closed"
   );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "verified_existing_downloads", count: 1, stage: "pre_report" }),
+    "Verified 1 room already downloaded (found in Chrome's download history) - not re-downloaded before writing the report"
+  );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "verified_existing_downloads", count: 3, stage: "csv_resume" }),
+    "Verified 3 rooms already downloaded (found in Chrome's download history) - not re-downloaded"
+  );
 });
 
 test("describeWorkerEvent falls back to the raw event type for an unrecognized type, instead of throwing", () => {
@@ -374,6 +382,24 @@ test("parseUploadedCsv still queues 'Failed', 'Success/Attempted', and 'Waiting'
   assert.equal(result.rooms.length, 3);
   assert.equal(result.priorResults.length, 0);
   assert.deepEqual(result.rooms.map(r => r.roomId), ["1", "2", "3"]);
+});
+
+// Regression: without carrying `status` through, background.js's
+// DS_START_QUEUE handler would have no way to tell a "Success/Attempted"
+// room (genuinely worth checking against Chrome's download history -
+// findVerifiedExistingDownloads()) from a "Failed" one (never had a
+// download triggered, nothing to check) once both land in the same
+// `rooms` array.
+test("parseUploadedCsv carries the original 'Status' through onto queued rooms, so Success/Attempted can be told apart from Failed", () => {
+  const rows = [
+    DOWNLOAD_REPORT_HEADER,
+    ["1", "Room A", "1", "https://rooms.docusign.com/rooms/1/documents", "Failed", "Bulk download button was not found", "", "", ""],
+    ["2", "Room B", "2", "https://rooms.docusign.com/rooms/2/documents", "Success/Attempted", "Download click attempted", "", "", ""]
+  ];
+  const result = utils.parseUploadedCsv(rows);
+
+  assert.equal(result.rooms.find(r => r.roomId === "1").status, "Failed");
+  assert.equal(result.rooms.find(r => r.roomId === "2").status, "Success/Attempted");
 });
 
 test("parseUploadedCsv treats a plain Scan List CSV (no Status column) as everything needing processing", () => {

@@ -368,7 +368,20 @@ chrome.runtime.onMessage.addListener(message => {
     } else if (s.running) {
       setStatus(runningStatusText(s));
     } else if (s.finishedAt) {
-      setStatus("Done. Download report and activity log saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.");
+      // A flat "Done" was misleading when the run actually ended with
+      // rooms still in a non-final state (Success/Attempted or Failed) -
+      // background.js's verifySuccessAttemptedResults() already catches
+      // whatever it can confirm before this report was written, but
+      // whatever's genuinely still outstanding needs a real answer here,
+      // not silence dressed up as completion.
+      const outstanding = (s.results || []).filter(
+        r => r.status !== "Downloaded" && r.status !== "Complete (Empty)"
+      ).length;
+      if (outstanding > 0) {
+        setStatus(`Done, but ${outstanding} room${outstanding === 1 ? "" : "s"} still need${outstanding === 1 ? "s" : ""} attention (not confirmed downloaded) - re-upload the download report to finish them. Saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.`);
+      } else {
+        setStatus("Done - every room downloaded or confirmed empty. Report and activity log saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.");
+      }
     }
     return;
   }

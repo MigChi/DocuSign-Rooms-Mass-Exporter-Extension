@@ -77,7 +77,22 @@ is a nice-to-have refinement, not a gap in core functionality.
   Error`, or `Waiting` for anything not yet reached), reason, saved
   filename, and timestamp. `Downloaded` and `Complete (Empty)` rooms are
   both skipped (not re-run) if this report is re-uploaded via "Upload
-  CSV to Run/Resume".
+  CSV to Run/Resume". The status line at the end of a run is honest about
+  what's left too — a flat "Done" only shows once every room is actually
+  `Downloaded` or `Complete (Empty)`; otherwise it says exactly how many
+  rooms still need attention.
+- **Verifies before re-downloading** — a room marked `Success/Attempted`
+  had a download genuinely triggered, just never confirmed complete, and
+  sometimes it actually did finish (the confirmation event was never
+  recorded — a tab closed right after triggering it, or the browser
+  restarted before Chrome reported it done). Before re-processing such a
+  room — both automatically before the very first report is written, and
+  again on any CSV-upload resume — the extension checks Chrome's own
+  download history for a real, completed, still-existing file matching
+  that room, and skips re-downloading it if one's found, avoiding a
+  genuine duplicate ZIP. `Failed` rooms are never checked this way, since
+  nothing was ever downloaded for them in the first place. See `DESIGN.md`
+  Decision 26.
 - **Standalone panel window** — opened via the toolbar icon, independent
   of any Docusign tab. Reflects the run's live status (including which
   rooms are actively processing across all worker tabs) regardless of
@@ -273,6 +288,7 @@ summary of it, not a second copy that can drift.
 | 5h. Trailing-period filename bug | Diagnose "some files did not get saved to the Docusign Rooms folder" from the same 8000-room run | Done | Confirmed via the user's own console (`Unchecked runtime.lastError: Invalid filename`) and the actual Download Report CSV - 5 real rooms, all named with a street-abbreviation period (`"124 Rosman Rd."`, `"1 Landmark Sq."`, etc.), all landed in the flat Downloads root. First diagnostic pass looked at the wrong CSV column (`Downloaded Filename`, which Chrome overwrites with its own fallback name) and seemed to contradict the trailing-period theory until the *Room Name* column was checked instead. Fixed in `cleanName()` - the single function every folder/file name in this codebase passes through - plus a Windows-reserved-device-name guard added at the same time. Regression tests added using the exact 5 confirmed room names, at both `cleanName()` and `computeFolderNames()` (the function `background.js` actually calls). See `DESIGN.md` Decision 23. |
 | 5i. Detached panel window | Move the control panel out of the Docusign page into its own standalone window, raised as a design problem (not a bug) once long runs made refresh/tab-switch fragility actually matter | Done | The panel and the scan it triggers structurally can't share one execution context - a standalone window has no DOM access, and scanning must run as DOM automation inside an actual Docusign tab. Solved with a message relay through `background.js` (`chrome.tabs.sendMessage` reaches a tab but not other extension pages; `chrome.runtime.sendMessage` reaches the reverse) - four hops for one logical scan request. Found two gaps via code review before calling it done, not live testing: a synchronous-guard race on `STATE.scanning` (same class of bug already fixed once for `STATE.running`), and no recovery if the Docusign tab closes mid-scan (fixed with a `chrome.tabs.onRemoved` listener and a new `DS_SCAN_FAILED` message). See `DESIGN.md` Decision 24. |
 | 5j. Year-based folder organization | Route each room's ZIP into `Docusign Rooms/<Year Created>/<Room Name>/...` instead of a flat `Docusign Rooms/<Room Name>/...`, requested directly by the user | Done | Building this exposed a real, pre-existing bug: the Scan List CSV's "Created Date" column used `String(date).slice(0, 10)`, which silently produces a weekday/day fragment with no year at all on any non-UTC-midnight machine (confirmed directly: "2021-01-04" became "Sun Jan 03") - fixed with a proper `toISOString()`-based helper before building the year-folder logic on top of it, since the feature depended on that column actually being trustworthy. Collision disambiguation (the "(roomId)" suffix for two same-named rooms) was rescoped to per-(year, name) rather than per-name - two identically-named rooms created in different years no longer need it, since they're not actually sharing a folder anymore. The Download Report CSV gained its own new "Created Date" column so a CSV-upload resume still knows which year folder a re-queued room belongs in. See `DESIGN.md` Decision 25. |
+| 5k. Verify-before-re-download | Stop re-uploaded CSVs from blindly re-triggering rooms that actually already finished, raised after investigating "why does it say 1085 still Waiting when the previous CSV said it was complete" | Done | Root cause of the *specific* 1085 turned out to be a run stopped ~5.5 minutes after it started (confirmed via the Activity Log's timestamps, not guessed) - not a queue bug. But the underlying complaint was real: a "Success/Attempted" room sometimes already has a real file on disk, and re-clicking Download for it risks a genuine duplicate. Fixed with `chrome.downloads.search()` (already covered by the existing "downloads" permission) matching a room's expected filename against Chrome's own download history - scoped to `Success/Attempted` only, not `Failed` (nothing was ever downloaded for a Failed room to verify), per direct correction mid-conversation. Runs automatically before the very first report is written, not only on a CSV re-upload, per a follow-up request - so the first report is already accurate instead of needing a second pass just to reconcile. The "Done" status message was also fixed to say how many rooms still need attention instead of a flat "Done" regardless of outcome. See `DESIGN.md` Decision 26. |
 | 6. Adaptive concurrency suggestion | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | The bounds half of this landed early, in phase 5d - what's left is the *measured, suggested* half. Depends on real timing data, which now exists to build against. |
 
 Every issue above is one line here and a full paragraph in either
@@ -766,6 +782,32 @@ practical at 10,000+ rooms instead of a few dozen.
     an older-format CSV that predates this column - falls into an
     `Unknown Year` folder rather than being silently misfiled or dropped.
     Full reasoning in `DESIGN.md`'s Decision 25.
+  - **Verify a room against Chrome's own download history before
+    re-downloading it**, prompted by investigating "why does it say 1085
+    still Waiting when the previous CSV said it was complete." That
+    specific case traced to a run stopped ~5.5 minutes after it started
+    (confirmed via the Activity Log's own timestamps) - not a queue bug -
+    but the underlying complaint held up: a `Success/Attempted` room
+    (download triggered, never confirmed complete) sometimes really did
+    finish, and blindly re-clicking Download for it risks a genuine
+    duplicate ZIP rather than fixing anything. Fixed with
+    `chrome.downloads.search()` (covered by the existing `"downloads"`
+    permission already declared - no manifest change) matching a room's
+    expected filename against Chrome's own persistent download history,
+    checking the leaf filename only so it works regardless of whether the
+    real file landed under the old flat structure or the new year-folder
+    one. Deliberately scoped to `Success/Attempted` only, not `Failed` -
+    corrected directly mid-conversation ("don't check for the failed
+    ones, only for the success/attempted") - a Failed room never had a
+    download triggered, so there's nothing to verify. Runs in two places,
+    the second added after a direct follow-up request ("can this be done
+    before the final CSV is generated, not just on re-upload"): once
+    automatically before the very first report is ever written (so it
+    starts out accurate), and again on any CSV-upload resume (catching
+    older reports that predate this fix). The "Done" status message was
+    also fixed to report how many rooms still need attention instead of a
+    flat "Done" regardless of what actually happened. Full reasoning in
+    `DESIGN.md`'s Decision 26.
 
 ---
 
