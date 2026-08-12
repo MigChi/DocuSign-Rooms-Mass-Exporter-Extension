@@ -252,12 +252,12 @@ function computeFolderNames(queue) {
 
 // Pure matching logic, factored out from findVerifiedExistingDownloads()
 // below so it's testable without mocking chrome.downloads.search() - given
-// a list of already-fetched DownloadItems and a list of "Success/
-// Attempted" rooms (either this run's own results, checked right before
-// the report is written, or rooms coming off an uploaded CSV on a
-// resume - see the two call sites), returns roomId -> the matched
-// DownloadItem for every room a real, complete, still-existing download
-// can be tied to.
+// a list of already-fetched DownloadItems and a list of rooms not yet
+// confirmed downloaded ("Success/Attempted" from this run's own results,
+// checked right before the report is written, or "Success/Attempted" or
+// "Waiting" rooms coming off an uploaded CSV on a resume - see the two
+// call sites), returns roomId -> the matched DownloadItem for every room
+// a real, complete, still-existing download can be tied to.
 //
 // Matches by roomId extracted from the download's own url/finalUrl/
 // referrer - the exact same /rooms/<id>/ or /transaction/<id>/ pattern
@@ -305,16 +305,22 @@ function matchVerifiedDownloads(existingItems, rooms) {
 // already covered by this extension's existing "downloads" permission, no
 // manifest change needed) for every completed, still-on-disk download
 // whose filename mentions "Docusign Rooms," then matches it against a set
-// of "Success/Attempted" rooms - one that genuinely had a download
-// triggered, just never confirmed complete, sometimes really did finish
-// (the completion event was never recorded at all - the tab closed or
-// crashed right after triggering it, or the service worker restarted
-// before that event fired) - re-clicking Select All/Download for a room
-// that already has a real file risks a genuine duplicate ZIP rather than
-// fixing anything. Two callers: verifySuccessAttemptedResults() checks
-// this run's own results right before the report is written, and
-// DS_START_QUEUE checks rooms coming off an uploaded CSV before queueing
-// them for reprocessing (catches older reports predating the first
+// of rooms not yet confirmed downloaded. "Success/Attempted" means a
+// download was genuinely triggered, just never confirmed complete,
+// sometimes really did finish (the completion event was never recorded at
+// all - the tab closed or crashed right after triggering it, or the
+// service worker restarted before that event fired). "Waiting" (only
+// possible on a CSV-upload resume, never in this run's own live results)
+// means something different but just as worth checking: it only says
+// *this* run's queue never reached the room - not that no earlier,
+// separate run ever downloaded it. Either way, re-clicking Select All/
+// Download for a room that already has a real file risks a genuine
+// duplicate ZIP rather than fixing anything. Two callers:
+// verifySuccessAttemptedResults() checks this run's own results (always
+// "Success/Attempted" only - "Waiting" can't appear there) right before
+// the report is written, and DS_START_QUEUE checks rooms coming off an
+// uploaded CSV before queueing them for reprocessing (catches older
+// reports predating the first
 // check, or where the gap was never caught the first time). One bulk
 // search, not one per room - chrome.downloads history can be large, and
 // a native call per room would add up needlessly. Never throws: a
@@ -629,7 +635,11 @@ async function waitForInFlightDownloadsToSettle(timeoutMs = 20000) {
 // crashed right after triggering it, or the service worker restarted
 // before that event fired) - this check covers exactly that gap. Only
 // "Success/Attempted" results are checked, never "Failed" - see
-// findVerifiedExistingDownloads()'s own comment for why. Mutates
+// findVerifiedExistingDownloads()'s own comment for why. Not widened to
+// "Waiting" the way DS_START_QUEUE's analogous check is - "Waiting" is a
+// createReport()-time display default for a queue entry with no result
+// at all, never a status processRoom() actually writes into STATE.results,
+// so there's nothing here for it to match against. Mutates
 // STATE.results in place (the same array createReport() reads right
 // after this returns) rather than returning a new list, since every
 // caller already holds a reference to the live STATE.results.
@@ -1106,16 +1116,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }));
 
         // Before queueing anything for real DOM reprocessing, check whether
-        // a "Success/Attempted" room (one that genuinely had a download
-        // triggered, just never confirmed complete) actually already has a
-        // real file sitting in Chrome's download history - see
+        // a "Success/Attempted" or "Waiting" room already has a real file
+        // sitting in Chrome's download history - see
         // findVerifiedExistingDownloads()'s own comment for why this
         // happens and why re-clicking Download for it risks a real
-        // duplicate. Scoped to Success/Attempted only, not Failed - a
-        // Failed room never had a download start in the first place, so
-        // there's nothing there to verify.
-        const successAttempted = normalized.filter(r => r.status === "Success/Attempted");
-        const verifiedMatches = await findVerifiedExistingDownloads(successAttempted);
+        // duplicate. "Waiting" widened in alongside "Success/Attempted"
+        // after a direct follow-up: Waiting only means *this* run's queue
+        // never reached the room - it says nothing about whether an
+        // earlier, separate run already downloaded it successfully.
+        // Confirmed directly against this account's real data: of the
+        // non-Downloaded rooms found already sitting at their correct
+        // location, the large majority were at Waiting, not Success/
+        // Attempted. Still excludes "Failed" - a genuinely failed attempt
+        // (page didn't load, button not found) is a different signal than
+        // "never touched," and Failed rooms were deliberately left out of
+        // this check per an earlier, explicit decision.
+        const unconfirmedRooms = normalized.filter(r => r.status === "Success/Attempted" || r.status === "Waiting");
+        const verifiedMatches = await findVerifiedExistingDownloads(unconfirmedRooms);
 
         const stillNeedsProcessing = [];
         const verifiedRoomsForQueue = [];
