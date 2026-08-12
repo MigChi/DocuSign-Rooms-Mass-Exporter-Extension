@@ -40,6 +40,67 @@ const setStatus = text => {
   statusEl.textContent = text;
 };
 
+// A stand-in for window.confirm() - confirmed live: Chrome silently
+// suppresses a real confirm()/alert()/prompt() dialog whenever the
+// window that called it isn't the currently focused one, auto-resolving
+// it as Cancel with no visible error at all. This panel is a standalone
+// popup window, and a scan can run for several minutes - long enough
+// that a user reasonably switches away and isn't looking at this window
+// the instant a scan finishes and tries to confirm starting the run. A
+// DOM overlay is just page content, not an OS-level modal - it can never
+// be suppressed that way, so this replaces every confirm() call in this
+// file. Returns a Promise<boolean> instead of a synchronous boolean,
+// which is why every caller became `async`/`await` rather than a plain
+// `if (confirm(...))` check.
+const confirmOverlayEl = document.getElementById("dsbd-confirm-overlay");
+const confirmMessageEl = document.getElementById("dsbd-confirm-message");
+const confirmOkBtn = document.getElementById("dsbd-confirm-ok");
+const confirmCancelBtn = document.getElementById("dsbd-confirm-cancel");
+
+// A real confirm() is fully blocking at the OS level, so two calls in the
+// same page could never overlap. This one can't make that guarantee on
+// its own - it's just a Promise, and two showConfirmDialog() calls close
+// together (a scan finishing right as someone clicks Stop, say) would
+// otherwise both attach listeners to the same single overlay at once,
+// letting one click resolve both pending Promises incorrectly. Chained
+// onto confirmDialogChain so calls are serialized instead: each new
+// dialog only actually appears once whatever's currently pending has
+// been answered, never layered underneath it.
+let confirmDialogChain = Promise.resolve();
+
+function showConfirmDialog(message) {
+  const run = () => new Promise(resolve => {
+    confirmMessageEl.textContent = message;
+    confirmOverlayEl.hidden = false;
+
+    const cleanup = result => {
+      confirmOverlayEl.hidden = true;
+      confirmOkBtn.removeEventListener("click", onOk);
+      confirmCancelBtn.removeEventListener("click", onCancel);
+      document.removeEventListener("keydown", onKeydown);
+      resolve(result);
+    };
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    // Enter/Escape mirror the real confirm() dialog's own keyboard
+    // behavior, so this doesn't feel like a downgrade to anyone used to
+    // the native one.
+    const onKeydown = event => {
+      if (event.key === "Enter") onOk();
+      else if (event.key === "Escape") onCancel();
+    };
+
+    confirmOkBtn.addEventListener("click", onOk);
+    confirmCancelBtn.addEventListener("click", onCancel);
+    document.addEventListener("keydown", onKeydown);
+    confirmOkBtn.focus();
+  });
+
+  const next = confirmDialogChain.then(run);
+  confirmDialogChain = next;
+  return next;
+}
+
 // One row per worker tab (s.workerTabIds, in creation order - stable for
 // the run's lifetime, unlike raw Chrome tab IDs which mean nothing to a
 // user) showing which room it currently has claimed, or "idle" if it has
@@ -147,14 +208,15 @@ function readWorkerTabCount() {
 // with the user, then hands the room list to background.js. priorResults
 // (only non-empty for a resumed CSV upload) is forwarded as-is so
 // background.js can seed the new run's results/report with rooms already
-// known to be done.
-function beginRun(rooms, confirmMessage, priorResults = [], dateRangeLabel = null) {
+// known to be done. async because showConfirmDialog() is - see its own
+// comment for why this can no longer be a synchronous confirm() check.
+async function beginRun(rooms, confirmMessage, priorResults = [], dateRangeLabel = null) {
   if (!rooms.length) {
     setStatus("No rooms to run - the list is empty.");
     return;
   }
 
-  const confirmed = confirm(confirmMessage);
+  const confirmed = await showConfirmDialog(confirmMessage);
 
   if (!confirmed) {
     setStatus("Cancelled.");
@@ -249,9 +311,9 @@ function updateButtonStates(s) {
   pauseResumeBtn.disabled = !active;
 }
 
-startStopBtn.addEventListener("click", () => {
+startStopBtn.addEventListener("click", async () => {
   if (scanInProgress) {
-    const confirmed = confirm("Stop scanning? Rooms found so far will still be used.");
+    const confirmed = await showConfirmDialog("Stop scanning? Rooms found so far will still be used.");
     if (!confirmed) return;
     chrome.runtime.sendMessage({ type: "DS_SCAN_STOP" }).catch(() => {});
     setStatus("Stopping scan...");
@@ -259,7 +321,7 @@ startStopBtn.addEventListener("click", () => {
   }
 
   if (isRunning) {
-    const confirmed = confirm("Stop after the current step?");
+    const confirmed = await showConfirmDialog("Stop after the current step?");
     if (!confirmed) return;
     chrome.runtime.sendMessage({ type: "DS_STOP" }).catch(() => {});
     setStatus("Stopping...");

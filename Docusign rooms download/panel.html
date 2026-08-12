@@ -222,6 +222,37 @@
       font-size: 11px;
       line-height: 1.35;
     }
+    .dsbd-confirm-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(26,26,26,.45);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      z-index: 100;
+    }
+    .dsbd-confirm-overlay[hidden] { display: none; }
+    .dsbd-confirm-box {
+      background: #fff;
+      border-radius: 10px;
+      border-top: 4px solid #ffcc22;
+      padding: 18px 18px 14px;
+      max-width: 100%;
+      box-shadow: 0 10px 30px rgba(0,0,0,.25);
+    }
+    .dsbd-confirm-message {
+      margin: 0 0 16px;
+      font-size: 13px;
+      line-height: 1.45;
+      color: #1a1a1a;
+      white-space: pre-line;
+    }
+    .dsbd-confirm-buttons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
   </style>
 </head>
 <body>
@@ -263,6 +294,27 @@
   <div class="dsbd-credit">created by Miguel Chica</div>
   <div class="dsbd-note">
     Saves as: Downloads / Docusign Rooms / Year / Room Name / Room Name.zip. Requires a Docusign Rooms list tab to be open for scanning.
+  </div>
+
+  <!-- A custom stand-in for window.confirm() - Chrome silently suppresses
+       a real confirm()/alert()/prompt() dialog whenever the window that
+       called it isn't the currently focused one (confirmed live: this
+       panel is a standalone popup window, and a scan can run for several
+       minutes - long enough that a user reasonably switches away and
+       isn't looking at this window the instant it finishes), auto-
+       resolving it as Cancel with no visible error at all. This overlay
+       is just page content, not an OS-level modal, so it can never be
+       suppressed that way - it's simply there, or it isn't, regardless
+       of window focus. Hidden by default via [hidden]; see panel.js's
+       showConfirmDialog(). -->
+  <div class="dsbd-confirm-overlay" id="dsbd-confirm-overlay" hidden>
+    <div class="dsbd-confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="dsbd-confirm-message">
+      <p class="dsbd-confirm-message" id="dsbd-confirm-message"></p>
+      <div class="dsbd-confirm-buttons">
+        <button id="dsbd-confirm-cancel" class="dsbd-secondary">Cancel</button>
+        <button id="dsbd-confirm-ok" class="dsbd-state-start">Continue</button>
+      </div>
+    </div>
   </div>
 
   <script src="content/utils.js"></script>
