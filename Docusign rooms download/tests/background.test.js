@@ -16,45 +16,71 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { freshBackground } = require("./helpers/load-background");
 
-test("computeFolderNames gives every room a plain name when nothing collides", () => {
+test("computeFolderNames gives every room a plain name and the right year when nothing collides", () => {
   const { computeFolderNames } = freshBackground();
 
   const queue = [
-    { roomId: "1", roomName: "Alpha" },
-    { roomId: "2", roomName: "Beta" }
+    { roomId: "1", roomName: "Alpha", createdDate: "2024-03-15" },
+    { roomId: "2", roomName: "Beta", createdDate: "2023-11-02" }
   ];
 
   const folderNames = computeFolderNames(queue);
 
-  assert.equal(folderNames.get("1"), "Alpha");
-  assert.equal(folderNames.get("2"), "Beta");
+  assert.deepEqual(folderNames.get("1"), { year: "2024", roomFolderName: "Alpha" });
+  assert.deepEqual(folderNames.get("2"), { year: "2023", roomFolderName: "Beta" });
 });
 
-test("computeFolderNames appends the room ID only for rooms whose name collides in this run (regression: two 'Ponchak - Listing' rooms sharing one folder)", () => {
+test("computeFolderNames appends the room ID only for rooms whose name collides within the same year (regression: two 'Ponchak - Listing' rooms sharing one folder)", () => {
   const { computeFolderNames } = freshBackground();
 
   const queue = [
-    { roomId: "2977526", roomName: "Ponchak - Listing" },
-    { roomId: "2977529", roomName: "Ponchak - Listing" },
-    { roomId: "3000000", roomName: "Unrelated Room" }
+    { roomId: "2977526", roomName: "Ponchak - Listing", createdDate: "2022-05-01" },
+    { roomId: "2977529", roomName: "Ponchak - Listing", createdDate: "2022-09-01" },
+    { roomId: "3000000", roomName: "Unrelated Room", createdDate: "2022-01-01" }
   ];
 
   const folderNames = computeFolderNames(queue);
 
-  assert.equal(folderNames.get("2977526"), "Ponchak - Listing (2977526)");
-  assert.equal(folderNames.get("2977529"), "Ponchak - Listing (2977529)");
-  assert.equal(folderNames.get("3000000"), "Unrelated Room");
+  assert.equal(folderNames.get("2977526").roomFolderName, "Ponchak - Listing (2977526)");
+  assert.equal(folderNames.get("2977529").roomFolderName, "Ponchak - Listing (2977529)");
+  assert.equal(folderNames.get("3000000").roomFolderName, "Unrelated Room");
   // The two disambiguated names must actually be distinct from each other -
   // the whole point of the fix.
-  assert.notEqual(folderNames.get("2977526"), folderNames.get("2977529"));
+  assert.notEqual(folderNames.get("2977526").roomFolderName, folderNames.get("2977529").roomFolderName);
+});
+
+test("computeFolderNames does NOT disambiguate two same-named rooms created in different years - they land in different year folders already", () => {
+  const { computeFolderNames } = freshBackground();
+
+  const queue = [
+    { roomId: "1", roomName: "Main St Listing", createdDate: "2021-06-01" },
+    { roomId: "2", roomName: "Main St Listing", createdDate: "2024-06-01" }
+  ];
+
+  const folderNames = computeFolderNames(queue);
+
+  assert.deepEqual(folderNames.get("1"), { year: "2021", roomFolderName: "Main St Listing" });
+  assert.deepEqual(folderNames.get("2"), { year: "2024", roomFolderName: "Main St Listing" });
+});
+
+test("computeFolderNames falls back to \"Unknown Year\" for a room with no usable createdDate, without dropping the room", () => {
+  const { computeFolderNames } = freshBackground();
+
+  const folderNames = computeFolderNames([
+    { roomId: "1", roomName: "No Date Room", createdDate: null },
+    { roomId: "2", roomName: "Bad Date Room", createdDate: "not a date" }
+  ]);
+
+  assert.deepEqual(folderNames.get("1"), { year: "Unknown Year", roomFolderName: "No Date Room" });
+  assert.deepEqual(folderNames.get("2"), { year: "Unknown Year", roomFolderName: "Bad Date Room" });
 });
 
 test("computeFolderNames falls back to a generated name when roomName is missing", () => {
   const { computeFolderNames } = freshBackground();
 
-  const folderNames = computeFolderNames([{ roomId: "99", roomName: "" }]);
+  const folderNames = computeFolderNames([{ roomId: "99", roomName: "", createdDate: "2024-01-01" }]);
 
-  assert.equal(folderNames.get("99"), "Docusign Room 99");
+  assert.equal(folderNames.get("99").roomFolderName, "Docusign Room 99");
 });
 
 // End-to-end regression, one level up from cleanName()'s own tests in
@@ -79,12 +105,12 @@ test("computeFolderNames produces a folder name with no trailing period/space fo
     "693 Squaw Brook Rd."
   ];
 
-  const queue = confirmedBadNames.map((roomName, i) => ({ roomId: String(i + 1), roomName }));
+  const queue = confirmedBadNames.map((roomName, i) => ({ roomId: String(i + 1), roomName, createdDate: "2024-01-01" }));
   const folderNames = computeFolderNames(queue);
 
   queue.forEach(room => {
-    const folderName = folderNames.get(room.roomId);
-    assert.ok(!/[.\s]$/.test(folderName), `folder name for "${room.roomName}" must not end in a period/space (got "${folderName}")`);
+    const { roomFolderName } = folderNames.get(room.roomId);
+    assert.ok(!/[.\s]$/.test(roomFolderName), `folder name for "${room.roomName}" must not end in a period/space (got "${roomFolderName}")`);
   });
 });
 

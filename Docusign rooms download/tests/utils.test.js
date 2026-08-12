@@ -173,6 +173,53 @@ test("formatDateRangeLabel handles a single-day range (From and To the same date
   assert.equal(label, "2026-06-15 to 2026-06-15");
 });
 
+test("formatCreatedDateForCsv formats a Date object as ISO 'YYYY-MM-DD'", () => {
+  assert.equal(utils.formatCreatedDateForCsv(new Date("2024-03-15")), "2024-03-15");
+});
+
+test("formatCreatedDateForCsv formats a CSV-round-tripped date string the same way", () => {
+  assert.equal(utils.formatCreatedDateForCsv("2024-03-15"), "2024-03-15");
+});
+
+test("formatCreatedDateForCsv returns '' for null/undefined/empty/unparseable input, never throws", () => {
+  assert.equal(utils.formatCreatedDateForCsv(null), "");
+  assert.equal(utils.formatCreatedDateForCsv(undefined), "");
+  assert.equal(utils.formatCreatedDateForCsv(""), "");
+  assert.equal(utils.formatCreatedDateForCsv("not a date"), "");
+});
+
+// Regression: an earlier version of this column used
+// `String(date).slice(0, 10)`, which is not toISOString() - on a
+// non-UTC-midnight machine that silently produces something like
+// "Sun Jan 03" (no year at all, and a calendar day off) instead of
+// "2021-01-04". Confirmed directly against this bug before fixing it.
+test("formatCreatedDateForCsv is timezone-safe - matches toISOString(), not toString()", () => {
+  const date = new Date("2021-01-04");
+  assert.equal(utils.formatCreatedDateForCsv(date), date.toISOString().slice(0, 10));
+  assert.notEqual(utils.formatCreatedDateForCsv(date), String(date).slice(0, 10));
+});
+
+test("roomCreatedYear extracts the year from a Date object or an ISO date string", () => {
+  assert.equal(utils.roomCreatedYear(new Date("2024-03-15")), "2024");
+  assert.equal(utils.roomCreatedYear("2023-11-02"), "2023");
+});
+
+test("roomCreatedYear falls back to 'Unknown Year' for null/undefined/unparseable input, never throws", () => {
+  assert.equal(utils.roomCreatedYear(null), "Unknown Year");
+  assert.equal(utils.roomCreatedYear(undefined), "Unknown Year");
+  assert.equal(utils.roomCreatedYear(""), "Unknown Year");
+  assert.equal(utils.roomCreatedYear("not a date"), "Unknown Year");
+});
+
+test("roomCreatedYear is UTC-based, not local-time-based, so a date-only string's year never shifts across a timezone boundary", () => {
+  // A bare "YYYY-MM-DD" string parses as UTC midnight (language spec) -
+  // getUTCFullYear() must read that back as the same year regardless of
+  // this machine's local timezone; getFullYear() could disagree right at
+  // a year boundary for a timezone behind UTC.
+  assert.equal(utils.roomCreatedYear("2024-01-01"), "2024");
+  assert.equal(utils.roomCreatedYear("2024-12-31"), "2024");
+});
+
 test("parseWorkerTabCountInput passes through an in-range integer string unchanged", () => {
   assert.equal(utils.parseWorkerTabCountInput("3", 1, 8, 3), 3);
   assert.equal(utils.parseWorkerTabCountInput("1", 1, 8, 3), 1);
@@ -338,4 +385,44 @@ test("parseUploadedCsv treats a plain Scan List CSV (no Status column) as everyt
 
   assert.equal(result.rooms.length, 1);
   assert.equal(result.priorResults.length, 0);
+});
+
+// Regression: without this, a room re-queued from a CSV upload would
+// lose its createdDate entirely, and background.js's computeFolderNames()
+// would file it under "Unknown Year" regardless of when it was actually
+// created - even though the CSV had the real date sitting right there.
+test("parseUploadedCsv carries a 'Created Date' column through onto queued rooms (Scan List CSV)", () => {
+  const rows = [
+    ["Room #", "Room Name", "Room ID", "Documents URL", "Created Date"],
+    ["1", "Room A", "1", "https://rooms.docusign.com/rooms/1/documents", "2024-03-15"]
+  ];
+  const result = utils.parseUploadedCsv(rows);
+
+  assert.equal(result.rooms[0].createdDate, "2024-03-15");
+});
+
+const DOWNLOAD_REPORT_HEADER_WITH_DATE = [
+  "Room #", "Room Name", "Room ID", "Documents URL", "Created Date", "Status", "Reason", "Downloaded Filename", "Download ID", "Time"
+];
+
+test("parseUploadedCsv carries a 'Created Date' column through for both still-queued and already-done rows (Download Report CSV)", () => {
+  const rows = [
+    DOWNLOAD_REPORT_HEADER_WITH_DATE,
+    ["1", "Room A", "1", "https://rooms.docusign.com/rooms/1/documents", "2024-03-15", "Waiting", "Not yet processed", "", "", ""],
+    ["2", "Room B", "2", "https://rooms.docusign.com/rooms/2/documents", "2023-11-02", "Downloaded", "Download completed", "Docusign Rooms/2023/Room B/Room B.zip", "7", "2026-01-01T00:00:00.000Z"]
+  ];
+  const result = utils.parseUploadedCsv(rows);
+
+  assert.equal(result.rooms[0].createdDate, "2024-03-15");
+  assert.equal(result.priorResults[0].createdDate, "2023-11-02");
+});
+
+test("parseUploadedCsv falls back to a null createdDate for an older-format Download Report with no 'Created Date' column, without breaking", () => {
+  const rows = [
+    DOWNLOAD_REPORT_HEADER,
+    ["1", "Room A", "1", "https://rooms.docusign.com/rooms/1/documents", "Waiting", "Not yet processed", "", "", ""]
+  ];
+  const result = utils.parseUploadedCsv(rows);
+
+  assert.equal(result.rooms[0].createdDate, null);
 });

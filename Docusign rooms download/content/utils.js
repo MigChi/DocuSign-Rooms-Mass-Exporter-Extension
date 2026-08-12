@@ -167,6 +167,60 @@ function formatDateRangeLabel(dateRange) {
 }
 
 /**
+ * Normalizes a room's createdDate - a real Date object fresh off a live
+ * scan (content/scan.js), or a plain "YYYY-MM-DD" string once it's round
+ * -tripped through an uploaded CSV (parseUploadedCsv() below) - into a
+ * Date, or null if there's nothing usable. Centralizes the Date-or-string
+ * handling so formatCreatedDateForCsv()/roomCreatedYear() don't each have
+ * to guess at the input shape, and so both agree on what counts as
+ * "invalid" (an unparseable string produces an Invalid Date, not a thrown
+ * error - Number.isNaN(date.getTime()) is the actual way to detect that).
+ */
+function coerceCreatedDate(createdDate) {
+    if (!createdDate) return null;
+    const date = createdDate instanceof Date ? createdDate : new Date(createdDate);
+    return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/**
+ * Formats a room's createdDate as an ISO "YYYY-MM-DD" string for a CSV
+ * column, or "" if there's nothing valid to format - shared by the Scan
+ * List and Download Report exports (background.js) so "Created Date"
+ * reads the same way regardless of which export produced it. Replaces an
+ * earlier version of this column that used `String(date).slice(0, 10)` -
+ * that only happens to look like an ISO date in UTC; everywhere else it
+ * silently produces something like "Sun Jan 03" (a weekday-and-day
+ * fragment with no year at all, from Date's default toString() format,
+ * and shifted a calendar day off the real date to boot) - confirmed
+ * directly on this machine (America/New_York) before writing this fix.
+ */
+function formatCreatedDateForCsv(createdDate) {
+    const date = coerceCreatedDate(createdDate);
+    return date ? date.toISOString().slice(0, 10) : "";
+}
+
+/**
+ * The year folder a room's documents get organized under
+ * (Docusign Rooms/<year>/<Room Name>/...). UTC-based (getUTCFullYear, not
+ * getFullYear) to match how room dates are parsed in the first place -
+ * content/scan.js reads a date-only string off the page ("Jan 4, 2024")
+ * straight into `new Date(...)`, which the language spec treats as UTC
+ * midnight, not local midnight. Using local time here instead could roll
+ * a room created right at a year boundary into the wrong year depending
+ * on which side of UTC the browser's timezone falls - the same class of
+ * mismatch formatCreatedDateForCsv() above avoids by using toISOString()
+ * rather than toString(). Falls back to "Unknown Year" (not, say,
+ * silently grouping with some other year, or throwing) for a room with
+ * no usable createdDate at all - only possible today for a room queued
+ * from a Download Report CSV that predates this column, or one a user
+ * hand-edited to drop it.
+ */
+function roomCreatedYear(createdDate) {
+    const date = coerceCreatedDate(createdDate);
+    return date ? String(date.getUTCFullYear()) : "Unknown Year";
+}
+
+/**
  * Coerces a raw "Worker tabs" panel input value (a string from an
  * <input type="number">, possibly "") into a safe integer in [min, max],
  * falling back to `fallback` for anything not a real number. Mirrors
@@ -236,6 +290,17 @@ function describeWorkerEvent(evt) {
  *     resume rather than a blind full re-run, without needing
  *     chrome.storage.local at all (which doesn't survive a cleared
  *     profile or a different computer - a CSV file on disk does).
+ *
+ * Also reads a "Created Date" column when present (both exports have one
+ * now - see handleExportScanList()/createReport() in background.js) so a
+ * room re-queued from either kind of CSV still carries the date its
+ * Docusign-Rooms/<year>/... folder is computed from (computeFolderNames()
+ * in background.js) - without it, every room resumed from a CSV upload
+ * would fall back to the "Unknown Year" bucket regardless of when it was
+ * actually created. Attached to priorResults rows too for consistency,
+ * though it isn't actually load-bearing there - an already-`Downloaded`/
+ * `Complete (Empty)` room never gets re-downloaded, so nothing ever
+ * recomputes a folder for it again.
  */
 function parseUploadedCsv(rows) {
     if (rows.length < 2) return { rooms: [], priorResults: [] };
@@ -244,6 +309,7 @@ function parseUploadedCsv(rows) {
     const nameIdx = header.indexOf("Room Name");
     const idIdx = header.indexOf("Room ID");
     const urlIdx = header.indexOf("Documents URL");
+    const dateIdx = header.indexOf("Created Date");
     const statusIdx = header.indexOf("Status");
     const reasonIdx = header.indexOf("Reason");
     const filenameIdx = header.indexOf("Downloaded Filename");
@@ -261,6 +327,7 @@ function parseUploadedCsv(rows) {
 
       const roomId = idIdx === -1 ? "" : (r[idIdx] || "");
       const roomName = nameIdx === -1 ? "" : (r[nameIdx] || "");
+      const createdDate = dateIdx === -1 ? null : (r[dateIdx] || null);
       const status = statusIdx === -1 ? "" : (r[statusIdx] || "");
 
       if (status === "Downloaded" || status === "Complete (Empty)") {
@@ -268,6 +335,7 @@ function parseUploadedCsv(rows) {
           roomId,
           roomName,
           documentsUrl,
+          createdDate,
           status,
           reason: reasonIdx === -1 ? "" : (r[reasonIdx] || ""),
           downloadedFilename: filenameIdx === -1 ? "" : (r[filenameIdx] || ""),
@@ -275,7 +343,7 @@ function parseUploadedCsv(rows) {
           time: timeIdx === -1 ? "" : (r[timeIdx] || "")
         });
       } else {
-        rooms.push({ roomId, roomName, documentsUrl });
+        rooms.push({ roomId, roomName, documentsUrl, createdDate });
       }
     });
 
@@ -299,6 +367,8 @@ if (typeof module !== "undefined" && module.exports) {
     roomUrlToDocumentsUrl,
     parseCsv,
     formatDateRangeLabel,
+    formatCreatedDateForCsv,
+    roomCreatedYear,
     parseWorkerTabCountInput,
     describeWorkerEvent,
     parseUploadedCsv

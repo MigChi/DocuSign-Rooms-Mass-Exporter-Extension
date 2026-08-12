@@ -111,10 +111,10 @@ const STATE = {
   // concurrency, since only one room was ever in flight at a time. Now
   // there's one entry per active worker tab.
   currentRooms: {},
-  // roomId -> folder name, computed once by computeFolderNames() whenever
-  // STATE.queue is set. Not persisted - it's a pure function of the
-  // queue, cheap to rebuild on resume, so there's no reason to treat it
-  // as state that could drift out of sync with the queue it's derived
+  // roomId -> {year, roomFolderName}, computed once by computeFolderNames()
+  // whenever STATE.queue is set. Not persisted - it's a pure function of
+  // the queue, cheap to rebuild on resume, so there's no reason to treat
+  // it as state that could drift out of sync with the queue it's derived
   // from.
   folderNames: new Map(),
   results: [],
@@ -220,20 +220,31 @@ async function clearPersistedJob() {
 // ID only to names that actually collide within this run, so the
 // common case (no collision) keeps the plain, readable name. Computed
 // once whenever STATE.queue is set, not recomputed per-download.
+//
+// Collisions are scoped per (year, name), not just name - rooms now land
+// in Docusign Rooms/<year>/<Room Name>/, so two identically-named rooms
+// created in different years no longer actually share a folder and don't
+// need the (roomId) suffix; only a same-name collision *within* the same
+// year folder does. roomCreatedYear() (content/utils.js) is what decides
+// the year - see its own comment for why it's UTC-based, and why a room
+// with no usable createdDate falls into "Unknown Year" rather than being
+// silently misfiled or dropped.
 function computeFolderNames(queue) {
-  const nameCounts = new Map();
+  const keyCounts = new Map();
 
   queue.forEach(room => {
+    const year = roomCreatedYear(room.createdDate);
     const name = cleanName(room.roomName || `Docusign Room ${room.roomId}`);
-    nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+    keyCounts.set(`${year}/${name}`, (keyCounts.get(`${year}/${name}`) || 0) + 1);
   });
 
   const folderNames = new Map();
 
   queue.forEach(room => {
+    const year = roomCreatedYear(room.createdDate);
     const name = cleanName(room.roomName || `Docusign Room ${room.roomId}`);
-    const folderName = nameCounts.get(name) > 1 ? `${name} (${room.roomId})` : name;
-    folderNames.set(room.roomId, folderName);
+    const roomFolderName = keyCounts.get(`${year}/${name}`) > 1 ? `${name} (${room.roomId})` : name;
+    folderNames.set(room.roomId, { year, roomFolderName });
   });
 
   return folderNames;
@@ -390,6 +401,7 @@ async function createReport() {
       "Room Name",
       "Room ID",
       "Documents URL",
+      "Created Date",
       "Status",
       "Reason",
       "Downloaded Filename",
@@ -414,6 +426,12 @@ async function createReport() {
       (r?.roomName || room.roomName || ""),
       (r?.roomId || room.roomId || ""),
       (r?.documentsUrl || room.documentsUrl || ""),
+      // Read from `room` (STATE.queue), not `r` (STATE.results) - results
+      // objects never carry createdDate at all (there was never a reason
+      // to duplicate it there), while every queue entry has it already
+      // (see DS_START_QUEUE's `normalized` mapping) or falls back to ""
+      // via formatCreatedDateForCsv() if it doesn't.
+      formatCreatedDateForCsv(room.createdDate),
       r?.status || "Waiting",
       r?.reason || "Not yet processed",
       r?.downloadedFilename || "",
@@ -643,8 +661,10 @@ async function processRoom(tabId, room) {
       // the same source here keeps the reported filename matching what
       // Chrome actually creates instead of drifting if the live page's
       // room name differs slightly from what was in the original scan.
-      const folderName = STATE.folderNames.get(roomId) || finalRoomName;
-      result.downloadedFilename = `Docusign Rooms/${folderName}/${folderName}.zip`;
+      const folderInfo = STATE.folderNames.get(roomId);
+      const roomFolderName = folderInfo?.roomFolderName || finalRoomName;
+      const yearFolder = folderInfo?.year || "Unknown Year";
+      result.downloadedFilename = `Docusign Rooms/${yearFolder}/${roomFolderName}/${roomFolderName}.zip`;
 
       STATE.results.push(result);
       await persistJob();
@@ -835,7 +855,14 @@ async function handleExportScanList(rooms, dateRangeLabel) {
         r.roomName || "",
         r.roomId || "",
         r.documentsUrl || "",
-        String(r.createdDate || "").slice(0, 10)
+        // Was `String(r.createdDate || "").slice(0, 10)` - looks
+        // plausible but is wrong for any non-UTC timezone: Date's default
+        // toString() isn't an ISO string, so slicing its first 10
+        // characters produces something like "Sun Jan 03" (no year, and
+        // a calendar day off from the real date) rather than
+        // "2021-01-04". formatCreatedDateForCsv() (content/utils.js)
+        // uses toISOString() instead, which this format actually needs.
+        formatCreatedDateForCsv(r.createdDate)
       ]);
     });
 
@@ -884,7 +911,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return {
             roomId,
             roomName: cleanName(room.roomName || room.title || `Docusign Room ${roomId}`),
-            documentsUrl
+            documentsUrl,
+            // Carried through so computeFolderNames() below can route this
+            // room into Docusign Rooms/<year>/... - present as a real Date
+            // on a room fresh off a live scan (content/scan.js), or an
+            // ISO string once it's round-tripped through an uploaded CSV
+            // (parseUploadedCsv() in content/utils.js); roomCreatedYear()
+            // accepts either. Previously dropped entirely here, which
+            // would have silently sent every room to "Unknown Year."
+            createdDate: room.createdDate || null
           };
         })
         .filter(Boolean);
@@ -903,7 +938,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const priorRoomsForQueue = priorResults.map(r => ({
         roomId: r.roomId,
         roomName: r.roomName,
-        documentsUrl: r.documentsUrl
+        documentsUrl: r.documentsUrl,
+        // Without this, createReport()'s "Created Date" column would go
+        // blank for every already-`Downloaded`/`Complete (Empty)` row on
+        // a resumed run's report, even though parseUploadedCsv() already
+        // parsed a real date for these rows off the uploaded CSV.
+        createdDate: r.createdDate || null
       }));
 
       STATE.queue = [...priorRoomsForQueue, ...normalized];
@@ -1174,10 +1214,15 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
   // would send both into the same folder, silently merging their
   // downloads. STATE.folderNames (built once per run by
   // computeFolderNames()) appends the room ID only where a collision
-  // actually exists in this run's queue, so most rooms still get a
-  // plain, readable folder name.
-  const folderName = STATE.folderNames.get(currentRoom.roomId) || roomName;
-  const filename = `Docusign Rooms/${folderName}/${folderName}.zip`;
+  // actually exists within the same year folder in this run's queue, so
+  // most rooms still get a plain, readable folder name. The year itself
+  // also comes from that same precomputed map, not recalculated here, so
+  // this listener and processRoom()'s own reported downloadedFilename
+  // can never disagree about where a given room's ZIP actually landed.
+  const folderInfo = STATE.folderNames.get(currentRoom.roomId);
+  const roomFolderName = folderInfo?.roomFolderName || roomName;
+  const yearFolder = folderInfo?.year || "Unknown Year";
+  const filename = `Docusign Rooms/${yearFolder}/${roomFolderName}/${roomFolderName}.zip`;
 
   STATE.downloads[downloadItem.id] = {
     roomId: currentRoom.roomId,
@@ -1187,7 +1232,8 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
   };
 
   // This creates a folder even if the Docusign export contains only one file,
-  // because every download is saved as Docusign Rooms/<Room Name>/<Room Name>.zip
+  // because every download is saved as
+  // Docusign Rooms/<Year>/<Room Name>/<Room Name>.zip
   suggest({
     filename,
     conflictAction: "uniquify"

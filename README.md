@@ -64,6 +64,13 @@ is a nice-to-have refinement, not a gap in core functionality.
   real page-state signals rather than fixed timers. Empty rooms are
   detected and skipped in under a second instead of waiting out a full
   timeout.
+- **Organized by year** — each room's ZIP saves to `Docusign Rooms/<Year
+  the room was created>/<Room Name>/<Room Name>.zip`, using the same
+  "created" date already captured during scanning and used for the
+  From/To filter, not the date you happened to run the download. A room
+  with no usable created date (only possible from an older-format CSV
+  upload) falls into an `Unknown Year` folder rather than being silently
+  misfiled or dropped. See `DESIGN.md` Decision 25.
 - **Download report CSV** after every run (or Stop) — one row per room
   that was ever queued, with its outcome (`Downloaded`, `Complete
   (Empty)` for a room with nothing to download, `Failed`, `Download
@@ -114,10 +121,16 @@ is a nice-to-have refinement, not a gap in core functionality.
 
 | What | Where |
 |---|---|
-| Each room's documents | `Downloads/Docusign Rooms/<Room Name>/<Room Name>.zip` |
+| Each room's documents | `Downloads/Docusign Rooms/<Year Created>/<Room Name>/<Room Name>.zip` |
 | Scan List CSV (from "Scan & Export List") | `Downloads/Docusign Rooms/_Scan Lists/Scan List (<date range>) <timestamp>.csv` |
 | Download Report CSV (after Start finishes or Stop) | `Downloads/Docusign Rooms/_Download Reports/Docusign Rooms Download Report (<date range>) <timestamp>.csv` |
 | Activity Log CSV (after Start finishes or Stop) | `Downloads/Docusign Rooms/_Activity Logs/Activity Log (<date range>) <timestamp>.csv` |
+
+`<Year Created>` is the room's own created date (or `Unknown Year` if
+that's ever unavailable), not the date you ran the download — see
+`DESIGN.md` Decision 25. The three CSV report categories themselves stay
+flat under `_Scan Lists`/`_Download Reports`/`_Activity Logs`, not
+year-organized — only the room ZIPs are.
 
 All three filenames include the scan's From/To date range (e.g.
 `(2026-01-01 to 2026-03-01)`) so they're identifiable without opening
@@ -259,6 +272,7 @@ summary of it, not a second copy that can drift.
 | 5g. CSV-upload resume reliability | Make Stop-then-reupload actually trustworthy, raised mid-run on the same 8000-room test | Done | A room whose ZIP was still downloading when the report was generated could show `Success/Attempted` instead of `Downloaded`, even though it finished fine seconds later - since resume only skips rows marked `Downloaded`, that room would get needlessly re-downloaded. Fixed with a bounded wait for in-flight downloads before writing the reports. Separately, empty rooms were marked `Failed` (not their own outcome), so every resume re-checked every empty room from scratch - fixed with a distinct `Complete (Empty)` status, also skipped on resume. `parseUploadedCsv()` was found to be pure and untested, sitting inside `content.js`'s closure the same way three other functions were in phase 5e - moved to `content/utils.js`, given real coverage of the exact behavior changed here. See `DESIGN.md` Decision 22. |
 | 5h. Trailing-period filename bug | Diagnose "some files did not get saved to the Docusign Rooms folder" from the same 8000-room run | Done | Confirmed via the user's own console (`Unchecked runtime.lastError: Invalid filename`) and the actual Download Report CSV - 5 real rooms, all named with a street-abbreviation period (`"124 Rosman Rd."`, `"1 Landmark Sq."`, etc.), all landed in the flat Downloads root. First diagnostic pass looked at the wrong CSV column (`Downloaded Filename`, which Chrome overwrites with its own fallback name) and seemed to contradict the trailing-period theory until the *Room Name* column was checked instead. Fixed in `cleanName()` - the single function every folder/file name in this codebase passes through - plus a Windows-reserved-device-name guard added at the same time. Regression tests added using the exact 5 confirmed room names, at both `cleanName()` and `computeFolderNames()` (the function `background.js` actually calls). See `DESIGN.md` Decision 23. |
 | 5i. Detached panel window | Move the control panel out of the Docusign page into its own standalone window, raised as a design problem (not a bug) once long runs made refresh/tab-switch fragility actually matter | Done | The panel and the scan it triggers structurally can't share one execution context - a standalone window has no DOM access, and scanning must run as DOM automation inside an actual Docusign tab. Solved with a message relay through `background.js` (`chrome.tabs.sendMessage` reaches a tab but not other extension pages; `chrome.runtime.sendMessage` reaches the reverse) - four hops for one logical scan request. Found two gaps via code review before calling it done, not live testing: a synchronous-guard race on `STATE.scanning` (same class of bug already fixed once for `STATE.running`), and no recovery if the Docusign tab closes mid-scan (fixed with a `chrome.tabs.onRemoved` listener and a new `DS_SCAN_FAILED` message). See `DESIGN.md` Decision 24. |
+| 5j. Year-based folder organization | Route each room's ZIP into `Docusign Rooms/<Year Created>/<Room Name>/...` instead of a flat `Docusign Rooms/<Room Name>/...`, requested directly by the user | Done | Building this exposed a real, pre-existing bug: the Scan List CSV's "Created Date" column used `String(date).slice(0, 10)`, which silently produces a weekday/day fragment with no year at all on any non-UTC-midnight machine (confirmed directly: "2021-01-04" became "Sun Jan 03") - fixed with a proper `toISOString()`-based helper before building the year-folder logic on top of it, since the feature depended on that column actually being trustworthy. Collision disambiguation (the "(roomId)" suffix for two same-named rooms) was rescoped to per-(year, name) rather than per-name - two identically-named rooms created in different years no longer need it, since they're not actually sharing a folder anymore. The Download Report CSV gained its own new "Created Date" column so a CSV-upload resume still knows which year folder a re-queued room belongs in. See `DESIGN.md` Decision 25. |
 | 6. Adaptive concurrency suggestion | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | The bounds half of this landed early, in phase 5d - what's left is the *measured, suggested* half. Depends on real timing data, which now exists to build against. |
 
 Every issue above is one line here and a full paragraph in either
@@ -731,6 +745,27 @@ practical at 10,000+ rooms instead of a few dozen.
     `chrome.tabs.onRemoved` listener and a new `DS_SCAN_FAILED` message
     that resets the panel's state and shows why. Full reasoning in
     `DESIGN.md`'s Decision 24.
+  - **Organized downloads by year**, requested directly: each room's ZIP
+    now saves to `Docusign Rooms/<Year Created>/<Room Name>/<Room
+    Name>.zip` instead of a flat `Docusign Rooms/<Room Name>/...`, using
+    the room's own created date (the same one already captured during
+    scanning and used for the From/To filter) rather than the date the
+    download happened to run. Building this surfaced a real, pre-existing
+    bug in the Scan List CSV's "Created Date" column - it used
+    `String(date).slice(0, 10)`, which is not an ISO string and silently
+    drops the year entirely on any non-UTC-midnight machine (confirmed
+    directly: "2021-01-04" became "Sun Jan 03") - fixed with a proper
+    `toISOString()`-based helper before relying on that column for
+    anything. `computeFolderNames()`'s same-name collision handling was
+    rescoped from per-name to per-(year, name), since two identically-
+    named rooms created in different years no longer share a folder and
+    don't need the `(roomId)` disambiguation suffix anymore. The Download
+    Report CSV gained its own new "Created Date" column (it never had
+    one) so a CSV-upload resume still knows which year a re-queued room
+    belongs in. A room with no usable created date - only possible from
+    an older-format CSV that predates this column - falls into an
+    `Unknown Year` folder rather than being silently misfiled or dropped.
+    Full reasoning in `DESIGN.md`'s Decision 25.
 
 ---
 
