@@ -480,6 +480,24 @@ async function ensureWorkerTabs(count) {
   return STATE.workerTabIds;
 }
 
+// Keyed by the exact data: URL used for a CSV export (each one is unique -
+// the content differs every time) so the onDeterminingFilename listener
+// below can recognize "this is one of our own report exports" and
+// suggest() the real intended filename directly, rather than trusting
+// chrome.downloads.download()'s own `filename` option alone. Confirmed
+// live: for a data: URL, Chrome does not reliably honor that option -
+// every CSV this extension exports landed as a generic "download.csv" /
+// "download (1).csv" instead of the descriptive, labeled name each of
+// createReport()/createEventLogReport()/handleExportScanList() actually
+// requests. onDeterminingFilename's own suggest() call is the same
+// mechanism already proven reliable for every room ZIP, so reusing it
+// here closes the gap with a proven approach rather than guessing at a
+// second fix for the same class of problem. Cleaned up by the listener
+// itself once consumed - at most 3 entries ever pending at once (one
+// run's Scan List, Download Report, and Activity Log), so there's no
+// meaningful growth risk even without a cap.
+const pendingReportFilenames = new Map();
+
 async function createReport() {
   STATE.finishedAt = new Date().toISOString();
 
@@ -532,6 +550,7 @@ async function createReport() {
   const dataUrl = "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
   const filename = `Docusign Rooms/_Download Reports/${labeledFilename("Docusign Rooms Download Report", STATE.runDateRangeLabel)}.csv`;
 
+  pendingReportFilenames.set(dataUrl, filename);
   await chrome.downloads.download({
     url: dataUrl,
     filename,
@@ -566,6 +585,7 @@ async function createEventLogReport() {
   const dataUrl = "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
   const filename = `Docusign Rooms/_Activity Logs/${labeledFilename("Activity Log", STATE.runDateRangeLabel)}.csv`;
 
+  pendingReportFilenames.set(dataUrl, filename);
   await chrome.downloads.download({
     url: dataUrl,
     filename,
@@ -1016,6 +1036,7 @@ async function handleExportScanList(rooms, dateRangeLabel) {
     const label = typeof dateRangeLabel === "string" ? dateRangeLabel : null;
     const filename = `Docusign Rooms/_Scan Lists/${labeledFilename("Scan List", label)}.csv`;
 
+    pendingReportFilenames.set(dataUrl, filename);
     await chrome.downloads.download({
       url: dataUrl,
       filename,
@@ -1417,6 +1438,19 @@ function findCurrentRoomForDownload(downloadItem) {
 }
 
 chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
+  // Checked first, before any room-matching - this extension's own CSV
+  // report exports (Scan List, Download Report, Activity Log) are never
+  // room downloads, and this is the one place their actual intended
+  // filename is reliably known. See pendingReportFilenames' own comment
+  // for why chrome.downloads.download()'s `filename` option alone isn't
+  // enough for these.
+  const pendingFilename = pendingReportFilenames.get(downloadItem.url);
+  if (pendingFilename) {
+    pendingReportFilenames.delete(downloadItem.url);
+    suggest({ filename: pendingFilename, conflictAction: "uniquify" });
+    return;
+  }
+
   const currentRoom = findCurrentRoomForDownload(downloadItem);
 
   if (!currentRoom) {
@@ -1437,9 +1471,13 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
     // onDeterminingFilename fires for every download in the entire
     // browser, not just this extension's - most "unmatched" downloads
     // are something totally unrelated (a PDF from Gmail in some other
-    // tab, this extension's own CSV report exports via data: URLs) and
-    // must be left completely alone, exactly as before this check
-    // existed. Redirecting an unrelated download into this extension's
+    // tab) and must be left completely alone, exactly as before this
+    // check existed. This extension's own CSV report exports used to
+    // reach this same "unmatched" path too (a data: URL never matches
+    // the /rooms|transaction/ pattern below) - they no longer do, caught
+    // instead by the pendingReportFilenames check at the very top of
+    // this listener, before room-matching even runs. Redirecting an
+    // unrelated download into this extension's
     // folder just because a room lookup failed would be a much worse bug
     // than the one being fixed here. Only a download whose URL actually
     // matches the same /rooms/<id>/ or /transaction/<id>/ pattern

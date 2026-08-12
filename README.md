@@ -301,6 +301,7 @@ summary of it, not a second copy that can drift.
 | 5l. "Unassigned" catch-all | Give both "can't determine a year" and "can't identify the room at all" a real landing spot instead of a silent fallback or an escape from the folder structure entirely | Done | Renamed the existing year-fallback bucket from "Unknown Year" to "Unassigned" - no logic change, just a shared name for both failure modes. The real risk was the second case: `onDeterminingFilename` fires for *every* download in the browser, not just this extension's, so routing every "unmatched" download into `Docusign Rooms/Unassigned/` would have redirected a user's unrelated download (e.g. a Gmail attachment) into this extension's folder - a worse bug than the one being fixed. Scoped narrowly: only a download whose URL actually matches the same `/rooms/<id>/`/`/transaction/<id>/` pattern `findCurrentRoomForDownload()` already checks is treated as "ours, but unidentifiable"; that existing function itself (already corrected twice - Decision 2) was left untouched rather than refactored, to avoid risking a third regression in code with that history. See `DESIGN.md` Decision 27. |
 | 5m. "Waiting" included in verify-before-retry | Widen Decision 26's check to cover Waiting rooms too, after a direct correction that "Waiting means no way it got downloaded" | Done | Disproved directly against the real account: of 977 non-Downloaded rooms already sitting at their correct file location, 839 were at Waiting and only 138 at Success/Attempted - "Waiting" only means *this run's* queue never reached the room, not that no earlier run ever downloaded it. `DS_START_QUEUE`'s filter widened accordingly; `Failed` stays excluded, same reasoning as Decision 26. Verified end-to-end against the real handler, not assumed. A one-time real-data pass followed: cross-checked the account's actual Download Report against real files using the extension's own `computeFolderNames()`, found and fixed 5 genuinely misplaced files (the original Decision 23 casualties, still parked in `Unassigned/`), correctly left 2 harmless duplicates alone, and generated a corrected Download Report CSV - catching a real column-ordering bug in that script before it shipped (a new "Created Date" column was being inserted before the status corrections were written, silently shifting where they landed). See `DESIGN.md` Decision 28. |
 | 5n. "Failed" excluded from "still needs attention" | Fix the Done message counting real failures as if they were ambiguous/unconfirmed | Done | Found via real use immediately after 5m shipped: "the csv said 185 rooms needed attention but they all were just failed rooms." The message counted anything not Downloaded/Complete (Empty), including Failed - misleading, since a Failed room's outcome is already fully known, not ambiguous the way Success/Attempted or Waiting is. Now only those two count toward "still needs attention"; Failed is surfaced in its own clause instead. Verified against the exact reported scenario plus several other combinations before considering it fixed. See `DESIGN.md` Decision 29. |
+| 5o. Exported CSVs get their real filename | Fix every exported report landing on disk as generic "download.csv"/"download (1).csv" instead of its labeled name | Done | `chrome.downloads.download()`'s `filename` option wasn't being reliably honored for `data:` URLs - confirmed directly against the account's own files. Fixed by suggesting the real filename explicitly via `onDeterminingFilename` (the same mechanism already proven for room ZIPs), checked before any room-matching logic runs. Verified end-to-end by driving the real export message path and confirming `suggest()` received the correct labeled name, not a fallback. See `DESIGN.md` Decision 30. |
 | 6. Adaptive concurrency suggestion | Suggest (not auto-apply) a worker-tab count from measured per-room timing | Not started | The bounds half of this landed early, in phase 5d - what's left is the *measured, suggested* half. Depends on real timing data, which now exists to build against. |
 
 Every issue above is one line here and a full paragraph in either
@@ -872,6 +873,18 @@ practical at 10,000+ rooms instead of a few dozen.
     else outstanding - now correctly reads "Done ... except 185 rooms
     that failed") plus several other combinations. Full reasoning in
     `DESIGN.md`'s Decision 29.
+  - **Fixed exported CSVs landing as generic "download.csv" instead of
+    their real, labeled name** - raised directly: "they need clearer
+    titles for people to understand what they are." Chrome wasn't
+    reliably honoring `chrome.downloads.download()`'s `filename` option
+    for a `data:` URL, confirmed against the account's own report files.
+    Fixed by suggesting the real filename explicitly via
+    `onDeterminingFilename`, the same mechanism already proven reliable
+    for every room ZIP - checked before any room-matching logic runs,
+    since a report export is never a room download. Verified end-to-end
+    by driving the real export path and confirming the suggested
+    filename was correct, not a fallback. Full reasoning in `DESIGN.md`'s
+    Decision 30.
 
 ---
 
