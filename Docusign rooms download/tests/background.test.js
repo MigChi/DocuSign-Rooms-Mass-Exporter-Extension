@@ -501,6 +501,99 @@ test("chrome.tabs.onUpdated ignores updates for a different tab, or a status tha
   assert.equal(STATE.scanTabId, 7);
 });
 
+test("withTimeout resolves with the real value when the promise settles well within the deadline", async () => {
+  const { withTimeout } = freshBackground();
+
+  const result = await withTimeout(Promise.resolve("real result"), 1000, "timed out");
+  assert.equal(result, "real result");
+});
+
+test("withTimeout resolves with the timeout value instead of hanging forever when the promise never settles (regression: processRoom()'s chrome.tabs.sendMessage() call had no bound at all - see DESIGN.md)", async () => {
+  const { withTimeout } = freshBackground();
+
+  const neverSettles = new Promise(() => {});
+  const result = await withTimeout(neverSettles, 30, "timed out");
+  assert.equal(result, "timed out");
+});
+
+test("withTimeout doesn't fire early for a promise that settles just before its own deadline", async () => {
+  const { withTimeout } = freshBackground();
+
+  const slowButFine = new Promise(resolve => setTimeout(() => resolve("finished in time"), 20));
+  const result = await withTimeout(slowButFine, 500, "timed out");
+  assert.equal(result, "finished in time");
+});
+
+// runWorker()'s loop uses real setTimeout-based sleep() calls between
+// claims, so - unlike the message-dispatch tests above, which only need
+// microtasks to settle - these two tests need to wait on real elapsed time.
+// Polls instead of a fixed sleep so the test fails fast and loud (a thrown
+// timeout) if something regresses, rather than racing a guessed duration.
+async function waitUntil(conditionFn, timeoutMs = 5000) {
+  const start = Date.now();
+  while (!conditionFn()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitUntil: condition never became true");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
+
+test("an uncaught error inside runQueue() resets STATE.running and broadcasts DS_RUN_FAILED, instead of leaving the run stuck true forever (regression: runQueue() had no top-level try/catch, and both its call sites - DS_START_QUEUE and the startup-resume IIFE - invoke it fire-and-forget, so nothing else could ever catch an unexpected throw anywhere in ensureWorkerTabs()/runWorker()/processRoom() - see DESIGN.md)", async () => {
+  const { STATE } = freshBackground();
+  global.chrome.tabs.create = async () => { throw new Error("tab creation boom"); };
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_START_QUEUE",
+      rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }],
+      priorResults: [],
+      workerTabCount: 1
+    },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => STATE.running === false);
+
+  assert.equal(STATE.running, false);
+
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_RUN_FAILED");
+  assert.ok(failed, "expected a DS_RUN_FAILED broadcast");
+  assert.match(failed.reason, /tab creation boom/);
+
+  const failedEvent = STATE.workerEvents.find(e => e.type === "run_queue_failed");
+  assert.ok(failedEvent, "expected a run_queue_failed worker event");
+  assert.match(failedEvent.error, /tab creation boom/);
+
+  // The persisted job must survive a crash like this - it's what lets a
+  // later resume (automatic, on the next service-worker restart, or
+  // manual, via re-uploading the report this path still tries to write)
+  // pick the run back up instead of losing it outright.
+  assert.equal(global.chrome.storage.local.removeCalls.length, 0, "a crashed run's persisted job should not be cleared");
+});
+
+test("a normal run (no error) still completes without broadcasting DS_RUN_FAILED", async () => {
+  const { STATE } = freshBackground();
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_START_QUEUE",
+      rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }],
+      priorResults: [],
+      workerTabCount: 1
+    },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => STATE.running === false && STATE.finishedAt !== null);
+
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_RUN_FAILED");
+  assert.equal(failed, undefined, "a normal completion should never broadcast DS_RUN_FAILED");
+
+  const failedEvent = STATE.workerEvents.find(e => e.type === "run_queue_failed");
+  assert.equal(failedEvent, undefined);
+});
+
 test("clampWorkerTabCount passes through an in-range integer unchanged", () => {
   const { clampWorkerTabCount } = freshBackground();
 

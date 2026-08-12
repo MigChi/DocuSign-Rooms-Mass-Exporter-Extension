@@ -278,8 +278,26 @@
       if (!message || !message.type) return;
 
       if (message.type === "DS_PROCESS_ROOM") {
-        const result = await processCurrentRoom(message);
-        sendResponse(result);
+        // Same class of gap as DS_BEGIN_SCAN above, and higher-stakes here:
+        // an uncaught throw inside processCurrentRoom() would skip
+        // sendResponse() entirely, and background.js's own
+        // chrome.tabs.sendMessage() call has no way to tell "never going to
+        // respond" apart from "still legitimately working" except a
+        // timeout (see withTimeout() there) - without this try/catch, one
+        // room hitting an unexpected DOM issue would silently stall that
+        // room for a full 90s instead of failing immediately with a real
+        // reason, and do so on every single room where it happens across a
+        // whole run.
+        try {
+          const result = await processCurrentRoom(message);
+          sendResponse(result);
+        } catch (error) {
+          sendResponse({
+            ok: false,
+            roomId: message.roomId,
+            reason: `Unexpected error while processing this room: ${error?.message || error}`
+          });
+        }
       }
     })();
 

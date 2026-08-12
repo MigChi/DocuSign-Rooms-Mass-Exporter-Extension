@@ -493,6 +493,21 @@ chrome.runtime.onMessage.addListener(message => {
     return;
   }
 
+  if (message.type === "DS_RUN_FAILED") {
+    // Sent by background.js's runQueue() catch block when the run stops on
+    // an uncaught error instead of finishing normally - always arrives
+    // right after a DS_BULK_STATUS broadcast reporting running: false, so
+    // without this, the status line above would already say something
+    // that reads exactly like a normal completion ("Done, but N rooms
+    // still need attention..."), silently hiding that this was actually an
+    // unexpected crash. This message is deliberately the last word on the
+    // status line for that reason - setStatus() here overrides whatever
+    // the DS_BULK_STATUS handler just set.
+    updateButtonStates({ running: isRunning, paused: isPaused });
+    setStatus(message.reason || "The run stopped unexpectedly.");
+    return;
+  }
+
   if (message.type === "DS_SCAN_RESULT") {
     scanInProgress = false;
     updateButtonStates({ running: isRunning, paused: isPaused });

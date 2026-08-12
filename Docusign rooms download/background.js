@@ -435,6 +435,33 @@ async function waitForTabLoaded(tabId, timeoutMs = 60000) {
   return false;
 }
 
+// Races `promise` against a timeout, resolving with `timeoutValue` if
+// `promise` hasn't settled by then. Every other wait in this pipeline
+// (waitForTabLoaded, waitForDownloadStart, waitForInFlightDownloadsToSettle
+// above/below) is already bounded this way - processRoom()'s
+// chrome.tabs.sendMessage() call to the worker tab was the one real
+// exception, and not by design. Confirmed by reasoning through Chrome's own
+// extension-messaging semantics: unlike a rejected promise, a response that
+// simply never arrives is not something try/catch can do anything about -
+// chrome.tabs.sendMessage()'s returned promise stays pending forever unless
+// sendResponse() is actually called on the content-script side or the
+// tab's port disconnects (it closes or navigates). content.js's own
+// DS_PROCESS_ROOM handler is now wrapped in try/catch too (so a thrown
+// error reports itself immediately, the common case), but this timeout is
+// the only thing that can bound a genuine hang - a page that stops
+// responding without throwing, a future page-structure change this
+// couldn't anticipate, or any other way sendResponse() might just never
+// fire. Without it, that single stuck room would keep its worker's loop
+// from ever finishing, which keeps runQueue()'s Promise.all() from ever
+// resolving - the entire run hangs forever, not just one room, even with
+// every other worker tab long done.
+function withTimeout(promise, timeoutMs, timeoutValue) {
+  return Promise.race([
+    promise,
+    new Promise(resolve => setTimeout(() => resolve(timeoutValue), timeoutMs))
+  ]);
+}
+
 // Verifies any previously-known worker tabs are still alive (survives a
 // resume, where the old tab IDs from before a crash are almost
 // certainly gone) and creates however many more are needed to reach
@@ -788,11 +815,22 @@ async function processRoom(tabId, room) {
       // onMessage listener actually being attached.
       await sleep(500);
 
-      const response = await chrome.tabs.sendMessage(tabId, {
-        type: "DS_PROCESS_ROOM",
-        roomId,
-        documentsUrl
-      }).catch(err => ({ ok: false, reason: err.message || "Could not message room tab" }));
+      // Bounded to 90s - comfortably above processCurrentRoom()'s own
+      // worst-case legitimate duration (up to 45s waiting for the
+      // documents list, plus up to ~22s more across selecting/clicking
+      // Download, see content.js) - so a genuinely slow page is never
+      // mistaken for a stuck one, while a truly stuck one can't hang the
+      // rest of the run. See withTimeout()'s own comment for why this,
+      // specifically, was the one unbounded wait in this whole pipeline.
+      const response = await withTimeout(
+        chrome.tabs.sendMessage(tabId, {
+          type: "DS_PROCESS_ROOM",
+          roomId,
+          documentsUrl
+        }).catch(err => ({ ok: false, reason: err.message || "Could not message room tab" })),
+        90000,
+        { ok: false, reason: "Room processing timed out - no response from the room tab after 90s" }
+      );
 
       const finalRoomName = cleanName(response?.roomName || guessedRoomName);
 
@@ -926,72 +964,124 @@ async function runWorker(tabId) {
   delete STATE.currentRooms[currentTabId];
 }
 
+// Always called fire-and-forget - a real run can take hours, so neither of
+// its two call sites (DS_START_QUEUE below, and the startup-resume IIFE at
+// the bottom of this file) ever awaits or .catch()'s it. That means this
+// function's own top-level try/catch is the ONLY safety net standing
+// between an uncaught throw anywhere in the pipeline below (most plausibly
+// ensureWorkerTabs()'s chrome.tabs.create() call, the one spot in that
+// chain not already defensively wrapped) and STATE.running staying stuck
+// `true` forever - confirmed by tracing the exact same failure shape
+// DS_START_QUEUE/DS_RUN_SCAN's own setup-phase try/catches already guard
+// against (see their comments), just never closed at this level: nothing
+// past the throw point would run, including every line that resets
+// STATE.running, clears the persisted job, or writes a report - the panel
+// would be left showing "running" forever with no error, no report, and no
+// way out short of a service-worker restart happening to occur on its own.
 async function runQueue() {
-  STATE.running = true;
-  STATE.stopped = false;
-  STATE.finishedAt = null;
-  // Not unconditional - a resumed run already has a real startedAt
-  // restored from storage, and overwriting it here would report the
-  // wrong total elapsed time and, more importantly, imply the job had
-  // no downtime when it may have sat interrupted for a while.
-  STATE.startedAt = STATE.startedAt || new Date().toISOString();
-  STATE.currentRooms = {};
-
-  await broadcastStatus();
-
-  // Never more tabs than there's work for - a 1-2 room run (or the tail
-  // end of a larger one) doesn't need STATE.workerTabCount tabs sitting
-  // open with nothing to claim.
-  const tabCount = Math.min(STATE.workerTabCount, STATE.pending.length) || 1;
-  const tabIds = await ensureWorkerTabs(tabCount);
-
-  await Promise.all(tabIds.map(id => runWorker(id)));
-
-  STATE.running = false;
-  STATE.currentRooms = {};
-
-  // Covers both ways the workers can all stop - running out of pending
-  // rooms and an explicit Stop both end here (Promise.all only resolves
-  // once every worker's loop has exited), so one call handles both:
-  // nothing left to resume either way.
-  await clearPersistedJob();
-
-  // See waitForInFlightDownloadsToSettle()'s own comment - closes the gap
-  // between "every worker ran out of rooms to claim" and "every download
-  // that was ever started has actually finished," so the reports below
-  // reflect reality as closely as reasonably possible instead of a
-  // snapshot taken slightly too early.
-  await waitForInFlightDownloadsToSettle();
-
-  // Catches what the wait above structurally can't - a "Success/
-  // Attempted" result whose download genuinely finished but whose
-  // completion was never recorded at all (not just not-yet-settled). See
-  // verifySuccessAttemptedResults()'s own comment.
-  await verifySuccessAttemptedResults();
-
-  // Logged, not silently swallowed - a bare `.catch(() => "")` here would
-  // mean a genuinely failed report (the same safeEncodeURIComponent()
-  // scenario that made CSV export hang, or the storage-quota risk noted
-  // in Decision 15) leaves no trace anywhere that the run's report never
-  // got written at all. Still .catch()'d rather than awaited plainly -
-  // one failed report must not prevent the run from being marked done or
-  // block the other report from still being attempted.
-  await createReport().catch(err => {
-    console.error("[DSBD] createReport failed:", err);
-    logWorkerEvent("report_failed", { stage: "download_report", error: err?.message || String(err) });
-  });
-  await createEventLogReport().catch(err => {
-    console.error("[DSBD] createEventLogReport failed:", err);
-    logWorkerEvent("report_failed", { stage: "activity_log", error: err?.message || String(err) });
-  });
-  await broadcastStatus();
-
   try {
-    if (STATE.workerTabIds[0]) {
-      // Keep one tab focused so the user can see where it ended.
-      await chrome.tabs.update(STATE.workerTabIds[0], { active: true }).catch(() => {});
-    }
-  } catch (e) {}
+    STATE.running = true;
+    STATE.stopped = false;
+    STATE.finishedAt = null;
+    // Not unconditional - a resumed run already has a real startedAt
+    // restored from storage, and overwriting it here would report the
+    // wrong total elapsed time and, more importantly, imply the job had
+    // no downtime when it may have sat interrupted for a while.
+    STATE.startedAt = STATE.startedAt || new Date().toISOString();
+    STATE.currentRooms = {};
+
+    await broadcastStatus();
+
+    // Never more tabs than there's work for - a 1-2 room run (or the tail
+    // end of a larger one) doesn't need STATE.workerTabCount tabs sitting
+    // open with nothing to claim.
+    const tabCount = Math.min(STATE.workerTabCount, STATE.pending.length) || 1;
+    const tabIds = await ensureWorkerTabs(tabCount);
+
+    await Promise.all(tabIds.map(id => runWorker(id)));
+
+    STATE.running = false;
+    STATE.currentRooms = {};
+
+    // Covers both ways the workers can all stop - running out of pending
+    // rooms and an explicit Stop both end here (Promise.all only resolves
+    // once every worker's loop has exited), so one call handles both:
+    // nothing left to resume either way.
+    await clearPersistedJob();
+
+    // See waitForInFlightDownloadsToSettle()'s own comment - closes the gap
+    // between "every worker ran out of rooms to claim" and "every download
+    // that was ever started has actually finished," so the reports below
+    // reflect reality as closely as reasonably possible instead of a
+    // snapshot taken slightly too early.
+    await waitForInFlightDownloadsToSettle();
+
+    // Catches what the wait above structurally can't - a "Success/
+    // Attempted" result whose download genuinely finished but whose
+    // completion was never recorded at all (not just not-yet-settled). See
+    // verifySuccessAttemptedResults()'s own comment.
+    await verifySuccessAttemptedResults();
+
+    // Logged, not silently swallowed - a bare `.catch(() => "")` here would
+    // mean a genuinely failed report (the same safeEncodeURIComponent()
+    // scenario that made CSV export hang, or the storage-quota risk noted
+    // in Decision 15) leaves no trace anywhere that the run's report never
+    // got written at all. Still .catch()'d rather than awaited plainly -
+    // one failed report must not prevent the run from being marked done or
+    // block the other report from still being attempted.
+    await createReport().catch(err => {
+      console.error("[DSBD] createReport failed:", err);
+      logWorkerEvent("report_failed", { stage: "download_report", error: err?.message || String(err) });
+    });
+    await createEventLogReport().catch(err => {
+      console.error("[DSBD] createEventLogReport failed:", err);
+      logWorkerEvent("report_failed", { stage: "activity_log", error: err?.message || String(err) });
+    });
+    await broadcastStatus();
+
+    try {
+      if (STATE.workerTabIds[0]) {
+        // Keep one tab focused so the user can see where it ended.
+        await chrome.tabs.update(STATE.workerTabIds[0], { active: true }).catch(() => {});
+      }
+    } catch (e) {}
+  } catch (error) {
+    STATE.running = false;
+    STATE.currentRooms = {};
+    logWorkerEvent("run_queue_failed", { error: error?.message || String(error) });
+    console.error("[DSBD] runQueue failed unexpectedly:", error);
+
+    // Deliberately does NOT clear the persisted job here - whatever
+    // persistJob() already checkpointed (up through the last completed
+    // room) stays in chrome.storage.local, so the run can still be picked
+    // back up: automatically, if the service worker happens to restart
+    // (the startup-resume IIFE below will find it), or manually via
+    // re-uploading the report this still attempts to write, same as a
+    // normal completion. Both report calls are .catch()'d the same way the
+    // normal-completion path above already handles a failed report - a
+    // second failure in this recovery path must not make things worse.
+    await createReport().catch(err => {
+      console.error("[DSBD] createReport failed after a run crash:", err);
+      logWorkerEvent("report_failed", { stage: "download_report", error: err?.message || String(err) });
+    });
+    await createEventLogReport().catch(err => {
+      console.error("[DSBD] createEventLogReport failed after a run crash:", err);
+      logWorkerEvent("report_failed", { stage: "activity_log", error: err?.message || String(err) });
+    });
+
+    await broadcastStatus();
+    // A distinct broadcast, not just the DS_BULK_STATUS above - running:
+    // false plus a finishedAt from the report just written would otherwise
+    // read to the panel exactly like a normal completion (see its "Done,
+    // but N rooms still need attention" logic), silently hiding that this
+    // was actually an unexpected crash rather than the run genuinely
+    // finishing. Sent after broadcastStatus() specifically so it has the
+    // last word on the panel's status line.
+    chrome.runtime.sendMessage({
+      type: "DS_RUN_FAILED",
+      reason: `The run stopped unexpectedly: ${error?.message || String(error)}. A partial report was saved - re-upload it via "Upload CSV to Run/Resume" to finish the rest.`
+    }).catch(() => {});
+  }
 }
 
 // Builds and downloads the Scan List CSV. A plain function, not a message
@@ -1798,6 +1888,7 @@ if (typeof module !== "undefined" && module.exports) {
     labeledFilename,
     safeEncodeURIComponent,
     waitForInFlightDownloadsToSettle,
-    matchVerifiedDownloads
+    matchVerifiedDownloads,
+    withTimeout
   };
 }

@@ -26,6 +26,20 @@ function makeChromeStub() {
     sentMessages: []
   };
 
+  const storageLocal = {
+    // Empty by default so background.js's startup resume IIFE finds no
+    // persisted job and returns immediately - most tests don't care about
+    // resume behavior and shouldn't have to stub around it.
+    get: async () => ({}),
+    set: async () => {},
+    // Calls recorded in `removeCalls` (not just a no-op) so a test can
+    // assert a persisted job was deliberately left alone - e.g. runQueue()'s
+    // crash path, which must NOT clear it so a later resume can still pick
+    // the job back up.
+    removeCalls: [],
+    remove: async (...args) => { storageLocal.removeCalls.push(args); }
+  };
+
   return {
     runtime,
     downloads: {
@@ -35,14 +49,7 @@ function makeChromeStub() {
       search: async () => []
     },
     storage: {
-      local: {
-        // Empty by default so background.js's startup resume IIFE finds
-        // no persisted job and returns immediately - most tests don't
-        // care about resume behavior and shouldn't have to stub around it.
-        get: async () => ({}),
-        set: async () => {},
-        remove: async () => {}
-      }
+      local: storageLocal
     },
     tabs: {
       query: async () => [],
