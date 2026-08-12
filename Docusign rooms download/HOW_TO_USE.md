@@ -2,6 +2,10 @@
 
 This guide is written for anyone using this tool, not just developers. No technical background is needed to follow it. If you get stuck, the [Troubleshooting](#troubleshooting) section at the bottom covers the most common issues.
 
+**A formatted, easier-to-read version of this same guide is also available here:**
+**https://claude.ai/code/artifact/42dafe6c-16d4-4a6d-8ef2-a5996fb486ca**
+Share that link directly with other market centers — it needs no GitHub account to view.
+
 For the engineering write-up behind this tool, see [`Claude Code/DESIGN.md`](Claude%20Code/DESIGN.md) and the main [`README.md`](../README.md) instead — this guide is purely about how to install and run it.
 
 ---

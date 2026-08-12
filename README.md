@@ -24,7 +24,9 @@ is a nice-to-have refinement, not a gap in core functionality.
 with [`Docusign rooms download/HOW_TO_USE.md`](Docusign%20rooms%20download/HOW_TO_USE.md)
 instead of this README — it's a plain-language install and usage guide
 with no engineering background assumed, written for other market
-centers to follow on their own.
+centers to follow on their own. A formatted, share-friendly version of
+that same guide (no GitHub account needed to view) is published at
+**https://claude.ai/code/artifact/42dafe6c-16d4-4a6d-8ef2-a5996fb486ca**.
 
 ## Features
 
