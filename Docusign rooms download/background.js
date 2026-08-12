@@ -1314,8 +1314,12 @@ chrome.action.onClicked.addListener(async () => {
 // Known limitation: this only fires once something wakes the worker -
 // there's no periodic self-wake (no chrome.alarms) here, so resume isn't
 // instant if the browser sits fully closed or no matching tab gets
-// opened. In practice the panel's own DS_GET_STATUS call on load (every
-// Docusign Rooms page) is what wakes it, the next time the user checks in.
+// opened. In practice, whichever happens first wakes it: a content
+// script's DS_ROOM_PAGE_INFO message (sent automatically ~2.5s after any
+// Docusign room page loads) or the user reopening the standalone panel
+// via the toolbar icon, which fires its own DS_GET_STATUS call on load -
+// unlike the old in-page panel, that no longer happens automatically on
+// every Docusign Rooms page, only when the user actually opens it.
 (async () => {
   const stored = await chrome.storage.local.get(PERSIST_KEY);
   const job = stored[PERSIST_KEY];

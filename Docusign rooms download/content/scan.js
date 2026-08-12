@@ -137,13 +137,15 @@ async function waitIfScanPausedOrStopped(scanControl, updateStatus) {
 }
 
 /**
- * Entry point for scanning - called from content.js's injectPanel() when
- * Scan/Start is clicked, passing the date range read from the panel's own
- * date inputs (`{ start: Date, end: Date }`) - this used to be a pair of
- * hardcoded module constants; now the caller controls batch size directly
- * instead of needing a code edit per run.
+ * Entry point for scanning - called from content.js's DS_BEGIN_SCAN
+ * listener when the standalone panel window (panel.js) requests a scan,
+ * passing the date range it read from its own date inputs
+ * (`{ start: Date, end: Date }`, relayed through background.js since the
+ * panel has no DOM access of its own - see DESIGN.md Decision 24) - this
+ * used to be a pair of hardcoded module constants; now the caller
+ * controls batch size directly instead of needing a code edit per run.
  *
- * `scanControl` (optional, `{ stopped, paused }`) lets content.js's
+ * `scanControl` (optional, `{ stopped, paused }`) lets the panel's
  * Start/Stop and Pause/Resume buttons interrupt a long scan - confirmed
  * live as a real gap at real scale: an 8000-room scan has no way to stop
  * or pause it once started, only Ctrl+scroll-and-wait. Checked once per
