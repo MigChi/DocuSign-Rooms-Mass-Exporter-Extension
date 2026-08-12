@@ -369,16 +369,42 @@ chrome.runtime.onMessage.addListener(message => {
       setStatus(runningStatusText(s));
     } else if (s.finishedAt) {
       // A flat "Done" was misleading when the run actually ended with
-      // rooms still in a non-final state (Success/Attempted or Failed) -
-      // background.js's verifySuccessAttemptedResults() already catches
-      // whatever it can confirm before this report was written, but
-      // whatever's genuinely still outstanding needs a real answer here,
-      // not silence dressed up as completion.
-      const outstanding = (s.results || []).filter(
-        r => r.status !== "Downloaded" && r.status !== "Complete (Empty)"
-      ).length;
-      if (outstanding > 0) {
-        setStatus(`Done, but ${outstanding} room${outstanding === 1 ? "" : "s"} still need${outstanding === 1 ? "s" : ""} attention (not confirmed downloaded) - re-upload the download report to finish them. Saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.`);
+      // rooms still genuinely ambiguous (Success/Attempted, or Waiting -
+      // never claimed at all) - background.js's
+      // verifySuccessAttemptedResults() already catches whatever it can
+      // confirm before this report was written, but whatever's genuinely
+      // still unconfirmed needs a real answer here, not silence dressed
+      // up as completion.
+      //
+      // "Failed" is deliberately NOT counted toward that - corrected
+      // directly after real use showed a run reporting "185 rooms still
+      // need attention" when every one of them was actually Failed, not
+      // ambiguous. A Failed room's outcome is already fully known (the
+      // DOM automation ran and failed) - unlike Success/Attempted or
+      // Waiting, re-uploading the report to "resolve" it doesn't clear up
+      // any uncertainty, it just retries a room that's already been
+      // conclusively answered. Still surfaced, just not folded into the
+      // same "not done yet" framing as the genuinely unconfirmed ones.
+      const results = s.results || [];
+      // "Waiting" is never an actual status stored in a result - a room
+      // with no result at all is what "Waiting" means (see
+      // renderBreakdown() above for the same computation) - so it has to
+      // be derived from total minus however many rooms got a real result,
+      // not filtered out of `results` directly.
+      const waiting = Math.max(0, (s.total || 0) - results.length);
+      const successAttempted = results.filter(r => r.status === "Success/Attempted").length;
+      const unconfirmed = waiting + successAttempted;
+      const failedCount = results.filter(r => r.status === "Failed").length;
+      // A separate clause, not folded into "of those" - failedCount is not
+      // a subset of `unconfirmed`, it's deliberately excluded from it, so
+      // wording that implied otherwise would misrepresent exactly the
+      // distinction this fix exists to draw.
+      const failedNote = failedCount > 0 ? `, plus ${failedCount} room${failedCount === 1 ? "" : "s"} that already failed and won't change` : "";
+
+      if (unconfirmed > 0) {
+        setStatus(`Done, but ${unconfirmed} room${unconfirmed === 1 ? "" : "s"} still need${unconfirmed === 1 ? "s" : ""} attention (not confirmed downloaded)${failedNote} - re-upload the download report to finish them. Saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.`);
+      } else if (failedCount > 0) {
+        setStatus(`Done - every room downloaded or confirmed empty, except ${failedCount} room${failedCount === 1 ? "" : "s"} that failed. Report and activity log saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.`);
       } else {
         setStatus("Done - every room downloaded or confirmed empty. Report and activity log saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.");
       }
