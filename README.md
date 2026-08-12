@@ -20,6 +20,12 @@ recovery. The one item left on the [Roadmap](#roadmap) below —
 suggesting a worker-tab count instead of only accepting a manual one —
 is a nice-to-have refinement, not a gap in core functionality.
 
+**New to this tool, or setting it up for someone non-technical?** Start
+with [`Docusign rooms download/HOW_TO_USE.md`](Docusign%20rooms%20download/HOW_TO_USE.md)
+instead of this README — it's a plain-language install and usage guide
+with no engineering background assumed, written for other market
+centers to follow on their own.
+
 ## Features
 
 - **Auto-scan the Rooms list** — auto-switches to List View and
@@ -200,6 +206,7 @@ npm test
 | `content/room.js` | Room-page helpers (currently just reading the room name from its Details page) |
 | `content.js` | DOM automation only — the single-room download pipeline (Select All → Bulk Download → confirm → wait) and the scan relay (`DS_BEGIN_SCAN`/`DS_SCAN_STOP`/`DS_SCAN_PAUSE`/`DS_SCAN_RESUME`) that lets the standalone panel trigger and control a scan it has no DOM access to run itself |
 | `panel.html` / `panel.js` | The standalone control panel window (opened via the toolbar icon), replacing the old in-page panel that used to live inside `content.js` — see `DESIGN.md` Decision 24 |
+| `HOW_TO_USE.md` | Plain-language install/setup/usage guide for non-technical end users — separate from this README, which assumes an engineering audience |
 | `package.json` | Just a `test` script (`node --test`) — no dependencies, not part of the loaded extension, exists purely so `npm test` works |
 | `tests/utils.test.js` | Tests for `content/utils.js`'s pure helpers |
 | `tests/background.test.js` | Tests for `background.js`'s pure/`STATE`-driven logic, including regression tests for several real bugs found via live testing at scale (see `DESIGN.md`) |
