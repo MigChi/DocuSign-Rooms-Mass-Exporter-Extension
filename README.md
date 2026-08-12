@@ -156,7 +156,6 @@ npm test
 | `content/room.js` | Room-page helpers (currently just reading the room name from its Details page) |
 | `content.js` | DOM automation only — the single-room download pipeline (Select All → Bulk Download → confirm → wait) and the scan relay (`DS_BEGIN_SCAN`/`DS_SCAN_STOP`/`DS_SCAN_PAUSE`/`DS_SCAN_RESUME`) that lets the standalone panel trigger and control a scan it has no DOM access to run itself |
 | `panel.html` / `panel.js` | The standalone control panel window (opened via the toolbar icon), replacing the old in-page panel that used to live inside `content.js` — see `DESIGN.md` Decision 24 |
-| `popup.html` / `popup.js` | Leftover from the original 1.0.2 toolbar popup — unused since it was replaced by the in-page panel and later `panel.html`; not referenced by `manifest.json`, kept for reference only |
 | `package.json` | Just a `test` script (`node --test`) — no dependencies, not part of the loaded extension, exists purely so `npm test` works |
 | `tests/utils.test.js` | Tests for `content/utils.js`'s pure helpers |
 | `tests/background.test.js` | Tests for `background.js`'s pure/`STATE`-driven logic, including regression tests for two of this session's real live-testing bugs |
