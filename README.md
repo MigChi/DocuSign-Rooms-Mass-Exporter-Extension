@@ -205,7 +205,6 @@ npm test
 | `tests/background.test.js` | Tests for `background.js`'s pure/`STATE`-driven logic, including regression tests for several real bugs found via live testing at scale (see `DESIGN.md`) |
 | `tests/helpers/` | Minimal `chrome.*` stub and a fresh-module-load helper, both test-only — see `DESIGN.md`'s Decision 13 |
 | `Claude Code/DESIGN.md` | The full architecture and decision-by-decision case study |
-| `Claude Code/CONVERSATION_LOG.txt` | Raw transcript of the planning conversation that produced `DESIGN.md` — kept verbatim as a supplementary record, not maintained going forward the way `DESIGN.md`/this README are |
 
 ## Architecture & Design
 
