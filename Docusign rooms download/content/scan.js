@@ -165,11 +165,17 @@ async function waitIfScanPausedOrStopped(scanControl, updateStatus) {
  * and a UI change could silently break the auto-select without breaking
  * the safety check. Otherwise repeatedly scrolls the container found by
  * getScrollContainer() and re-runs getRoomCardsAndLinks() until either:
- * no new rooms appear for several tries (noNewRoomAttempts), a hard
- * scroll cap is hit (totalScrolls), or several consecutive rooms are
- * found past dateRange.end (outOfRangeStreak) - valid as a stop signal
- * only because the list is confirmed ascending by this point. Returns
- * the final list, filtered to [dateRange.start, dateRange.end].
+ * no new rooms appear for several tries (noNewRoomAttempts), or several
+ * consecutive rooms are found past dateRange.end (outOfRangeStreak) -
+ * valid as a stop signal only because the list is confirmed ascending by
+ * this point. Deliberately has no scroll-count ceiling - a hard cap here
+ * (400, later 10,000) was confirmed live to cut real scans short well
+ * before the account's actual date range was exhausted, on an account
+ * whose true size just didn't fit under whatever fixed number was picked;
+ * outOfRangeStreak is the one signal that actually means "done," so it's
+ * the only thing that gets to end the loop under normal conditions - Stop
+ * is always available if a scan genuinely needs to be cut off by hand.
+ * Returns the final list, filtered to [dateRange.start, dateRange.end].
  */
 async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = null) {
     ensureListView();
@@ -194,7 +200,31 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
     let outOfRangeStreak = 0
     let stoppedEarly = false;
 
-    while (noNewRoomAttempts < 7 && totalScrolls < 400) {
+    // No longer a loop-terminating condition - confirmed live as a real
+    // bug, not a hypothetical: a hard `totalScrolls < 400` cap (added
+    // purely as a circuit breaker against a genuinely infinite loop, never
+    // meant to be a real ceiling) silently cut real scans short - two
+    // separate runs on a real account, requesting 2023-01-01 to 2024-12-31,
+    // both stopped at the exact same room (2913 found, room ID 8659058,
+    // created 2023-06-10) out of a much larger range still remaining. The
+    // reproducibility across two independent runs is what pinned this on
+    // `totalScrolls` specifically, not `noNewRoomAttempts` (a
+    // timing-dependent condition that wouldn't land on the identical room
+    // twice) - 2913 rooms / 400 scrolls is ~7.3 rooms loaded per scroll on
+    // this account. Raising the number (first tried: 400 -> 10,000) is
+    // still just picking a different arbitrary ceiling - there's no scroll
+    // count that's provably enough for every account, so any hard cap here
+    // remains a real risk of the exact same bug at a large enough account.
+    // The loop already has the actual correct signal for "really done":
+    // `outOfRangeStreak` below, which only stops once several consecutive
+    // rooms are confirmed *past* the requested date range - meaningful
+    // specifically because the list is sorted oldest-first (enforced
+    // before this loop even starts). `totalScrolls` is still tracked, just
+    // no longer able to cut a legitimate scan short - `noNewRoomAttempts`
+    // (the account has genuinely stopped producing new rows) is the only
+    // other way the loop can end without a real stop signal, and Stop is
+    // always available as a manual override if something truly runs away.
+    while (noNewRoomAttempts < 15) {
       if (!(await waitIfScanPausedOrStopped(scanControl, updateStatus))) {
         updateStatus?.("Scan stopped.");
         stoppedEarly = true;
@@ -204,7 +234,11 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
       const rooms = getRoomCardsAndLinks();
       const currentCount = rooms.length;
 
-      updateStatus?.(`Loading rooms... found ${currentCount}`);
+      // Includes the scroll count now that nothing bounds how long this
+      // loop can legitimately run for a large account - without it, a
+      // scan still working through scroll #4000 looks identical, from the
+      // status line alone, to one that's silently frozen.
+      updateStatus?.(`Loading rooms... found ${currentCount} (scroll ${totalScrolls})`);
 
       const newRooms = rooms.slice(lastCount);
       for (const room of newRooms) {
@@ -237,19 +271,17 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
       totalScrolls++;
     }
 
-    // The two loop-condition exits (as opposed to a `break` above) were
+    // The loop-condition exit (as opposed to a `break` above) was
     // previously silent - no updateStatus() call at all, unlike every other
     // way the loop can end. That made a scan that legitimately ran out of
     // new rooms to load indistinguishable, from the panel's perspective,
     // from one that just stopped updating for no visible reason - exactly
     // the kind of thing worth surfacing explicitly rather than leaving the
-    // user to guess whether something went wrong.
-    if (!stoppedEarly) {
-      if (noNewRoomAttempts >= 7) {
-        updateStatus?.(`Finished scrolling: no new rooms loaded after ${noNewRoomAttempts} attempts (${lastCount} found so far).`);
-      } else if (totalScrolls >= 400) {
-        updateStatus?.(`Stopping scroll: hit the ${totalScrolls}-scroll safety cap (${lastCount} found so far) - if this account has more rooms than that in range, narrow the date range and run in smaller batches.`);
-      }
+    // user to guess whether something went wrong. (The old second branch
+    // here, for hitting the scroll-count cap, is gone along with the cap
+    // itself - `totalScrolls` can no longer be why the loop ends.)
+    if (!stoppedEarly && noNewRoomAttempts >= 15) {
+      updateStatus?.(`Finished scrolling: no new rooms loaded after ${noNewRoomAttempts} attempts (${lastCount} found so far).`);
     }
 
     return getRoomCardsAndLinks().filter(room => {

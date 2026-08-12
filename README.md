@@ -314,6 +314,7 @@ summary of it, not a second copy that can drift.
 | 5q. Docs moved to repo root, plain-text guide added, "Failed" wording rewritten | Reflect a manual doc reorganization, add a Notepad/TextEdit-friendly guide, and fix a misleading "Failed" explanation | Done | `DESIGN.md` and `HOW_TO_USE.md` moved from inside `Docusign rooms download/` up to the repo root - every relative link between the three docs updated accordingly (and one, `../../../README.md#roadmap` in `DESIGN.md`, turned out to have already been broken before the move). Extension code untouched by the move, confirmed with `node --check` on every `.js` file plus a full 97/97 `npm test` pass, not assumed safe. Added `HOW_TO_USE.txt`, a plain-text rendering of the same guide with headers/links converted to plain prose, for readers opening it outside GitHub. Rewrote the "Failed" explanation in `HOW_TO_USE.md`, `HOW_TO_USE.txt`, and the published Artifact: it almost always just means no Bulk Download button existed for that room (per `content.js`'s own failure reasons), not a real problem, and failed rooms can generally be ignored rather than investigated. See `DESIGN.md` Decision 32. |
 | 5r. Two ways a scan could silently hang forever, fixed | Audit the full scan relay end-to-end for anything that could make a scan "just stop" with no explanation, after being asked to double-check it | Done | Two real gaps, same failure shape as Decision 26/28's `STATE.running`/`scanning` fixes: (1) `content.js`'s `DS_BEGIN_SCAN` handler had no try/catch around the actual scan call - an uncaught throw inside it skipped the `DS_SCAN_COMPLETE` send entirely, leaving `STATE.scanning` stuck `true` forever with the panel frozen on its last progress line; (2) only the scan tab being *closed* was handled (`chrome.tabs.onRemoved`) - a navigation or reload of that same tab destroys the content script's execution context just as fatally, but the tab never closes, so nothing caught it. Fixed with a try/catch/finally in `content.js` that reports a real error instead of pretending 0 rooms were found, and a new `chrome.tabs.onUpdated` listener that catches the reload/navigation case the same way `onRemoved` already catches tab-close - both route through the existing `DS_SCAN_FAILED` broadcast the panel already understood. Also made `content/scan.js`'s two previously-silent scroll-loop exits (no new rooms; the 400-scroll hard cap) report explicitly why the loop ended, so a capped scan is visibly flagged instead of quietly returning a partial list that looks complete. Verified with 4 new regression tests that drive `background.js`'s actual message/tab-lifecycle listeners directly (`tests/helpers/chrome-stub.js` upgraded from silent no-op listener stubs to ones that actually capture and expose them) - not just code review. Full suite: 101/101. See `DESIGN.md` Decision 33. |
 | 5s. Full codebase audit for the same silent-hang bug class, in the actual download-running path | Audit every feature for anything that could make it "just stop," before sending this to other market centers | Done | Decision 33 covered the scan relay; this pass read every remaining file end-to-end and found the same failure shape twice more, this time in the higher-stakes download-running path: (1) `runQueue()` had no top-level try/catch, and both its call sites (`DS_START_QUEUE`, the startup-resume IIFE) invoke it fire-and-forget - an uncaught throw anywhere inside it (most plausibly `ensureWorkerTabs()`'s unguarded `chrome.tabs.create()`) would skip every cleanup step, leaving `STATE.running` stuck `true` forever with no report and no error shown; (2) `processRoom()`'s `chrome.tabs.sendMessage()` call to the worker tab was the one wait in the entire pipeline with no timeout - Chrome's messaging API leaves that promise pending forever if `sendResponse()` is never called, which a thrown error in `content.js`'s `DS_PROCESS_ROOM` handler (also previously unguarded) could cause on any single room, hanging the *entire run*, not just that room, since `runQueue()`'s `Promise.all()` can't resolve until every worker's loop exits. Fixed both: `runQueue()` now catches its own failures, resets state, writes a best-effort partial report, and broadcasts a new `DS_RUN_FAILED` message so the panel shows a real crash instead of reading it as a normal "Done"; a new `withTimeout()` helper bounds the room-messaging call to 90s, and `content.js`'s handler now reports a real error immediately instead of risking the full 90s wait. Verified with 5 new regression tests, including two that drive a full `DS_START_QUEUE` message through the real listener with `chrome.tabs.create` mocked to throw, confirming the crash path resets state, broadcasts correctly, and deliberately leaves the persisted job intact for a later resume. Full suite: 106/106. See `DESIGN.md` Decision 34. |
+| 5t. Removed the scroll-count safety cap entirely | Fix a scan silently stopping partway through a large date range, reported directly with the exact room count and date it happened at | Done | Checked against the account's own real Scan List CSVs: two independent scan runs, same date range, both stopped at the *exact same room* (2913 found, room ID `8659058`, `2023-06-10`) - that reproducibility points at a deterministic cap, not the timing-dependent no-new-rooms condition. `content/scan.js`'s `totalScrolls < 400` loop guard was a circuit-breaker against a genuinely infinite loop, never meant to be a real ceiling, but at this account's observed ~7.3 rooms/scroll, 400 scrolls covered only ~2900 rooms - far short of the 10,000+-room scale this project is built for. First raised 25x to 10,000, then reconsidered as still just a bigger arbitrary number with the same failure mode at large enough scale - removed as a stopping condition entirely, since the loop already has a real signal for "done": `outOfRangeStreak` (several consecutive rooms confirmed past the requested end date, valid because the list is sorted oldest-first). `noNewRoomAttempts`'s threshold also widened (7 → 15) since the two real runs stopped at different rooms, suggesting real timing variance worth a wider margin. The scroll count is still tracked and now shown in the periodic status line instead of discarded, so a long scan reads as active rather than possibly frozen. See `DESIGN.md` Decision 35. |
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
 build-log framing) — this table exists so you don't have to read either in
@@ -1052,6 +1053,34 @@ here for the full story.
   and deliberately leaves the persisted job intact for a later
   resume. Full suite: 106/106. Full reasoning in `DESIGN.md`'s
   Decision 34.
+
+#### Phase 5t: Removed the Scroll-Count Safety Cap Entirely
+
+- **Fixed a scan silently stopping partway through a large date
+  range** - reported directly with the exact room count and date it
+  happened at: "the code randomly just stopped a scan after 10k
+  rooms... i did 1/1/2023 to 12/31/2024 but once it reached like
+  6/10/2023 it just stopped." Checked against the account's own real
+  Scan List CSVs rather than guessing: two independent scan runs, same
+  requested range, both stopped at the *exact same room* (2913 found,
+  room ID `8659058`, `2023-06-10`) - that reproducibility points at a
+  deterministic cap, not the timing-dependent no-new-rooms condition.
+  `content/scan.js`'s `totalScrolls < 400` loop guard was a circuit
+  breaker against a genuinely infinite loop, never meant to be a real
+  ceiling, but at this account's observed ~7.3 rooms/scroll, 400
+  scrolls covered only ~2900 rooms - far short of the 10,000+-room
+  scale this project is built for. First raised 25x to 10,000, then
+  reconsidered as still just a bigger arbitrary number with the same
+  failure mode at large enough scale, and removed as a stopping
+  condition entirely - the loop already has a real signal for "done":
+  `outOfRangeStreak` (several consecutive rooms confirmed past the
+  requested end date, valid because the list is sorted oldest-first).
+  `noNewRoomAttempts`'s threshold also widened (7 → 15) since the two
+  real runs stopped at different rooms, suggesting real timing
+  variance worth a wider margin. The scroll count is still tracked and
+  now shown in the periodic status line instead of discarded, so a
+  long scan reads as active rather than possibly frozen. Full
+  reasoning in `DESIGN.md`'s Decision 35.
 
 ---
 
