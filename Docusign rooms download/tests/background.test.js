@@ -114,37 +114,43 @@ test("computeFolderNames produces a folder name with no trailing period/space fo
   });
 });
 
-test("matchVerifiedDownloads matches a room to a completed download by plain filename", () => {
+test("matchVerifiedDownloads matches a room to a completed download via its transaction/<id> URL", () => {
   const { matchVerifiedDownloads } = freshBackground();
 
   const items = [
-    { id: 1, filename: "/Users/x/Downloads/Docusign Rooms/2022/Room A/Room A.zip" }
+    {
+      id: 1,
+      filename: "/Users/x/Downloads/Docusign Rooms/2022/Room A/Room A.zip",
+      url: "https://rooms.docusign.com/transaction/555/documents/download",
+      referrer: "",
+      finalUrl: ""
+    }
   ];
-  const rooms = [{ roomId: "1", roomName: "Room A" }];
+  const rooms = [{ roomId: "555", roomName: "Room A" }];
 
   const verified = matchVerifiedDownloads(items, rooms);
 
   assert.equal(verified.size, 1);
-  assert.equal(verified.get("1"), items[0]);
+  assert.equal(verified.get("555"), items[0]);
 });
 
-test("matchVerifiedDownloads matches a room to a completed download using the '(roomId)' disambiguated filename", () => {
+test("matchVerifiedDownloads matches a room to a completed download via its rooms/<id> URL", () => {
   const { matchVerifiedDownloads } = freshBackground();
 
   const items = [
-    { id: 1, filename: "/Users/x/Downloads/Docusign Rooms/Room A (42).zip" }
+    { id: 1, filename: "/Users/x/Downloads/Docusign Rooms/Room A.zip", url: "https://rooms.docusign.com/rooms/777/documents", referrer: "", finalUrl: "" }
   ];
-  const rooms = [{ roomId: "42", roomName: "Room A" }];
+  const rooms = [{ roomId: "777", roomName: "Room A" }];
 
   const verified = matchVerifiedDownloads(items, rooms);
 
-  assert.equal(verified.get("42"), items[0]);
+  assert.equal(verified.get("777"), items[0]);
 });
 
 test("matchVerifiedDownloads does not match a room with no corresponding download at all", () => {
   const { matchVerifiedDownloads } = freshBackground();
 
-  const items = [{ id: 1, filename: "/Users/x/Downloads/Docusign Rooms/Some Other Room.zip" }];
+  const items = [{ id: 1, filename: "/Users/x/Downloads/Docusign Rooms/Some Other Room.zip", url: "https://rooms.docusign.com/transaction/999/documents/download" }];
   const rooms = [{ roomId: "1", roomName: "Room A" }];
 
   const verified = matchVerifiedDownloads(items, rooms);
@@ -152,26 +158,62 @@ test("matchVerifiedDownloads does not match a room with no corresponding downloa
   assert.equal(verified.size, 0);
 });
 
-test("matchVerifiedDownloads matches on the leaf filename only, regardless of the old flat vs new year-folder path prefix", () => {
+// Regression - confirmed live before this fix: an earlier version of
+// matchVerifiedDownloads matched purely by cleaned room name (the leaf
+// filename), which meant two genuinely different rooms sharing a display
+// name (a plain address, or a generic name like "Rental," reused across
+// different years/clients - a real, observed pattern in this project's
+// actual data) were indistinguishable. A completed download belonging to
+// one room would incorrectly "verify" a completely different, entirely
+// unrelated, never-downloaded room of the same name - silently marking
+// it Downloaded and skipping it for good, exactly the kind of false
+// positive this whole feature exists to avoid causing. Matching on
+// roomId (extracted from the download's own URL, same pattern
+// findCurrentRoomForDownload() already trusts) instead of name makes
+// this class of bug structurally impossible, not just less likely.
+test("matchVerifiedDownloads does NOT match two different rooms that share a display name - only the room whose ID is actually in the URL", () => {
   const { matchVerifiedDownloads } = freshBackground();
 
+  // Room 100 (created 2021) genuinely has a completed download. Room 200
+  // is a completely different room that happens to share the exact same
+  // cleaned display name, created a different year, and was never
+  // actually downloaded.
   const items = [
-    { id: 1, filename: "/Users/x/Downloads/Docusign Rooms/Room A/Room A.zip" },
-    { id: 2, filename: "/Users/x/Downloads/Docusign Rooms/2023/Room B/Room B.zip" }
+    {
+      id: 1,
+      filename: "/Users/x/Downloads/Docusign Rooms/2021/Main St Listing/Main St Listing.zip",
+      url: "https://rooms.docusign.com/transaction/100/documents/download",
+      referrer: "",
+      finalUrl: ""
+    }
   ];
-  const rooms = [
-    { roomId: "1", roomName: "Room A" },
-    { roomId: "2", roomName: "Room B" }
-  ];
+  const rooms = [{ roomId: "200", roomName: "Main St Listing" }];
 
   const verified = matchVerifiedDownloads(items, rooms);
 
-  assert.equal(verified.size, 2);
+  assert.equal(verified.size, 0, "room 200 must not be verified - the only existing file belongs to a different room (100)");
 });
 
-test("matchVerifiedDownloads handles empty inputs without throwing", () => {
+test("matchVerifiedDownloads checks referrer and finalUrl too, not just url, mirroring findCurrentRoomForDownload()'s own fallback order", () => {
   const { matchVerifiedDownloads } = freshBackground();
 
+  const viaReferrer = matchVerifiedDownloads(
+    [{ id: 1, filename: "a.zip", url: "", referrer: "https://rooms.docusign.com/transaction/10/documents/download", finalUrl: "" }],
+    [{ roomId: "10", roomName: "A" }]
+  );
+  assert.equal(viaReferrer.size, 1);
+
+  const viaFinalUrl = matchVerifiedDownloads(
+    [{ id: 2, filename: "b.zip", url: "", referrer: "", finalUrl: "https://rooms.docusign.com/rooms/20/documents" }],
+    [{ roomId: "20", roomName: "B" }]
+  );
+  assert.equal(viaFinalUrl.size, 1);
+});
+
+test("matchVerifiedDownloads handles missing url/referrer/finalUrl and empty/null inputs without throwing", () => {
+  const { matchVerifiedDownloads } = freshBackground();
+
+  assert.equal(matchVerifiedDownloads([{ id: 1, filename: "a.zip" }], [{ roomId: "1", roomName: "A" }]).size, 0);
   assert.equal(matchVerifiedDownloads([], []).size, 0);
   assert.equal(matchVerifiedDownloads(null, null).size, 0);
 });

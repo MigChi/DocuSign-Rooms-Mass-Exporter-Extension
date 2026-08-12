@@ -256,30 +256,49 @@ function computeFolderNames(queue) {
 // Attempted" rooms (either this run's own results, checked right before
 // the report is written, or rooms coming off an uploaded CSV on a
 // resume - see the two call sites), returns roomId -> the matched
-// DownloadItem for every room whose expected filename (with or without
-// the "(roomId)" disambiguation suffix - whichever computeFolderNames()
-// would have used depends on what else was in whatever run originally
-// downloaded it, which this function doesn't know or need to) shows up
-// as a real, complete, still-existing file. Matches on the leaf filename
-// only, not the full path - deliberately, so this works whether the file
-// landed under the old flat Docusign Rooms/<name>/ structure or the new
-// Docusign Rooms/<year>/<name>/ one (Decision 25) - this check doesn't
-// care where the file is, only that it's really there.
+// DownloadItem for every room a real, complete, still-existing download
+// can be tied to.
+//
+// Matches by roomId extracted from the download's own url/finalUrl/
+// referrer - the exact same /rooms/<id>/ or /transaction/<id>/ pattern
+// findCurrentRoomForDownload() already trusts to identify a live download
+// (Decision 2's second correction) - not by filename. An earlier version
+// of this function matched by cleaned room name instead, on the theory
+// that it would work regardless of which folder-path scheme (old flat vs
+// new year-folder, Decision 25) the file happened to land under. That
+// version had a real, confirmed bug: two genuinely different rooms that
+// happen to share a cleaned display name (a plain address or a generic
+// name like "Rental" reused across different years/clients is an actual,
+// observed pattern in this project's real data, not a hypothetical) are
+// indistinguishable by name alone - a completed download that actually
+// belongs to one room would incorrectly verify a *different*, entirely
+// unrelated, never-downloaded room of the same name, silently marking it
+// "Downloaded" and skipping it for good. Confirmed directly before this
+// fix: `matchVerifiedDownloads([{filename: ".../2021/Main St Listing/
+// Main St Listing.zip"}], [{roomId: "200", roomName: "Main St Listing"}])`
+// returned a match for room 200 even though the existing file belonged to
+// an entirely different room. A same-leaf-name-but-different-full-path
+// exclusion rule was tried next and still didn't close the gap - the
+// false match above involves exactly *one* existing file, not two
+// competing ones, so nothing about counting duplicate leaf names touches
+// it. roomId is unique per room by construction, so matching on it
+// structurally cannot produce this class of false positive the way any
+// name-based approach can.
 function matchVerifiedDownloads(existingItems, rooms) {
-  const byLeafName = new Map();
+  const roomIdsWanted = new Set((rooms || []).map(room => room.roomId));
+  const itemByRoomId = new Map();
+
   (existingItems || []).forEach(item => {
-    const leaf = String(item.filename || "").split("/").pop();
-    if (leaf) byLeafName.set(leaf, item);
+    for (const candidate of [item.url, item.finalUrl, item.referrer]) {
+      const match = String(candidate || "").match(/\/(?:rooms|transaction)\/(\d+)/i);
+      if (match && roomIdsWanted.has(match[1])) {
+        itemByRoomId.set(match[1], item);
+        break;
+      }
+    }
   });
 
-  const verified = new Map();
-  (rooms || []).forEach(room => {
-    const name = cleanName(room.roomName || `Docusign Room ${room.roomId}`);
-    const match = byLeafName.get(`${name}.zip`) || byLeafName.get(`${name} (${room.roomId}).zip`);
-    if (match) verified.set(room.roomId, match);
-  });
-
-  return verified;
+  return itemByRoomId;
 }
 
 // Queries Chrome's own persistent download history (chrome.downloads.search -
@@ -1018,126 +1037,149 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // concurrently over the same STATE.pending.
       STATE.running = true;
 
-      const rooms = Array.isArray(message.rooms) ? message.rooms : [];
-      const normalized = rooms
-        .map(room => {
-          const documentsUrl = room.documentsUrl || roomUrlToDocumentsUrl(room.url || room.href);
-          if (!documentsUrl) return null;
-          const roomId = getRoomIdFromUrl(documentsUrl);
-          return {
-            roomId,
-            roomName: cleanName(room.roomName || room.title || `Docusign Room ${roomId}`),
-            documentsUrl,
-            // Carried through so computeFolderNames() below can route this
-            // room into Docusign Rooms/<year>/... - present as a real Date
-            // on a room fresh off a live scan (content/scan.js), or an
-            // ISO string once it's round-tripped through an uploaded CSV
-            // (parseUploadedCsv() in content/utils.js); roomCreatedYear()
-            // accepts either. Previously dropped entirely here, which
-            // would have silently sent every room to "Unassigned."
-            createdDate: room.createdDate || null,
-            // The room's own prior status, from parseUploadedCsv() - only
-            // read below to decide which rooms are worth verifying against
-            // Chrome's download history before re-processing (a "Failed"
-            // room never had a download triggered at all, nothing to
-            // check; undefined for a room fresh off a live scan, same
-            // effect). Not otherwise used - processRoom() always computes
-            // this run's own fresh status from what actually happens.
-            status: room.status || null
-          };
-        })
-        .filter(Boolean);
+      // Everything from here through sendResponse() is wrapped in try/catch
+      // as a safety net, not because any single line here is expected to
+      // fail under normal conditions - persistJob() and
+      // findVerifiedExistingDownloads() already swallow their own real
+      // failure modes internally. Confirmed directly (not assumed) that
+      // without this, an unexpected throw anywhere in this block - a
+      // chrome.* API call failing in some way this code didn't anticipate -
+      // would leave STATE.running stuck `true` forever, since runQueue()
+      // (the only place that resets it) would never even be reached:
+      // sendResponse() never fires either, so the caller hangs, and every
+      // future DS_START_QUEUE gets silently rejected with "a run is
+      // already active" until the next service worker restart happens to
+      // occur, with no obvious cause visible anywhere. Mirrors the same
+      // reset-on-failure pattern DS_RUN_SCAN below already uses for
+      // STATE.scanning around its own chrome.tabs.sendMessage() call.
+      try {
+        const rooms = Array.isArray(message.rooms) ? message.rooms : [];
+        const normalized = rooms
+          .map(room => {
+            const documentsUrl = room.documentsUrl || roomUrlToDocumentsUrl(room.url || room.href);
+            if (!documentsUrl) return null;
+            const roomId = getRoomIdFromUrl(documentsUrl);
+            return {
+              roomId,
+              roomName: cleanName(room.roomName || room.title || `Docusign Room ${roomId}`),
+              documentsUrl,
+              // Carried through so computeFolderNames() below can route this
+              // room into Docusign Rooms/<year>/... - present as a real Date
+              // on a room fresh off a live scan (content/scan.js), or an
+              // ISO string once it's round-tripped through an uploaded CSV
+              // (parseUploadedCsv() in content/utils.js); roomCreatedYear()
+              // accepts either. Previously dropped entirely here, which
+              // would have silently sent every room to "Unassigned."
+              createdDate: room.createdDate || null,
+              // The room's own prior status, from parseUploadedCsv() - only
+              // read below to decide which rooms are worth verifying against
+              // Chrome's download history before re-processing (a "Failed"
+              // room never had a download triggered at all, nothing to
+              // check; undefined for a room fresh off a live scan, same
+              // effect). Not otherwise used - processRoom() always computes
+              // this run's own fresh status from what actually happens.
+              status: room.status || null
+            };
+          })
+          .filter(Boolean);
 
-      // Optional: when a Download Report CSV is uploaded, content.js
-      // already filters out rows marked "Downloaded" before sending
-      // `rooms` (only what still needs work) - but sending nothing else
-      // would mean this run's own final report only covers that subset,
-      // losing the record of everything already completed before the
-      // interruption. priorResults carries those already-done rows back
-      // in so they're seeded straight into STATE.results and STATE.queue,
-      // giving the resumed run's report (and its live progress counter)
-      // the true, complete picture instead of restarting the count from
-      // zero against a shrunk total.
-      const priorResults = Array.isArray(message.priorResults) ? message.priorResults : [];
-      const priorRoomsForQueue = priorResults.map(r => ({
-        roomId: r.roomId,
-        roomName: r.roomName,
-        documentsUrl: r.documentsUrl,
-        // Without this, createReport()'s "Created Date" column would go
-        // blank for every already-`Downloaded`/`Complete (Empty)` row on
-        // a resumed run's report, even though parseUploadedCsv() already
-        // parsed a real date for these rows off the uploaded CSV.
-        createdDate: r.createdDate || null
-      }));
+        // Optional: when a Download Report CSV is uploaded, content.js
+        // already filters out rows marked "Downloaded" before sending
+        // `rooms` (only what still needs work) - but sending nothing else
+        // would mean this run's own final report only covers that subset,
+        // losing the record of everything already completed before the
+        // interruption. priorResults carries those already-done rows back
+        // in so they're seeded straight into STATE.results and STATE.queue,
+        // giving the resumed run's report (and its live progress counter)
+        // the true, complete picture instead of restarting the count from
+        // zero against a shrunk total.
+        const priorResults = Array.isArray(message.priorResults) ? message.priorResults : [];
+        const priorRoomsForQueue = priorResults.map(r => ({
+          roomId: r.roomId,
+          roomName: r.roomName,
+          documentsUrl: r.documentsUrl,
+          // Without this, createReport()'s "Created Date" column would go
+          // blank for every already-`Downloaded`/`Complete (Empty)` row on
+          // a resumed run's report, even though parseUploadedCsv() already
+          // parsed a real date for these rows off the uploaded CSV.
+          createdDate: r.createdDate || null
+        }));
 
-      // Before queueing anything for real DOM reprocessing, check whether
-      // a "Success/Attempted" room (one that genuinely had a download
-      // triggered, just never confirmed complete) actually already has a
-      // real file sitting in Chrome's download history - see
-      // findVerifiedExistingDownloads()'s own comment for why this
-      // happens and why re-clicking Download for it risks a real
-      // duplicate. Scoped to Success/Attempted only, not Failed - a
-      // Failed room never had a download start in the first place, so
-      // there's nothing there to verify.
-      const successAttempted = normalized.filter(r => r.status === "Success/Attempted");
-      const verifiedMatches = await findVerifiedExistingDownloads(successAttempted);
+        // Before queueing anything for real DOM reprocessing, check whether
+        // a "Success/Attempted" room (one that genuinely had a download
+        // triggered, just never confirmed complete) actually already has a
+        // real file sitting in Chrome's download history - see
+        // findVerifiedExistingDownloads()'s own comment for why this
+        // happens and why re-clicking Download for it risks a real
+        // duplicate. Scoped to Success/Attempted only, not Failed - a
+        // Failed room never had a download start in the first place, so
+        // there's nothing there to verify.
+        const successAttempted = normalized.filter(r => r.status === "Success/Attempted");
+        const verifiedMatches = await findVerifiedExistingDownloads(successAttempted);
 
-      const stillNeedsProcessing = [];
-      const verifiedRoomsForQueue = [];
-      const verifiedResults = [];
+        const stillNeedsProcessing = [];
+        const verifiedRoomsForQueue = [];
+        const verifiedResults = [];
 
-      normalized.forEach(room => {
-        const match = verifiedMatches.get(room.roomId);
-        if (match) {
-          verifiedRoomsForQueue.push(room);
-          verifiedResults.push({
-            roomId: room.roomId,
-            roomName: room.roomName,
-            documentsUrl: room.documentsUrl,
-            status: "Downloaded",
-            reason: "Verified already on disk via Chrome's download history - not re-downloaded",
-            downloadedFilename: match.filename || "",
-            downloadId: match.id != null ? String(match.id) : "",
-            time: new Date().toISOString()
-          });
-        } else {
-          stillNeedsProcessing.push(room);
+        normalized.forEach(room => {
+          const match = verifiedMatches.get(room.roomId);
+          if (match) {
+            verifiedRoomsForQueue.push(room);
+            verifiedResults.push({
+              roomId: room.roomId,
+              roomName: room.roomName,
+              documentsUrl: room.documentsUrl,
+              status: "Downloaded",
+              reason: "Verified already on disk via Chrome's download history - not re-downloaded",
+              downloadedFilename: match.filename || "",
+              downloadId: match.id != null ? String(match.id) : "",
+              time: new Date().toISOString()
+            });
+          } else {
+            stillNeedsProcessing.push(room);
+          }
+        });
+
+        if (verifiedResults.length) {
+          logWorkerEvent("verified_existing_downloads", { count: verifiedResults.length, stage: "csv_resume" });
         }
-      });
 
-      if (verifiedResults.length) {
-        logWorkerEvent("verified_existing_downloads", { count: verifiedResults.length, stage: "csv_resume" });
+        STATE.queue = [...priorRoomsForQueue, ...verifiedRoomsForQueue, ...stillNeedsProcessing];
+        STATE.folderNames = computeFolderNames(STATE.queue);
+        STATE.pending = stillNeedsProcessing;
+        STATE.index = 0;
+        STATE.results = [...priorResults, ...verifiedResults];
+        // clampWorkerTabCount() handles a missing field the same as an
+        // invalid one (falls back to DEFAULT_WORKER_TAB_COUNT) - covers both
+        // an older panel that doesn't send this field yet and a genuinely
+        // bad value, without needing a separate presence check.
+        STATE.workerTabCount = clampWorkerTabCount(message.workerTabCount);
+        STATE.runDateRangeLabel = typeof message.dateRangeLabel === "string" ? message.dateRangeLabel : null;
+        STATE.paused = false;
+        STATE.stopped = false;
+        STATE.currentRooms = {};
+        // Without this, a stale entry from a previous run (e.g. Stop, then
+        // Start again over a list that includes an already-processed room)
+        // could make waitForDownloadStart() match against that old download
+        // and report "started" instantly for a room whose download in this
+        // run hasn't actually begun yet.
+        STATE.downloads = {};
+        // Explicitly cleared, not left as whatever a previous run in this
+        // same service-worker lifetime set it to - runQueue() only sets a
+        // fresh timestamp when this is falsy (so a resumed run keeps its
+        // real start time), which would otherwise make a genuinely new run
+        // silently inherit a stale startedAt from an earlier one.
+        STATE.startedAt = null;
+
+        await persistJob();
+        sendResponse({ ok: true, total: STATE.queue.length });
+      } catch (error) {
+        STATE.running = false;
+        console.error("[DSBD] DS_START_QUEUE failed unexpectedly:", error);
+        logWorkerEvent("start_queue_failed", { error: error?.message || String(error) });
+        sendResponse({ ok: false, reason: "Could not start - see the service worker console for details." });
+        return;
       }
-
-      STATE.queue = [...priorRoomsForQueue, ...verifiedRoomsForQueue, ...stillNeedsProcessing];
-      STATE.folderNames = computeFolderNames(STATE.queue);
-      STATE.pending = stillNeedsProcessing;
-      STATE.index = 0;
-      STATE.results = [...priorResults, ...verifiedResults];
-      // clampWorkerTabCount() handles a missing field the same as an
-      // invalid one (falls back to DEFAULT_WORKER_TAB_COUNT) - covers both
-      // an older panel that doesn't send this field yet and a genuinely
-      // bad value, without needing a separate presence check.
-      STATE.workerTabCount = clampWorkerTabCount(message.workerTabCount);
-      STATE.runDateRangeLabel = typeof message.dateRangeLabel === "string" ? message.dateRangeLabel : null;
-      STATE.paused = false;
-      STATE.stopped = false;
-      STATE.currentRooms = {};
-      // Without this, a stale entry from a previous run (e.g. Stop, then
-      // Start again over a list that includes an already-processed room)
-      // could make waitForDownloadStart() match against that old download
-      // and report "started" instantly for a room whose download in this
-      // run hasn't actually begun yet.
-      STATE.downloads = {};
-      // Explicitly cleared, not left as whatever a previous run in this
-      // same service-worker lifetime set it to - runQueue() only sets a
-      // fresh timestamp when this is falsy (so a resumed run keeps its
-      // real start time), which would otherwise make a genuinely new run
-      // silently inherit a stale startedAt from an earlier one.
-      STATE.startedAt = null;
-
-      await persistJob();
-      sendResponse({ ok: true, total: STATE.queue.length });
 
       runQueue();
       return;
@@ -1219,24 +1261,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // same tab.
       STATE.scanning = true;
 
-      // Picks the first matching tab - if more than one Docusign Rooms
-      // tab happens to be open, this is the same "first match wins"
-      // choice ensureWorkerTabs()/broadcastStatus() implicitly make
-      // elsewhere in this file, not a new ambiguity introduced here.
-      const tabs = await chrome.tabs.query({ url: "https://rooms.docusign.com/*" });
-      const targetTab = tabs[0];
-
-      if (!targetTab) {
-        STATE.scanning = false;
-        sendResponse({ ok: false, reason: "No Docusign Rooms tab is open. Open the Rooms list page first." });
-        return;
-      }
-
-      STATE.scanTabId = targetTab.id;
-      STATE.scanMode = message.mode;
-      STATE.scanDateRangeLabel = typeof message.dateRangeLabel === "string" ? message.dateRangeLabel : null;
-
+      // Widened to cover chrome.tabs.query() too, not just
+      // chrome.tabs.sendMessage() below - confirmed directly (the same
+      // way as DS_START_QUEUE's analogous fix above) that an unguarded
+      // query() throwing here would leave STATE.scanning stuck `true`
+      // forever, since nothing past this point would ever run to reset
+      // it and sendResponse() would never fire either.
       try {
+        // Picks the first matching tab - if more than one Docusign Rooms
+        // tab happens to be open, this is the same "first match wins"
+        // choice ensureWorkerTabs()/broadcastStatus() implicitly make
+        // elsewhere in this file, not a new ambiguity introduced here.
+        const tabs = await chrome.tabs.query({ url: "https://rooms.docusign.com/*" });
+        const targetTab = tabs[0];
+
+        if (!targetTab) {
+          STATE.scanning = false;
+          sendResponse({ ok: false, reason: "No Docusign Rooms tab is open. Open the Rooms list page first." });
+          return;
+        }
+
+        STATE.scanTabId = targetTab.id;
+        STATE.scanMode = message.mode;
+        STATE.scanDateRangeLabel = typeof message.dateRangeLabel === "string" ? message.dateRangeLabel : null;
+
         // Only acknowledging that the scan *started* - the actual result
         // arrives later via DS_SCAN_COMPLETE below, since a scan can run
         // for minutes and there's no reason to hold this message channel

@@ -306,6 +306,10 @@ test("describeWorkerEvent describes every logWorkerEvent() type background.js ac
     utils.describeWorkerEvent({ type: "unassigned_download", downloadId: 7, filename: "Docusign Rooms/Unassigned/mystery.zip" }),
     "Download 7 looked like a Docusign document but couldn't be matched to a room - saved to Docusign Rooms/Unassigned/ instead"
   );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "start_queue_failed", error: "chrome.downloads.search is not a function" }),
+    "Could not start the run: chrome.downloads.search is not a function"
+  );
 });
 
 test("describeWorkerEvent falls back to the raw event type for an unrecognized type, instead of throwing", () => {

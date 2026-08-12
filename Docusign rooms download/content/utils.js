@@ -277,6 +277,8 @@ function describeWorkerEvent(evt) {
         return `Verified ${evt.count} room${evt.count === 1 ? "" : "s"} already downloaded (found in Chrome's download history) - not re-downloaded${evt.stage === "csv_resume" ? "" : " before writing the report"}`;
       case "unassigned_download":
         return `Download ${evt.downloadId} looked like a Docusign document but couldn't be matched to a room - saved to Docusign Rooms/Unassigned/ instead`;
+      case "start_queue_failed":
+        return `Could not start the run: ${evt.error}`;
       default:
         return evt.type;
     }
