@@ -310,6 +310,42 @@ test("describeWorkerEvent describes every logWorkerEvent() type background.js ac
     utils.describeWorkerEvent({ type: "start_queue_failed", error: "chrome.downloads.search is not a function" }),
     "Could not start the run: chrome.downloads.search is not a function"
   );
+  // The six assertions below were missing until this audit, despite this
+  // test's own name - background.js has genuinely called logWorkerEvent()
+  // with each of these types since Decisions 33/34/37 (scan_failed,
+  // run_queue_failed, scan_checkpoint_failed, scan_watchdog_stalled,
+  // scan_tab_navigated), well before this session, plus scan_activity
+  // (new this session) - every one of them was silently falling through
+  // to the generic default (raw event type, no real detail) in the actual
+  // Activity Log a user would see, not just untested.
+  assert.equal(
+    utils.describeWorkerEvent({ type: "scan_activity", totalFound: 3200, inRangeFound: 1250, totalTrimmed: 2500, final: false }),
+    "Scan progress: 3200 rooms found so far (1250 in range), 2500 DOM rows trimmed"
+  );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "scan_activity", totalFound: 1, inRangeFound: 1, totalTrimmed: 0, final: true }),
+    "Scan finished: 1 room found so far (1 in range), 0 DOM rows trimmed"
+  );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "scan_checkpoint_failed", error: "QUOTA_BYTES exceeded" }),
+    "Checkpoint CSV save failed: QUOTA_BYTES exceeded"
+  );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "scan_watchdog_stalled", idleMs: 125000 }),
+    "Scan appears stalled (no activity for 125s) - treated as a crashed tab"
+  );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "scan_tab_navigated", tabId: 42 }),
+    "Scan cancelled: tab 42 navigated or reloaded mid-scan"
+  );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "scan_failed", error: "No rooms loaded after scrolling for a while" }),
+    "Scan failed: No rooms loaded after scrolling for a while"
+  );
+  assert.equal(
+    utils.describeWorkerEvent({ type: "run_queue_failed", error: "chrome.tabs.create failed" }),
+    "Run crashed: chrome.tabs.create failed"
+  );
 });
 
 test("describeWorkerEvent falls back to the raw event type for an unrecognized type, instead of throwing", () => {

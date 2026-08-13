@@ -273,7 +273,15 @@ async function waitIfScanPausedOrStopped(scanControl, updateStatus) {
  * disk during a long scan rather than only at the very end, so an
  * interruption doesn't lose hours of work the way a tab crash otherwise
  * would (this session's own next real request, raised alongside the
- * crash report). Before returning, reconciles every room ever glimpsed
+ * crash report). `onActivity` (optional) fires at the same 1,000-room
+ * cadence as `onCheckpoint`, plus once more right before returning - a
+ * periodic aggregate ("N rooms found so far, M in range, T DOM rows
+ * trimmed"), not a per-room diary, which would be both impractical to
+ * render and pointless to read at this project's real scale
+ * (13,000+ rooms) - lets the caller surface scan progress through the
+ * same Activity Log the download side already has, requested directly:
+ * "kinda like you did for the download... nice visual like it was for
+ * downloads." Before returning, reconciles every room ever glimpsed
  * as an incomplete row (a real link, but name/date never finished
  * rendering - see getRoomCardsAndLinks()) against what actually made it
  * into the final result, and throws if any never resolved - explicitly
@@ -282,7 +290,7 @@ async function waitIfScanPausedOrStopped(scanControl, updateStatus) {
  * completes; this is the check that catches one that never does.
  * Returns the final list, filtered to [dateRange.start, dateRange.end].
  */
-async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = null, onCheckpoint = null) {
+async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = null, onCheckpoint = null, onActivity = null) {
     ensureListView();
     await sleep(500);
 
@@ -331,6 +339,11 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
     const everIncompleteUrls = new Set();
     const collected = [];
     let roomsSinceCheckpoint = 0;
+    // Total rows ever removed by trimOldRoomRows() below, across the whole
+    // scan - purely for onActivity reporting (see this function's own
+    // comment); trimOldRoomRows() itself doesn't need this, it only ever
+    // looks at the DOM's current state.
+    let totalTrimmed = 0;
 
     let noNewRoomAttempts = 0;
     let totalScrolls = 0;
@@ -393,10 +406,12 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
 
       if (roomsSinceCheckpoint >= CHECKPOINT_EVERY) {
         roomsSinceCheckpoint = 0;
-        onCheckpoint?.(collected.filter(room => room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd));
+        const inRange = collected.filter(room => room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd);
+        onCheckpoint?.(inRange);
+        onActivity?.({ totalFound: collected.length, inRangeFound: inRange.length, totalTrimmed, final: false });
       }
 
-      trimOldRoomRows(DOM_TRIM_KEEP);
+      totalTrimmed += trimOldRoomRows(DOM_TRIM_KEEP);
 
       scrollContainer.scrollTo({
         top: scrollContainer.scrollHeight,
@@ -464,9 +479,18 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
       throw new Error(`${neverCompleted.length} room${neverCompleted.length === 1 ? "" : "s"} could not be fully read before the scan ended (found a link, but the room's name/date never finished loading) - re-run the scan; if this keeps happening, try a smaller date range. Affected room URL${neverCompleted.length === 1 ? "" : "s"}: ${neverCompleted.slice(0, 5).join(", ")}${neverCompleted.length > 5 ? ` (+${neverCompleted.length - 5} more)` : ""}`);
     }
 
-    return collected.filter(room => {
+    const finalRooms = collected.filter(room => {
         return room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd;
     });
+
+    // One last activity report, even if the loop ended after fewer than
+    // CHECKPOINT_EVERY new rooms since the previous one (or found none at
+    // all) - without this, a scan collecting under 1,000 rooms total would
+    // never produce a single activity entry, and the Activity Log would
+    // look exactly like nothing happened.
+    onActivity?.({ totalFound: collected.length, inRangeFound: finalRooms.length, totalTrimmed, final: true });
+
+    return finalRooms;
 }
 
 // Test-only, same reasoning and shape as content/utils.js's own tail

@@ -273,6 +273,20 @@ function describeWorkerEvent(evt) {
         return `Waiting for ${evt.count} download${evt.count === 1 ? "" : "s"} to finish before writing the report`;
       case "scan_tab_closed":
         return `Scan cancelled: tab ${evt.tabId} was closed`;
+      case "scan_activity": {
+        const label = evt.final ? "Scan finished" : "Scan progress";
+        return `${label}: ${evt.totalFound} room${evt.totalFound === 1 ? "" : "s"} found so far (${evt.inRangeFound} in range), ${evt.totalTrimmed} DOM row${evt.totalTrimmed === 1 ? "" : "s"} trimmed`;
+      }
+      case "scan_checkpoint_failed":
+        return `Checkpoint CSV save failed: ${evt.error}`;
+      case "scan_watchdog_stalled":
+        return `Scan appears stalled (no activity for ${Math.round((evt.idleMs || 0) / 1000)}s) - treated as a crashed tab`;
+      case "scan_tab_navigated":
+        return `Scan cancelled: tab ${evt.tabId} navigated or reloaded mid-scan`;
+      case "scan_failed":
+        return `Scan failed: ${evt.error}`;
+      case "run_queue_failed":
+        return `Run crashed: ${evt.error}`;
       case "verified_existing_downloads":
         return `Verified ${evt.count} room${evt.count === 1 ? "" : "s"} already downloaded (found in Chrome's download history) - not re-downloaded${evt.stage === "csv_resume" ? "" : " before writing the report"}`;
       case "unassigned_download":

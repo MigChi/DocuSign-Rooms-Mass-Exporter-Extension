@@ -197,3 +197,74 @@ test("autoScrollAndCollectRooms picks up a room that starts incomplete but finis
   assert.equal(result.length, 1);
   assert.equal(result[0].roomName, "Late Room");
 });
+
+// ---- onActivity (scan-side Activity Log reporting) ----
+
+test("autoScrollAndCollectRooms calls onActivity at the same 1,000-room cadence as onCheckpoint, then once more with final:true when the scan ends", async () => {
+  // Loads 3 batches of 350 rooms (1,050 total) via onScroll, one batch per
+  // scroll, then stops loading anything new - simulates a scan that
+  // crosses the 1,000-room checkpoint threshold partway through and then
+  // legitimately runs out of new rooms. DOM_TRIM_KEEP (500) is smaller
+  // than the running total well before the threshold is crossed, so
+  // trimming is also genuinely exercised here, not just the checkpoint
+  // cadence.
+  let batchesLoaded = 0;
+  const doc = makeDocumentStub([], {
+    onScroll(d) {
+      if (batchesLoaded >= 3) return; // permanent stall after 1,050 rooms
+      const batch = Array.from({ length: 350 }, (_, i) =>
+        makeRoomRow({ roomId: String(7000 + batchesLoaded * 350 + i), name: `Room ${i}`, dateText: "Jun 1, 2021" })
+      );
+      batch.forEach(row => d.addRow(row));
+      batchesLoaded++;
+    }
+  });
+  setDom(doc);
+
+  const activityEvents = [];
+  const onActivity = evt => activityEvents.push(evt);
+
+  const result = await scan.autoScrollAndCollectRooms(null, { start: new Date("2021-01-01"), end: new Date("2021-12-31") }, null, null, onActivity);
+
+  assert.equal(result.length, 1050, "sanity check: all 1,050 rooms should have been collected and be in range");
+
+  assert.equal(activityEvents.length, 2, "expected exactly one periodic report (crossing 1,000) plus one final report");
+
+  const [periodic, final] = activityEvents;
+  assert.equal(periodic.final, false);
+  assert.equal(periodic.totalFound, 1050);
+  assert.equal(periodic.inRangeFound, 1050);
+  assert.ok(periodic.totalTrimmed > 0, "DOM_TRIM_KEEP (500) should already have been exceeded and trimmed by the time 1,050 rooms have loaded");
+
+  assert.equal(final.final, true);
+  assert.equal(final.totalFound, 1050);
+  assert.equal(final.inRangeFound, 1050);
+  assert.ok(final.totalTrimmed >= periodic.totalTrimmed, "trimming only ever accumulates, never resets");
+});
+
+test("autoScrollAndCollectRooms still calls onActivity once, with final:true, on a scan that never reaches the 1,000-room checkpoint threshold at all", async () => {
+  const rows = Array.from({ length: 5 }, (_, i) =>
+    makeRoomRow({ roomId: String(8000 + i), name: `Room ${i}`, dateText: "Jun 1, 2021" })
+  );
+  setDom(makeDocumentStub(rows)); // nothing more ever loads
+
+  const activityEvents = [];
+  await scan.autoScrollAndCollectRooms(null, { start: new Date("2021-01-01"), end: new Date("2021-12-31") }, null, null, evt => activityEvents.push(evt));
+
+  assert.equal(activityEvents.length, 1, "a small scan should still get exactly one, final activity report - not zero");
+  assert.equal(activityEvents[0].final, true);
+  assert.equal(activityEvents[0].totalFound, 5);
+  assert.equal(activityEvents[0].inRangeFound, 5);
+  assert.equal(activityEvents[0].totalTrimmed, 0, "5 rooms never exceeds DOM_TRIM_KEEP (500), so nothing should have been trimmed");
+});
+
+test("autoScrollAndCollectRooms works correctly with onActivity omitted entirely (optional parameter, existing callers unaffected)", async () => {
+  const rows = Array.from({ length: 3 }, (_, i) =>
+    makeRoomRow({ roomId: String(9000 + i), name: `Room ${i}`, dateText: "Jun 1, 2021" })
+  );
+  setDom(makeDocumentStub(rows));
+
+  const result = await scan.autoScrollAndCollectRooms(null, { start: new Date("2021-01-01"), end: new Date("2021-12-31") });
+
+  assert.equal(result.length, 3);
+});

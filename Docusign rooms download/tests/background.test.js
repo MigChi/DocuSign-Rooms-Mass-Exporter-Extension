@@ -709,6 +709,61 @@ test("DS_SCAN_CHECKPOINT is a no-op when no scan is actually in progress", async
   assert.equal(global.chrome.downloads.downloadCalls.length, 0, "no checkpoint filename means nothing should be written");
 });
 
+test("DS_SCAN_ACTIVITY logs a scan_activity event and broadcasts it live via DS_BULK_STATUS (regression: previously only DS_SCAN_PROGRESS reached the panel during a scan, never the Activity Log - requested directly as 'nice visual like it was for downloads')", async () => {
+  const { STATE } = freshBackground();
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_ACTIVITY", totalFound: 3200, inRangeFound: 1250, totalTrimmed: 2500, final: false },
+    {},
+    () => {}
+  );
+
+  await flushAsync();
+
+  const evt = STATE.workerEvents.find(e => e.type === "scan_activity");
+  assert.ok(evt, "expected a scan_activity event to be logged");
+  assert.equal(evt.totalFound, 3200);
+  assert.equal(evt.inRangeFound, 1250);
+  assert.equal(evt.totalTrimmed, 2500);
+  assert.equal(evt.final, false);
+
+  const broadcast = global.chrome.runtime.sentMessages.find(m => m.type === "DS_BULK_STATUS");
+  assert.ok(broadcast, "expected a DS_BULK_STATUS broadcast so the panel's Activity Log updates live during the scan, not only after it ends");
+  assert.ok(broadcast.state.workerEvents.some(e => e.type === "scan_activity"));
+});
+
+test("DS_SCAN_ACTIVITY counts as sign of life for the scan-stall watchdog", async () => {
+  const { STATE } = freshBackground();
+  STATE.lastScanActivityAt = Date.now() - 500000; // stale, well past SCAN_STALL_THRESHOLD_MS
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_ACTIVITY", totalFound: 10, inRangeFound: 5, totalTrimmed: 0, final: false },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.ok(Date.now() - STATE.lastScanActivityAt < 1000, "STATE.lastScanActivityAt should have just been refreshed");
+});
+
+test("DS_SCAN_CHECKPOINT updates lastScanActivityAt even when there's no checkpoint filename yet (regression: this update was missing entirely despite the watchdog's own neighboring comment claiming it already happened here - only kept working by coincidence, via DS_SCAN_PROGRESS firing on every scroll regardless)", async () => {
+  const { STATE } = freshBackground();
+  STATE.lastScanActivityAt = Date.now() - 500000; // stale
+  // scanCheckpointFilename intentionally left null - receiving the message
+  // at all is real evidence the scan is alive, independent of whether a
+  // file ends up written.
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_CHECKPOINT", rooms: [] },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.ok(Date.now() - STATE.lastScanActivityAt < 1000, "STATE.lastScanActivityAt should have just been refreshed");
+  assert.equal(global.chrome.downloads.downloadCalls.length, 0, "still shouldn't actually write a file without a filename");
+});
+
 test("the scan-stall watchdog fires DS_SCAN_FAILED and resets state when a scan goes silent past the threshold (regression: a tab that crashes - \"Aw, Snap!\" - without ever being closed or navigated is invisible to chrome.tabs.onRemoved/onUpdated, the two existing signals - see DESIGN.md)", async () => {
   const { STATE, SCAN_WATCHDOG_ALARM, SCAN_STALL_THRESHOLD_MS } = freshBackground();
 

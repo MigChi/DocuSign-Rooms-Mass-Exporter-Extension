@@ -228,6 +228,19 @@
           chrome.runtime.sendMessage({ type: "DS_SCAN_CHECKPOINT", rooms }).catch(() => {});
         };
 
+        // Periodic aggregate progress for the panel's Activity Log -
+        // "nice visual like it was for downloads," requested directly.
+        // Deliberately a summary (rooms found/in-range/trimmed so far),
+        // not one entry per room - the download side's Activity Log
+        // covers events like worker-tab lifecycle changes, which happen
+        // at most a handful of times per run; a real per-room entry here
+        // would mean tens of thousands of log lines on a large scan,
+        // which is neither readable nor something a CSV export should
+        // have to carry.
+        const reportActivity = evt => {
+          chrome.runtime.sendMessage({ type: "DS_SCAN_ACTIVITY", ...evt }).catch(() => {});
+        };
+
         // Re-wrapped in `new Date(...)` defensively rather than trusted
         // as-is - structured clone (what chrome.runtime/tabs.sendMessage
         // use) preserves real Date objects across a message hop, and this
@@ -255,7 +268,7 @@
         // `message.error` and forwards it as DS_SCAN_FAILED, the same path
         // already used when the scan tab gets closed mid-scan.
         try {
-          const rooms = await autoScrollAndCollectRooms(reportProgress, dateRange, scanControl, reportCheckpoint);
+          const rooms = await autoScrollAndCollectRooms(reportProgress, dateRange, scanControl, reportCheckpoint, reportActivity);
           chrome.runtime.sendMessage({ type: "DS_SCAN_COMPLETE", rooms }).catch(() => {});
         } catch (error) {
           chrome.runtime.sendMessage({

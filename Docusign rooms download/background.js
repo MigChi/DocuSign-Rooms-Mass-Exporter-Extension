@@ -1609,6 +1609,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // itself, which is still running independently in the content script
     // regardless of whether this particular save succeeds.
     if (message.type === "DS_SCAN_CHECKPOINT") {
+      // Corrected during an audit: the comment on SCAN_STALL_THRESHOLD_MS
+      // above has always claimed both DS_SCAN_PROGRESS *and*
+      // DS_SCAN_CHECKPOINT update this, but this line was actually
+      // missing here - only DS_SCAN_PROGRESS (which happens to fire every
+      // scroll regardless, ~1.5-2s) was keeping the watchdog's sign-of-life
+      // signal accurate, purely by coincidence of timing rather than by
+      // this handler actually doing what its own neighboring comment said
+      // it did.
+      STATE.lastScanActivityAt = Date.now();
+
       const rooms = Array.isArray(message.rooms) ? message.rooms : [];
       if (!rooms.length || !STATE.scanCheckpointFilename) return;
 
@@ -1623,6 +1633,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         console.warn("[DSBD] checkpoint CSV write failed", err);
         logWorkerEvent("scan_checkpoint_failed", { error: err?.message || String(err) });
       });
+      return;
+    }
+
+    // Sent periodically by content/scan.js's autoScrollAndCollectRooms()
+    // at the same cadence as DS_SCAN_CHECKPOINT (every 1,000 new rooms),
+    // plus once more when the scan ends - a periodic aggregate ("nice
+    // visual like it was for downloads," requested directly), not a
+    // per-room diary, which would be both unreadable and pointless to
+    // export at this project's real scale. Routed through the same
+    // logWorkerEvent()/STATE.workerEvents the download side's Activity
+    // Log already reads from and exports (createEventLogReport()) - no
+    // new storage or UI needed, just a new event type feeding the
+    // existing pipe. broadcastStatus() is called explicitly (unlike
+    // DS_SCAN_PROGRESS, which only ever reaches the status line) so this
+    // shows up live in the panel's Activity Log during the scan itself,
+    // not only after it ends.
+    if (message.type === "DS_SCAN_ACTIVITY") {
+      STATE.lastScanActivityAt = Date.now();
+      logWorkerEvent("scan_activity", {
+        totalFound: message.totalFound,
+        inRangeFound: message.inRangeFound,
+        totalTrimmed: message.totalTrimmed,
+        final: !!message.final
+      });
+      await broadcastStatus();
       return;
     }
 
@@ -1952,10 +1987,11 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // error page, with no dedicated chrome.tabs event for "this tab's renderer
 // died" - confirmed there's genuinely no direct signal available for this
 // specific case, unlike the two above. This alarm-driven watchdog is the
-// only way to detect it: if a scan is active and DS_SCAN_PROGRESS/
-// DS_SCAN_CHECKPOINT (both update STATE.lastScanActivityAt) haven't
-// arrived in over SCAN_STALL_THRESHOLD_MS, something is almost certainly
-// wrong - reported the same way as the two structurally-detectable cases
+// only way to detect it: if a scan is active and none of DS_SCAN_PROGRESS,
+// DS_SCAN_CHECKPOINT, or DS_SCAN_ACTIVITY (all three update
+// STATE.lastScanActivityAt) have arrived in over SCAN_STALL_THRESHOLD_MS,
+// something is almost certainly wrong - reported the same way as the two
+// structurally-detectable cases
 // above, through DS_SCAN_FAILED, rather than leaving the panel frozen
 // indefinitely waiting for a tab that will never respond again. Uses
 // chrome.alarms rather than setInterval specifically because MV3 service

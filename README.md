@@ -321,6 +321,7 @@ summary of it, not a second copy that can drift.
 | 5x. Research-grounded audit - stale-DOM read, a storage race, a "high-risk areas" map | Proactively audit the codebase against how comparable systems are documented to fail, not just react to the next reported symptom | Done | Researched real failure modes in similar systems (MV3 service workers, infinite-scroll scrapers, worker-pool task queues) before reading code, then verified every finding against this codebase directly rather than assuming the research applied. Confirmed all 7 of `background.js`'s top-level listeners are correctly synchronous (a real, documented MV3 pitfall - checked and found not to apply here). Found and fixed a genuine stale-DOM read in `getRoomCardsAndLinks()`: a room row caught mid-render (link present, name/date not yet rendered - React batches DOM updates) got marked "seen" permanently on that first, incomplete read, then silently vanished from the export forever once its null date failed the range filter - fixed by treating a not-yet-rendered row the same as a not-yet-rendered link, retried on a later scroll instead of lost. Found and fixed a real, documented storage race: `chrome.storage.local` provides no ordering guarantee for concurrent writes to the same key, and multiple worker tabs genuinely call `persistJob()` at effectively the same time - now serialized through a shared promise chain so writes can never overlap. A first version of the regression test for this had a flawed premise and was corrected after it failed, rather than the failure being papered over. Added a permanent "High-Risk Areas" reference section to `DESIGN.md`, organized by function/area instead of chronologically, so a future pass can quickly tell which parts of the codebase have needed real fixes more than once and what to check before touching them again. Full suite: 115/115. See `DESIGN.md` Decision 39. |
 | 5y. Closing the rest of the stale-DOM gap, proving neither side glosses over a room | Directly challenged: "we cannot tolerate a room being glossed over like the bug you described" - verify scanning and downloading, don't just assert they're fixed | Done | Found a second variant of phase 5x's stale-DOM bug: `getRoomCardsAndLinks()` checked that the date *element* existed but not that it had *text* yet - a present-but-empty element produces an Invalid Date, which is truthy (slides past an existence check) and fails every comparison silently, indistinguishable from a legitimately out-of-range room. Fixed the same way as before (treated as not-yet-rendered, retried). Then built a standing safeguard instead of just a second patch: the scan now tracks every room ever glimpsed as incomplete across the *whole* scan and reconciles that against what actually completed right before returning - if any room was seen but never resolved, for *any* reason (not just these two specific timing gaps), the scan now fails loudly instead of silently exporting an incomplete list. Traced by hand that this also correctly catches a room trimmed out of the DOM while still incomplete (Decision 37's DOM trimming) - a case neither original fix anticipated. On the download side, verified (rather than assumed) that `createReport()` already fully covers the equivalent risk - it walks the full original queue, not just recorded results, so a room interrupted between being claimed and given a result still gets a row, correctly marked "Waiting" - proved this with a new test that seeds a queue with a deliberately missing result and confirms the real CSV output includes it anyway. Full suite: 116/116. See `DESIGN.md` Decision 40. |
 | 5z. A third silent-"0 rooms" gap, found from real Downloads-folder evidence, plus real test coverage for the scan loop | User asked directly why no checkpoint CSV had ever appeared - answered by checking the actual filesystem, not by re-explaining what the feature was supposed to do | Done | The real evidence told a bigger story than the checkpoint question alone: the account's large 2023-2024 range had succeeded once (~7,463 rooms) but then failed with a genuine, repeatable 0-room "success" four separate times since, across multiple fix commits, while smaller ranges kept succeeding. Root cause: phase 5w's fix only checked whether *any* rooms were ever collected, not whether any fell inside the requested range - on an account with years of history before the requested range, a scan that stalls while still scrolling through that earlier history collects plenty of rooms (just none in range yet), so the old check never fired and the scan fell through as a false "success." Fixed by checking rooms actually within the requested date range at the point the loop ends via a stall, leaving the one condition that actually proves a range was reached and passed through (several consecutive out-of-range rooms) untouched. This is the third distinct time this exact loop has silently reported 0 rooms as success - pattern recognized as reason enough to add real test coverage of the loop's branching logic instead of relying on code review alone, revisiting `DESIGN.md` Decision 13's original scope-out of this file. Added a narrow, purpose-built DOM stub (not a general DOM library) and 12 new tests covering this bug directly, the prior two "0 rooms" bugs' checks, the stale-DOM-read guards, and the incomplete-room reconciliation. One test-fixture mistake (non-numeric fake room IDs silently failing the real URL-matching regex) was self-caught by tracing why a fixture produced an unexpectedly empty result, rather than accepting a passing-looking test at face value. Full suite: 128/128. See `DESIGN.md` Decision 41. |
+| 5aa. A scan-side Activity Log, plus a real bug found auditing the code it extended | "kinda like you did for the download maybe do an activity log... nice visual like it was for downloads" - and, going forward, an audit of what changed plus real test verification after every change | Done | Added periodic aggregate reporting (rooms found/in-range, DOM rows trimmed) at the same 1,000-room cadence as checkpoint saves, feeding the exact same Activity Log/export pipeline the download side already has - deliberately a summary, not a per-room entry, since a literal per-room log would mean tens of thousands of unreadable lines on a large scan. While auditing the stall-watchdog code this plugs into, found a second real bug unrelated to the new feature: its own comment claimed both `DS_SCAN_PROGRESS` and `DS_SCAN_CHECKPOINT` refresh the watchdog's sign-of-life timestamp, but the checkpoint handler never actually did - silently masked until now only because the progress message happens to fire on every scroll anyway. Fixed, and the comment corrected to match. Also found, while extending the Activity Log's event-description switch, that an existing test literally named "describes every logWorkerEvent() type background.js actually emits" was already false - five real event types from earlier in the project had no real description and no test coverage, silently falling back to a bare code in the actual log. Fixed all five plus the new scan-activity type, and made the test's own name true. Full suite: 134/134. See `DESIGN.md` Decision 42. |
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
 build-log framing) — this table exists so you don't have to read either in
@@ -1335,6 +1336,57 @@ here for the full story.
   of a real one, caught by tracing *why* a supposedly working fixture
   produced nothing rather than accepting the first explanation. Full
   suite: 128/128. Full reasoning in `DESIGN.md`'s Decision 41.
+
+#### Phase 5aa: A Scan-Side Activity Log, Plus a Real Bug Found Auditing the Code It Extended
+
+- **Requested directly, mirroring the download side's existing feature** -
+  "kinda like you did for the download maybe do an activity log so
+  that it can be recorded what happened to every room seen... this
+  could be nice visual like it was for downloads." Also the point
+  where a standing practice was set going forward: audit what changed,
+  run the tests, and verify the tests are genuinely checking the right
+  thing after every change from here on.
+- **Deliberately scoped as a periodic aggregate, not a per-room
+  diary.** A real per-room entry would mean tens of thousands of
+  unreadable log lines on a large scan (13,000+ rooms). Reused the
+  same 1,000-room cadence already established for checkpoint saves, so
+  it rides the same milestone instead of adding a second timer to
+  reason about - rooms found, rooms in the requested range, and DOM
+  rows trimmed, reported at that cadence and once more when the scan
+  ends.
+- **Wired into the exact same Activity Log the download side already
+  built** - no new UI, no new storage: a new event type feeding
+  `logWorkerEvent()`, described by a new case in the existing
+  `describeWorkerEvent()` switch, exported by the existing Activity
+  Log CSV. Unlike the plain progress line, this one explicitly
+  refreshes the panel's live status broadcast, so it's visible in the
+  Activity Log *during* the scan, not only after it finishes.
+- **A second, real, unrelated bug found by actually reading the
+  watchdog code before extending it, not from a new failure report.**
+  Its own comment claimed two different scan messages both refresh its
+  "is the scan still alive" timestamp - only one of them actually did.
+  It happened to work anyway, purely because the other message fires
+  on every scroll regardless - a coincidence, not a guarantee. Fixed,
+  and the comment corrected to actually match the code.
+- **A second gap found the same way, this time in the test suite
+  itself** - a test literally named "describes every logWorkerEvent()
+  type background.js actually emits" turned out not to, for five event
+  types that have existed since well before this session. Every one of
+  them was silently showing up in the real Activity Log as a bare
+  internal code instead of a real sentence. Fixed all five, plus the
+  new scan-activity type, and gave the test real assertions to back up
+  its own name.
+- **6 new tests** across both the scan loop and the background
+  message handlers, including direct regression coverage for the
+  watchdog bug above, the correct 1,000-room reporting cadence, and a
+  scan that never reaches that cadence still getting exactly one
+  closing report. One small shape inconsistency was self-caught while
+  writing these: the periodic report and the closing report didn't
+  agree on whether a "not final" event should say `false` or nothing
+  at all - harmless in practice, but fixed for a consistent exported
+  CSV rather than left as something a user might notice in their own
+  export. Full suite: 134/134. Full reasoning in `DESIGN.md`'s
+  Decision 42.
 
 ---
 
