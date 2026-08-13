@@ -93,7 +93,7 @@ This panel is its own window, separate from the Docusign page. You can move it a
 7. **The tool opens several new browser tabs** ("worker tabs" — explained below) and starts working through the room list automatically: opening each room, selecting its documents, and downloading them.
 8. **Leave the computer alone from this point on.** Don't use the mouse or keyboard on this machine until the run finishes.
 9. **When it's done**, the panel's status line will say either:
-   - *"Done — every room downloaded or confirmed empty"* (everything succeeded), or
+   - *"Done — every room downloaded or confirmed empty/all-0-byte"* (everything succeeded), or
    - a message listing how many rooms still need attention or failed (see [If some rooms still need attention](#if-some-rooms-still-need-attention-or-failed) below).
 10. **Find your files** in File Explorer (Windows) or Finder (Mac), under **Downloads → Docusign Rooms**, organized by year.
 
@@ -105,7 +105,7 @@ This panel is its own window, separate from the Docusign page. You can move it a
 |---|---|
 | **Status line** (top) | A plain-language description of what's happening right now — scanning, running, paused, or done. |
 | **Progress counter** ("`120 / 3,400`") | How many rooms have been processed out of the total found. |
-| **Breakdown line** | A quick tally, e.g. "`Downloaded 120 · Empty 5 · In progress 3 · Failed 1 · Waiting 3271`" — one number per outcome so far. |
+| **Breakdown line** | A quick tally, e.g. "`Downloaded 120 · Empty 5 · 0-byte only 2 · In progress 3 · Failed 1 · Waiting 3271`" — one number per outcome so far. |
 | **Worker rows** | One line per active browser tab, showing which room it's currently working on and how long it's been on that room. |
 | **Activity Log** (collapsed by default — click to expand) | A technical event history. Mainly useful for troubleshooting or when reporting an issue — safe to ignore during normal use. |
 | **From / To date fields** | The date range controlling which rooms get included, based on the room's created date. |
@@ -184,7 +184,8 @@ Downloads
 At the end of a run, the panel's status may mention rooms that still need attention, rooms that failed, or both — these mean different things:
 
 - **"Still needs attention"** means the tool isn't fully certain those rooms downloaded successfully (this is rare, but can happen, for example if the browser closed at an unlucky moment). **Re-upload the Download Report CSV** via "Upload CSV to Run/Resume" and run again — the tool automatically double-checks these first and skips anything it confirms was actually already downloaded, so this step is quick even for a large account.
-- **"Failed"** almost always means the room simply has no Bulk Download button to click — for example, its documents section is in a state where nothing is available to download. This isn't a malfunction; the tool is correctly reporting that there was nothing it could do for that room. A normal run finishes with the large majority of rooms downloaded and only a small number of these; **in general, failed rooms can be ignored** — there's no need to investigate or re-run them as routine cleanup. If you want to double-check a specific one anyway, open it manually in Docusign and look at its Documents page yourself.
+- **"Failed"** means the room simply has no Bulk Download button to click. One specific, common cause is now handled automatically: Docusign won't show that button at all if every currently-selected document is 0 bytes, so a room mixing real documents with 0-byte placeholder ones used to fail outright even though its real documents were perfectly downloadable — the tool now selects around the 0-byte ones automatically, so a room like that should now succeed instead. **If you have an older Download Report CSV with Failed rooms from before this update, it's worth re-uploading it** via "Upload CSV to Run/Resume" — some of those rooms will likely now succeed. Rooms that are still Failed after that, or that only ever had 0-byte/placeholder documents to begin with (those get their own status, "Complete (All 0 Bytes)," not "Failed" — see below), genuinely have nothing the tool can do for them; those can be safely ignored. If you want to double-check a specific still-Failed one anyway, open it manually in Docusign and look at its Documents page yourself.
+- **"Complete (All 0 Bytes)"** means the room's documents section wasn't empty, but every document in it was confirmed to be 0 bytes — nothing was actually there to download. This is a normal, correctly-determined outcome, not a failure, and (like "Empty") is treated as fully done — it won't be re-attempted on a future "Upload CSV to Run/Resume."
 
 ---
 

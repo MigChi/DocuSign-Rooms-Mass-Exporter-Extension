@@ -181,8 +181,8 @@ disappear or lose your progress.
 8. Leave the computer alone from this point on. Don't use the mouse or
    keyboard on this machine until the run finishes.
 9. When it's done, the panel's status line will say either:
-     - "Done -- every room downloaded or confirmed empty" (everything
-       succeeded), or
+     - "Done -- every room downloaded or confirmed empty/all-0-byte"
+       (everything succeeded), or
      - a message listing how many rooms still need attention or
        failed (see section 9, "If some rooms still need attention, or
        failed," below).
@@ -202,8 +202,9 @@ disappear or lose your progress.
     How many rooms have been processed out of the total found.
 
   Breakdown line
-    A quick tally, e.g. "Downloaded 120, Empty 5, In progress 3,
-    Failed 1, Waiting 3271" -- one number per outcome so far.
+    A quick tally, e.g. "Downloaded 120, Empty 5, 0-byte only 2,
+    In progress 3, Failed 1, Waiting 3271" -- one number per outcome
+    so far.
 
   Worker rows
     One line per active browser tab, showing which room it's
@@ -367,16 +368,30 @@ things:
   it confirms was actually already downloaded, so this step is quick
   even for a large account.
 
-- "Failed" almost always means the room simply has no Bulk Download
-  button to click -- its documents section is in a state where nothing
-  is available to download. This isn't a malfunction; the tool is
-  correctly reporting that there was nothing it could do for that
-  room. A normal run finishes with the large majority of rooms
-  downloaded and only a small number of these -- in general, FAILED
-  ROOMS CAN BE IGNORED. There's no need to investigate or re-run them
-  as routine cleanup. If you want to double-check a specific one
+- "Failed" means the room simply has no Bulk Download button to
+  click. One specific, common cause is now handled automatically:
+  Docusign won't show that button at all if every currently-selected
+  document is 0 bytes, so a room mixing real documents with 0-byte
+  placeholder ones used to fail outright even though its real
+  documents were perfectly downloadable -- the tool now selects around
+  the 0-byte ones automatically, so a room like that should now
+  succeed instead. IF YOU HAVE AN OLDER DOWNLOAD REPORT CSV WITH
+  FAILED ROOMS FROM BEFORE THIS UPDATE, IT'S WORTH RE-UPLOADING IT via
+  "Upload CSV to Run/Resume" -- some of those rooms will likely now
+  succeed. Rooms that are still Failed after that, or that only ever
+  had 0-byte/placeholder documents to begin with (those get their own
+  status, "Complete (All 0 Bytes)," not "Failed" -- see below),
+  genuinely have nothing the tool can do for them; those can be safely
+  ignored. If you want to double-check a specific still-Failed one
   anyway, open it manually in Docusign and look at its Documents page
   yourself.
+
+- "Complete (All 0 Bytes)" means the room's documents section wasn't
+  empty, but every document in it was confirmed to be 0 bytes --
+  nothing was actually there to download. This is a normal,
+  correctly-determined outcome, not a failure, and (like "Empty") is
+  treated as fully done -- it won't be re-attempted on a future
+  "Upload CSV to Run/Resume."
 
 
 --------------------------------------------------------------------
