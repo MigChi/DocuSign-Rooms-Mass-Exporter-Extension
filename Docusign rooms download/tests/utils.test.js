@@ -367,6 +367,10 @@ test("describeWorkerEvent describes every logWorkerEvent() type background.js ac
     "Scan cancelled: tab 42 navigated or reloaded mid-scan"
   );
   assert.equal(
+    utils.describeWorkerEvent({ type: "scan_stop_forced", tabId: 42 }),
+    "Scan stop forced: tab 42 never confirmed it stopped (likely crashed)"
+  );
+  assert.equal(
     utils.describeWorkerEvent({ type: "scan_failed", error: "No rooms loaded after scrolling for a while" }),
     "Scan failed: No rooms loaded after scrolling for a while"
   );

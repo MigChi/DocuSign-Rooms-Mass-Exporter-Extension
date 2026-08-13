@@ -747,6 +747,24 @@ test("DS_RUN_SCAN computes a stable scanCheckpointFilename, and DS_SCAN_CHECKPOI
   assert.equal(second.filename, filename);
   assert.equal(first.conflictAction, "overwrite", "checkpoints must overwrite, not uniquify into a new file each time");
   assert.equal(second.conflictAction, "overwrite");
+
+  // The assertions above check what was *requested* of chrome.downloads.download()
+  // - not what Chrome actually does for a data: URL, which is governed by
+  // onDeterminingFilename's own suggest() call instead (see
+  // pendingReportFilenames' own comment - this is the exact mechanism this
+  // project's own Decision 30 established as the reliable source of truth
+  // here). Regression coverage for a real bug this gap in the test let
+  // through undetected: that listener had always hardcoded "uniquify"
+  // regardless of what the original download() call asked for, so every
+  // checkpoint was silently uniquified into its own numbered file (confirmed
+  // live: ten separate "... (in progress - partial) (1).csv" through "(10)"
+  // files on a real 18,000+-room scan) instead of ever actually overwriting.
+  global.chrome.downloads.onDeterminingFilename._listener(
+    { url: first.url },
+    suggestion => { global.chrome.downloads._lastSuggestion = suggestion; }
+  );
+  assert.equal(global.chrome.downloads._lastSuggestion.conflictAction, "overwrite", "onDeterminingFilename must honor the checkpoint's own requested conflictAction, not hardcode uniquify");
+  assert.equal(global.chrome.downloads._lastSuggestion.filename, filename);
 });
 
 test("DS_SCAN_CHECKPOINT is a no-op when no scan is actually in progress", async () => {
@@ -820,6 +838,92 @@ test("DS_SCAN_CHECKPOINT updates lastScanActivityAt even when there's no checkpo
   assert.equal(global.chrome.downloads.downloadCalls.length, 0, "still shouldn't actually write a file without a filename");
 });
 
+test("forceResetStoppedScanIfStillActive resets state and broadcasts DS_SCAN_FAILED when the tab never confirmed Stop (regression: reported directly - clicking Stop right after a scan tab crashed left the panel stuck, since DS_SCAN_STOP only ever messaged the tab and hoped, with nothing guaranteeing an exit if that tab was already dead)", async () => {
+  const { STATE, forceResetStoppedScanIfStillActive, SCAN_WATCHDOG_ALARM } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "start";
+  STATE.scanDateRangeLabel = "2024-01-01 to 2024-12-31";
+  STATE.scanCheckpointFilename = "Docusign Rooms/_Scan Lists/Scan List (in progress - partial).csv";
+
+  forceResetStoppedScanIfStillActive(7);
+
+  assert.equal(STATE.scanning, false);
+  assert.equal(STATE.scanTabId, null);
+  assert.equal(STATE.scanMode, null);
+  assert.equal(STATE.scanDateRangeLabel, null);
+  assert.equal(STATE.scanCheckpointFilename, null);
+  assert.ok(global.chrome.alarms.clearCalls.includes(SCAN_WATCHDOG_ALARM), "expected the watchdog alarm to be disarmed too");
+
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.ok(failed, "expected a DS_SCAN_FAILED broadcast");
+  assert.match(failed.reason, /never confirmed/);
+
+  const evt = STATE.workerEvents.find(e => e.type === "scan_stop_forced");
+  assert.ok(evt, "expected a scan_stop_forced worker event");
+  assert.equal(evt.tabId, 7);
+});
+
+test("forceResetStoppedScanIfStillActive is a no-op if the tab already confirmed Stop normally (STATE.scanning already false)", () => {
+  const { STATE, forceResetStoppedScanIfStillActive } = freshBackground();
+
+  STATE.scanning = false; // a real DS_SCAN_COMPLETE already reset this normally
+  STATE.scanTabId = null;
+
+  forceResetStoppedScanIfStillActive(7);
+
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.equal(failed, undefined, "must not broadcast a failure for a scan that already finished normally");
+  const evt = STATE.workerEvents.find(e => e.type === "scan_stop_forced");
+  assert.equal(evt, undefined);
+});
+
+test("forceResetStoppedScanIfStillActive does not tear down a different, newer scan that started in the meantime", () => {
+  const { STATE, forceResetStoppedScanIfStillActive } = freshBackground();
+
+  // A stale call left over from an earlier Stop click (tab 7) firing after
+  // a brand new scan (tab 99) has already legitimately started - the new
+  // scan's own state must be left completely alone.
+  STATE.scanning = true;
+  STATE.scanTabId = 99;
+  STATE.scanMode = "start";
+
+  forceResetStoppedScanIfStillActive(7);
+
+  assert.equal(STATE.scanning, true, "the new scan must still be considered active");
+  assert.equal(STATE.scanTabId, 99);
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.equal(failed, undefined, "must not broadcast a failure for the wrong scan");
+});
+
+test("DS_SCAN_STOP actually schedules forceResetStoppedScanIfStillActive, not just an unguarded message to the tab (regression: this exact wiring is what closes the stuck-forever gap - a future edit that dropped this scheduling would silently reintroduce it)", async () => {
+  const { STATE, SCAN_STOP_FORCE_TIMEOUT_MS } = freshBackground();
+
+  STATE.scanTabId = 7;
+
+  const originalSetTimeout = global.setTimeout;
+  const scheduled = [];
+  global.setTimeout = (fn, ms) => { scheduled.push({ fn, ms }); return 0; };
+  try {
+    global.chrome.runtime.onMessage._listener({ type: "DS_SCAN_STOP" }, {}, () => {});
+    await flushAsync();
+  } finally {
+    global.setTimeout = originalSetTimeout;
+  }
+
+  assert.equal(scheduled.length, 1, "expected exactly one force-reset timer scheduled");
+  assert.equal(scheduled[0].ms, SCAN_STOP_FORCE_TIMEOUT_MS);
+
+  // Confirms the scheduled call is actually the right one, not just some
+  // timer - invoking what was captured should behave identically to
+  // calling forceResetStoppedScanIfStillActive(7) directly.
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  scheduled[0].fn();
+  assert.equal(STATE.scanning, false);
+});
+
 test("the scan-stall watchdog fires DS_SCAN_FAILED and resets state when a scan goes silent past the threshold (regression: a tab that crashes - \"Aw, Snap!\" - without ever being closed or navigated is invisible to chrome.tabs.onRemoved/onUpdated, the two existing signals - see DESIGN.md)", async () => {
   const { STATE, SCAN_WATCHDOG_ALARM, SCAN_STALL_THRESHOLD_MS } = freshBackground();
 
@@ -853,6 +957,64 @@ test("the scan-stall watchdog does nothing while a scan is genuinely still activ
   await flushAsync();
 
   assert.equal(STATE.scanning, true, "recent activity should not be treated as a stall");
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.equal(failed, undefined);
+});
+
+test("the scan-stall watchdog fires DS_SCAN_FAILED on a suspiciously large gap between its own ticks, even when STATE.lastScanActivityAt looks fresh (regression: reported directly from a real scan - eight checkpoints roughly 6-12 minutes apart, then one over 2 hours after the previous one, with no DS_SCAN_FAILED ever reported in between, followed by a real tab crash shortly after - consistent with the computer sleeping through the gap, then the scan's own resumed activity refreshing lastScanActivityAt before the simple threshold check ever got a chance to notice)", async () => {
+  const { STATE, SCAN_WATCHDOG_ALARM, SCAN_STALL_THRESHOLD_MS, scanWatchdogState } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "start";
+  STATE.scanCheckpointFilename = "Docusign Rooms/_Scan Lists/Scan List (in progress - partial).csv";
+  // Simulates the exact race: the scan's own activity just refreshed this
+  // to "now" (a genuinely fresh timestamp) - the simple idleMs check alone
+  // would see nothing wrong here.
+  STATE.lastScanActivityAt = Date.now();
+  // ...but this alarm's own last tick was a long time ago (the alarm
+  // itself couldn't fire while the computer was asleep) - hard evidence
+  // of a suspend/resume cycle the fresh activity timestamp alone can't see.
+  scanWatchdogState.lastTickAt = Date.now() - (SCAN_STALL_THRESHOLD_MS + 60000);
+
+  global.chrome.alarms.onAlarm._listener({ name: SCAN_WATCHDOG_ALARM });
+  await flushAsync();
+
+  assert.equal(STATE.scanning, false, "a suspicious tick gap must be treated as a stall even with fresh-looking activity");
+  assert.equal(STATE.scanCheckpointFilename, null);
+
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.ok(failed, "expected a DS_SCAN_FAILED broadcast");
+  assert.match(failed.reason, /gone to sleep/);
+
+  const evt = STATE.workerEvents.find(e => e.type === "scan_watchdog_stalled");
+  assert.ok(evt, "expected a scan_watchdog_stalled worker event");
+  assert.equal(evt.tickGapSuspicious, true);
+});
+
+test("the scan-stall watchdog does not false-positive on a scan's very first tick, even if a previous, unrelated scan's last tick was hours earlier (regression: without resetting scanWatchdogState.lastTickAt at scan start, ordinary idle time between two separate scans would look identical to a real sleep/suspend gap)", async () => {
+  const { STATE, SCAN_WATCHDOG_ALARM, scanWatchdogState } = freshBackground();
+  global.chrome.tabs.query = async () => [{ id: 42 }];
+
+  // A much earlier, unrelated tick - e.g. from a previous scan that ended
+  // hours ago. DS_RUN_SCAN's own reset of scanWatchdogState.lastTickAt is
+  // what this test is actually verifying happens.
+  scanWatchdogState.lastTickAt = Date.now() - (3 * 60 * 60 * 1000); // 3 hours ago
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_RUN_SCAN", dateRange: { start: "2024-01-01", end: "2024-12-31" }, mode: "start" },
+    {},
+    () => {}
+  );
+  await waitUntil(() => STATE.scanning === true);
+
+  // First tick of this brand-new scan, activity genuinely fresh (just set
+  // by DS_RUN_SCAN itself) - must not be treated as a stall just because
+  // scanWatchdogState.lastTickAt hadn't been reset.
+  global.chrome.alarms.onAlarm._listener({ name: SCAN_WATCHDOG_ALARM });
+  await flushAsync();
+
+  assert.equal(STATE.scanning, true, "a fresh scan's first tick must never be judged against a previous, unrelated scan's last tick");
   const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
   assert.equal(failed, undefined);
 });

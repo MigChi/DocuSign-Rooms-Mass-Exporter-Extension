@@ -45,7 +45,11 @@ function makeChromeStub() {
   };
 
   const downloads = {
-    onDeterminingFilename: { addListener() {} },
+    // Captured (not a no-op), same reasoning as onMessage/onAlarm/onRemoved/
+    // onUpdated below - lets a test invoke background.js's real listener
+    // directly with a fake DownloadItem and assert on exactly what it
+    // suggest()'d, rather than only on what was requested via download().
+    onDeterminingFilename: { addListener(fn) { this._listener = fn; } },
     onChanged: { addListener() {} },
     // Every call recorded (not just a no-op) so a test can assert on
     // exactly what filename/conflictAction a download - a checkpoint

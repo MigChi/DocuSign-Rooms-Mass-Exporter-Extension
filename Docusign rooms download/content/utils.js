@@ -307,6 +307,8 @@ function describeWorkerEvent(evt) {
         return `Scan appears stalled (no activity for ${Math.round((evt.idleMs || 0) / 1000)}s) - treated as a crashed tab`;
       case "scan_tab_navigated":
         return `Scan cancelled: tab ${evt.tabId} navigated or reloaded mid-scan`;
+      case "scan_stop_forced":
+        return `Scan stop forced: tab ${evt.tabId} never confirmed it stopped (likely crashed)`;
       case "scan_failed":
         return `Scan failed: ${evt.error}`;
       case "run_queue_failed":

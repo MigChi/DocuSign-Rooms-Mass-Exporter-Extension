@@ -641,6 +641,24 @@ async function ensureWorkerTabs(count) {
 // this listener never gets a chance to clean it up - each call site that
 // can fire more than once per run deletes its own entry explicitly in
 // that failure case rather than leaning on this comment's assumption.
+//
+// Maps to { filename, conflictAction } - not just a bare filename string,
+// which this was for a long time. Confirmed live as a real, serious bug:
+// onDeterminingFilename's own suggest() call (below) is what Chrome
+// actually obeys for a data: URL - the same reason this whole map exists
+// in the first place (see the comment above) - and it had always hardcoded
+// conflictAction: "uniquify" regardless of what the *original*
+// chrome.downloads.download() call for that entry had actually requested.
+// createReport()/createEventLogReport()/handleExportScanList() all
+// genuinely want "uniquify" (each export is a new, final file), so this
+// was invisible for them - but DS_SCAN_CHECKPOINT explicitly requests
+// "overwrite", specifically so repeated checkpoint saves replace the same
+// in-progress file instead of piling up a new one. That request was
+// silently ignored every single time: confirmed live via the actual
+// Downloads folder showing ten separate numbered checkpoint files
+// ("... (in progress - partial) (1).csv" through "(10).csv", each ~1,000
+// rows bigger than the last) instead of one file being overwritten in
+// place, on a run that reached 18,000+ rooms scanned before crashing.
 const pendingReportFilenames = new Map();
 
 async function createReport() {
@@ -695,7 +713,7 @@ async function createReport() {
   const dataUrl = "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
   const filename = `Docusign Rooms/_Download Reports/${labeledFilename("Docusign Rooms Download Report", STATE.runDateRangeLabel)}.csv`;
 
-  pendingReportFilenames.set(dataUrl, filename);
+  pendingReportFilenames.set(dataUrl, { filename, conflictAction: "uniquify" });
   await chrome.downloads.download({
     url: dataUrl,
     filename,
@@ -730,7 +748,7 @@ async function createEventLogReport() {
   const dataUrl = "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
   const filename = `Docusign Rooms/_Activity Logs/${labeledFilename("Activity Log", STATE.runDateRangeLabel)}.csv`;
 
-  pendingReportFilenames.set(dataUrl, filename);
+  pendingReportFilenames.set(dataUrl, { filename, conflictAction: "uniquify" });
   await chrome.downloads.download({
     url: dataUrl,
     filename,
@@ -1274,7 +1292,7 @@ async function handleExportScanList(rooms, dateRangeLabel) {
     const label = typeof dateRangeLabel === "string" ? dateRangeLabel : null;
     const filename = `Docusign Rooms/_Scan Lists/${labeledFilename("Scan List", label)}.csv`;
 
-    pendingReportFilenames.set(dataUrl, filename);
+    pendingReportFilenames.set(dataUrl, { filename, conflictAction: "uniquify" });
     await chrome.downloads.download({
       url: dataUrl,
       filename,
@@ -1286,6 +1304,43 @@ async function handleExportScanList(rooms, dateRangeLabel) {
   } catch (error) {
     return { ok: false, reason: error.message || "CSV export failed" };
   }
+}
+
+// How long DS_SCAN_STOP waits for the scan tab to confirm normally (via a
+// real DS_SCAN_COMPLETE) before concluding it's unreachable and
+// force-resetting state itself - see DS_SCAN_STOP's own comment for why
+// this exists at all. Generous enough that a genuinely alive tab (which
+// only checks scanControl.stopped once per ~1.5-2s scroll cycle) has real
+// room to respond normally without racing this, short enough that a truly
+// dead tab no longer leaves the user waiting anywhere close to the full
+// SCAN_STALL_THRESHOLD_MS (2 minutes) the passive watchdog alone would take.
+const SCAN_STOP_FORCE_TIMEOUT_MS = 8000;
+
+// Extracted from DS_SCAN_STOP's setTimeout callback so a test can invoke it
+// directly - the same reasoning the chrome.alarms-driven watchdog's own
+// check already has its own separate, directly-testable shape for (tests
+// call the alarm listener directly rather than waiting out a real alarm).
+// Only forces a reset if `stoppedTabId` is still the exact scan that was
+// asked to stop - a fresh scan started in the meantime (a new, different
+// STATE.scanTabId) must never be torn down by a stale call left over from
+// an earlier Stop click, and a tab that *did* respond normally in the
+// meantime already reset STATE.scanning to false itself, which this
+// correctly treats as nothing left to do.
+function forceResetStoppedScanIfStillActive(stoppedTabId) {
+  if (!STATE.scanning || STATE.scanTabId !== stoppedTabId) return;
+
+  logWorkerEvent("scan_stop_forced", { tabId: stoppedTabId });
+  STATE.scanning = false;
+  updateKeepAwake();
+  STATE.scanTabId = null;
+  STATE.scanMode = null;
+  STATE.scanDateRangeLabel = null;
+  STATE.scanCheckpointFilename = null;
+  chrome.alarms.clear(SCAN_WATCHDOG_ALARM);
+  chrome.runtime.sendMessage({
+    type: "DS_SCAN_FAILED",
+    reason: "Scan stopped, but the Docusign tab never confirmed - it may have crashed. Any progress already checkpointed is still saved in Downloads / Docusign Rooms / _Scan Lists."
+  }).catch(() => {});
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -1577,6 +1632,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // chrome.alarms.create() with the same name replaces any existing
         // alarm outright, so this can never end up with two running.
         chrome.alarms.create(SCAN_WATCHDOG_ALARM, { periodInMinutes: 1 });
+        // Reset here too, not just implicitly at module load - without
+        // this, the watchdog's own tick-gap check (see its own comment)
+        // would compare against whatever tick a *previous*, unrelated scan
+        // last saw, which could easily be hours earlier (normal idle time
+        // between two separate scans, nothing wrong at all) and falsely
+        // report a sleep/suspend on this new scan's very first tick.
+        scanWatchdogState.lastTickAt = null;
 
         // Only acknowledging that the scan *started* - the actual result
         // arrives later via DS_SCAN_COMPLETE below, since a scan can run
@@ -1645,7 +1707,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!rooms.length || !STATE.scanCheckpointFilename) return;
 
       const dataUrl = buildScanListCsvDataUrl(rooms);
-      pendingReportFilenames.set(dataUrl, STATE.scanCheckpointFilename);
+      // conflictAction: "overwrite" here - not "uniquify" - is the entire
+      // point of a checkpoint (see this handler's own comment above): every
+      // save is meant to replace the same in-progress file, not pile up a
+      // new one. This is the exact value onDeterminingFilename's suggest()
+      // call now actually honors (see pendingReportFilenames' own comment) -
+      // it wasn't, for a long time, which is what produced ten separate
+      // numbered checkpoint files on a real 18,000+-room scan instead of one
+      // file being overwritten in place.
+      pendingReportFilenames.set(dataUrl, { filename: STATE.scanCheckpointFilename, conflictAction: "overwrite" });
       chrome.downloads.download({
         url: dataUrl,
         filename: STATE.scanCheckpointFilename,
@@ -1769,6 +1839,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       chrome.tabs.sendMessage(STATE.scanTabId, { type: message.type }).catch(() => {});
       sendResponse({ ok: true });
+
+      // Stop is a guaranteed exit, not a best-effort request - reported
+      // directly as a real, live gap: clicking Stop right after a scan tab
+      // crashed ("Aw, Snap!") left the panel stuck, since the message above
+      // only reaches a content script that's actually still alive to
+      // receive it. A crashed tab will never send the DS_SCAN_COMPLETE that
+      // normally resets STATE.scanning, and the only other thing that
+      // would have (the chrome.alarms stall watchdog) can take up to
+      // SCAN_STALL_THRESHOLD_MS (2 minutes) to fire - far longer than a
+      // user who already explicitly asked to stop should have to wait, or
+      // than they'd reasonably think to. A user clicking Stop has already
+      // stated their intent unambiguously either way, alive tab or not -
+      // see forceResetStoppedScanIfStillActive()'s own comment for the rest.
+      if (message.type === "DS_SCAN_STOP") {
+        const stoppedTabId = STATE.scanTabId;
+        setTimeout(() => forceResetStoppedScanIfStillActive(stoppedTabId), SCAN_STOP_FORCE_TIMEOUT_MS);
+      }
       return;
     }
 
@@ -1833,10 +1920,17 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
   // filename is reliably known. See pendingReportFilenames' own comment
   // for why chrome.downloads.download()'s `filename` option alone isn't
   // enough for these.
-  const pendingFilename = pendingReportFilenames.get(downloadItem.url);
-  if (pendingFilename) {
+  const pending = pendingReportFilenames.get(downloadItem.url);
+  if (pending) {
     pendingReportFilenames.delete(downloadItem.url);
-    suggest({ filename: pendingFilename, conflictAction: "uniquify" });
+    // conflictAction comes from the entry itself now, not a hardcoded
+    // "uniquify" - see pendingReportFilenames' own comment for the real,
+    // confirmed bug this fixes: a checkpoint's requested "overwrite" was
+    // silently replaced with "uniquify" every single time, since this
+    // suggest() call - not the conflictAction passed to
+    // chrome.downloads.download() itself - is what Chrome actually obeys
+    // for a data: URL.
+    suggest({ filename: pending.filename, conflictAction: pending.conflictAction });
     return;
   }
 
@@ -2059,12 +2153,51 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // workers are ephemeral - an alarm survives the worker being killed and
 // restarted (Chrome wakes it back up when the alarm fires), where a
 // setInterval timer would simply be gone the moment the worker was.
+//
+// Module-level, not STATE - purely internal bookkeeping for this listener
+// alone, not something any other part of the extension (or the panel, via
+// broadcastStatus()) needs to know about. An object (not a bare variable)
+// specifically so a test can set scanWatchdogState.lastTickAt directly to
+// simulate a specific prior tick time, the same way tests already set
+// STATE.lastScanActivityAt directly - the alternative would be mocking
+// Date.now() itself, which this file calls constantly for unrelated
+// reasons (logWorkerEvent's timestamps, persistJob, etc.) and would be
+// real collateral risk to control safely just for this one check.
+const scanWatchdogState = { lastTickAt: null };
+
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name !== SCAN_WATCHDOG_ALARM) return;
+
+  // A real, confirmed gap this simple threshold check alone could miss:
+  // if the computer sleeps (lid closed - chrome.power.requestKeepAwake
+  // cannot override that, see Decision 36) for longer than
+  // SCAN_STALL_THRESHOLD_MS, this alarm itself stops firing for the whole
+  // duration (a suspended OS can't run scheduled tasks) - but on wake, the
+  // scan tab's own content script resumes at essentially the same moment
+  // this alarm's next tick does, and if its next scroll iteration sends a
+  // DS_SCAN_PROGRESS/CHECKPOINT/ACTIVITY message (refreshing
+  // STATE.lastScanActivityAt to "now") before this callback actually runs
+  // and checks that value, the race is won by the scan's own refresh - the
+  // watchdog sees a fresh timestamp and concludes nothing is wrong, never
+  // realizing a multi-hour gap just happened. Confirmed live: a real scan
+  // showed exactly this shape - eight checkpoints roughly 6-12 minutes
+  // apart, then one over 2 *hours* after the previous one, with no
+  // DS_SCAN_FAILED ever reported in between, followed by a real tab crash
+  // shortly after. The gap between this alarm's own consecutive ticks is a
+  // second, independent signal that can't be raced the same way - this
+  // alarm is created with periodInMinutes: 1, so a gap meaningfully larger
+  // than that between two ticks is itself hard evidence of a suspend/sleep
+  // cycle, regardless of what STATE.lastScanActivityAt reads by the time
+  // this callback gets to check it.
+  const now = Date.now();
+  const sinceLastTick = scanWatchdogState.lastTickAt ? now - scanWatchdogState.lastTickAt : null;
+  scanWatchdogState.lastTickAt = now;
+
   if (!STATE.scanning || !STATE.lastScanActivityAt) return;
 
-  const idleMs = Date.now() - STATE.lastScanActivityAt;
-  if (idleMs < SCAN_STALL_THRESHOLD_MS) return;
+  const idleMs = now - STATE.lastScanActivityAt;
+  const tickGapSuspicious = sinceLastTick !== null && sinceLastTick >= SCAN_STALL_THRESHOLD_MS;
+  if (idleMs < SCAN_STALL_THRESHOLD_MS && !tickGapSuspicious) return;
 
   STATE.scanning = false;
   updateKeepAwake();
@@ -2074,10 +2207,12 @@ chrome.alarms.onAlarm.addListener(alarm => {
   STATE.scanCheckpointFilename = null;
   chrome.alarms.clear(SCAN_WATCHDOG_ALARM);
 
-  logWorkerEvent("scan_watchdog_stalled", { idleMs });
+  logWorkerEvent("scan_watchdog_stalled", { idleMs, sinceLastTick, tickGapSuspicious });
   chrome.runtime.sendMessage({
     type: "DS_SCAN_FAILED",
-    reason: "The scan appears to have stopped responding (no progress for over 2 minutes) - the Docusign tab may have crashed. Check that tab, close or reload it, and try again. If a checkpoint was saved, you'll find it in Downloads / Docusign Rooms / _Scan Lists (filename ending \"in progress - partial\")."
+    reason: tickGapSuspicious
+      ? "The computer appears to have gone to sleep for a while during this scan - resuming a scan after a long interruption isn't reliable (the Docusign tab may crash shortly after waking). Please try again. If a checkpoint was saved, you'll find it in Downloads / Docusign Rooms / _Scan Lists (filename ending \"in progress - partial\")."
+      : "The scan appears to have stopped responding (no progress for over 2 minutes) - the Docusign tab may have crashed. Check that tab, close or reload it, and try again. If a checkpoint was saved, you'll find it in Downloads / Docusign Rooms / _Scan Lists (filename ending \"in progress - partial\")."
   }).catch(() => {});
 });
 
@@ -2262,6 +2397,9 @@ if (typeof module !== "undefined" && module.exports) {
     clearPersistedJob,
     PERSIST_KEY,
     createReport,
-    pendingReportFilenames
+    pendingReportFilenames,
+    forceResetStoppedScanIfStillActive,
+    SCAN_STOP_FORCE_TIMEOUT_MS,
+    scanWatchdogState
   };
 }
