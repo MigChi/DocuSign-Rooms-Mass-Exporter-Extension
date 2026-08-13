@@ -228,6 +228,30 @@ function roomCreatedYear(createdDate) {
 }
 
 /**
+ * Recognizes a document row's own file-size cell text (read directly off
+ * the room Documents page, e.g. "0 B" or "224 KB") as meaning the document
+ * is genuinely 0 bytes. Confirmed live, requested directly and reported
+ * back working: a room's Bulk Download button never renders if every
+ * currently-*selected* document is 0 bytes, even when the room also has
+ * real, non-empty documents sitting right alongside them - content.js's
+ * selectAllDocuments() uses this to select only the non-zero ones instead
+ * of blindly including everything the way the plain Select All toggle
+ * does. Matches exactly "0 B" (case-insensitive, a little tolerance for
+ * "0.0 B" - no other variant has been observed) - deliberately does NOT
+ * match "0 KB"/"0 MB": Docusign shows raw bytes for anything under 1KB in
+ * the samples seen so far, so a unit other than bytes attached to a "0"
+ * would mean genuine (if small) content, not an empty file, and matching
+ * it as zero would risk excluding a real document from the fix meant to
+ * rescue it. Same DOM-free reasoning as formatDateRangeLabel() above for
+ * why this lives here, not content.js - it's pure text matching, not a
+ * DOM read itself (the DOM read is content.js's job, this only judges the
+ * text once already extracted).
+ */
+function isZeroByteSizeText(text) {
+    return /^0(\.0+)?\s*b$/i.test(String(text || "").trim());
+}
+
+/**
  * Coerces a raw "Worker tabs" panel input value (a string from an
  * <input type="number">, possibly "") into a safe integer in [min, max],
  * falling back to `fallback` for anything not a real number. Mirrors
@@ -303,20 +327,21 @@ function describeWorkerEvent(evt) {
  * row to find columns rather than assuming a fixed layout - works for
  * either CSV this extension exports:
  *   - rooms: still need processing (everything on a plain scan list, or
- *     anything not marked "Downloaded"/"Complete (Empty)" on a download
- *     report)
- *   - priorResults: rows already marked "Downloaded" OR "Complete (Empty)"
- *     on a download report, carried over in full (not just dropped) so a
- *     resumed run's own report still shows them instead of only covering
- *     whatever gets reprocessed. "Complete (Empty)" (see background.js's
- *     processRoom()) is treated the same as "Downloaded" here - a room
- *     correctly confirmed empty has nothing left to do, and without this
- *     it would get re-visited on every single CSV-upload resume, wasting
- *     real time at scale for a room that was never going to produce
- *     anything different. This is what makes uploading a report a genuine
- *     resume rather than a blind full re-run, without needing
- *     chrome.storage.local at all (which doesn't survive a cleared
- *     profile or a different computer - a CSV file on disk does).
+ *     anything not marked "Downloaded"/"Complete (Empty)"/"Complete (All 0
+ *     Bytes)" on a download report)
+ *   - priorResults: rows already marked "Downloaded", "Complete (Empty)",
+ *     or "Complete (All 0 Bytes)" on a download report, carried over in
+ *     full (not just dropped) so a resumed run's own report still shows
+ *     them instead of only covering whatever gets reprocessed. Both
+ *     "Complete" variants (see background.js's processRoom()) are treated
+ *     the same as "Downloaded" here - each is a correctly-determined
+ *     terminal state with nothing left to do, and without this they'd get
+ *     re-visited on every single CSV-upload resume, wasting real time at
+ *     scale on rooms that were never going to produce anything different.
+ *     This is what makes uploading a report a genuine resume rather than
+ *     a blind full re-run, without needing chrome.storage.local at all
+ *     (which doesn't survive a cleared profile or a different computer -
+ *     a CSV file on disk does).
  *
  * Also reads a "Created Date" column when present (both exports have one
  * now - see handleExportScanList()/createReport() in background.js) so a
@@ -357,7 +382,15 @@ function parseUploadedCsv(rows) {
       const createdDate = dateIdx === -1 ? null : (r[dateIdx] || null);
       const status = statusIdx === -1 ? "" : (r[statusIdx] || "");
 
-      if (status === "Downloaded" || status === "Complete (Empty)") {
+      // "Complete (All 0 Bytes)" treated identically to "Complete (Empty)"
+      // here - both are permanently-resolved terminal states with nothing
+      // left to retry. Reported directly as a real concern: without this,
+      // a room whose documents are all confirmed 0 bytes (so Docusign's
+      // own Bulk Download button can never render, no matter what) would
+      // get silently re-queued and re-attempted on every single future
+      // CSV-upload resume forever, since its status would otherwise be
+      // indistinguishable from a genuinely retryable "Failed."
+      if (status === "Downloaded" || status === "Complete (Empty)" || status === "Complete (All 0 Bytes)") {
         priorResults.push({
           roomId,
           roomName,
@@ -404,6 +437,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatDateRangeLabel,
     formatCreatedDateForCsv,
     roomCreatedYear,
+    isZeroByteSizeText,
     parseWorkerTabCountInput,
     describeWorkerEvent,
     parseUploadedCsv

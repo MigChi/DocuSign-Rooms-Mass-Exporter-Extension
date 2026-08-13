@@ -857,6 +857,51 @@ test("the scan-stall watchdog does nothing while a scan is genuinely still activ
   assert.equal(failed, undefined);
 });
 
+test("processRoom() gives a room whose documents are all confirmed 0 bytes its own 'Complete (All 0 Bytes)' status, not 'Failed', and skips the real download-start wait (regression: requested directly - a room like this must never be silently retried forever on future CSV-upload resumes the way a plain 'Failed' status would be)", async () => {
+  const { STATE } = freshBackground();
+
+  global.chrome.tabs.get = async () => ({ status: "complete" });
+  global.chrome.tabs.sendMessage = async (tabId, message) => {
+    if (message.type !== "DS_PROCESS_ROOM") return {};
+    // Exactly the shape content.js's processCurrentRoom() now returns for
+    // this case - ok: true (a correctly-determined terminal state, not a
+    // failure), allZeroByte: true, no download ever actually triggered.
+    return {
+      ok: true,
+      allZeroByte: true,
+      roomId: message.roomId,
+      roomName: `Room ${message.roomId}`,
+      reason: "Every document in this room is 0 bytes"
+    };
+  };
+
+  const startedAt = Date.now();
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_START_QUEUE",
+      rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }],
+      priorResults: [],
+      workerTabCount: 1
+    },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => STATE.running === false && STATE.finishedAt !== null, 10000);
+
+  // If the download-start wait wasn't actually skipped, this would take a
+  // real ~15s (nothing in this stub ever populates STATE.downloads to
+  // satisfy it early) - finishing well under that is itself evidence the
+  // skip condition correctly covers allZeroByte, not just empty.
+  assert.ok(Date.now() - startedAt < 5000, "expected the 15s download-start wait to be skipped for an all-0-byte room");
+
+  const result = STATE.results.find(r => r.roomId === "1");
+  assert.ok(result, "expected a result for the room");
+  assert.equal(result.status, "Complete (All 0 Bytes)");
+  assert.equal(result.reason, "Every document in this room is 0 bytes");
+});
+
 test("a worker tab's message channel failing on one room - simulating a crashed tab (\"Aw, Snap!\") - doesn't hang the run: that room is marked Failed and persisted, the run continues past it to completion, and a real Download Report CSV still gets written (regression: directly requested - confirm persistence and CSV generation survive a crashed worker tab, not just a crashed scan tab - see DESIGN.md)", async () => {
   const { STATE } = freshBackground();
 

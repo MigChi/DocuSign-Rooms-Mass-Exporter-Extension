@@ -147,6 +147,7 @@ function renderBreakdown(s) {
   const parts = [];
   if (counts["Downloaded"]) parts.push(`Downloaded ${counts["Downloaded"]}`);
   if (counts["Complete (Empty)"]) parts.push(`Empty ${counts["Complete (Empty)"]}`);
+  if (counts["Complete (All 0 Bytes)"]) parts.push(`0-byte only ${counts["Complete (All 0 Bytes)"]}`);
   if (counts["Success/Attempted"]) parts.push(`In progress ${counts["Success/Attempted"]}`);
   if (counts["Failed"]) parts.push(`Failed ${counts["Failed"]}`);
   if (counts["Download Error"]) parts.push(`Errors ${counts["Download Error"]}`);
@@ -260,7 +261,7 @@ csvInput.addEventListener("change", async () => {
 
   if (!rooms.length) {
     setStatus(priorResults.length
-      ? `Everything in ${file.name} is already marked Downloaded or Complete (Empty) - nothing to run.`
+      ? `Everything in ${file.name} is already marked Downloaded, Complete (Empty), or Complete (All 0 Bytes) - nothing to run.`
       : "No usable rooms found in that CSV. Expected a Scan List or Download Report exported by this extension.");
     return;
   }
@@ -466,9 +467,9 @@ chrome.runtime.onMessage.addListener(message => {
       if (unconfirmed > 0) {
         setStatus(`Done, but ${unconfirmed} room${unconfirmed === 1 ? "" : "s"} still need${unconfirmed === 1 ? "s" : ""} attention (not confirmed downloaded)${failedNote} - re-upload the download report to finish them. Saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.`);
       } else if (failedCount > 0) {
-        setStatus(`Done - every room downloaded or confirmed empty, except ${failedCount} room${failedCount === 1 ? "" : "s"} that failed. Report and activity log saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.`);
+        setStatus(`Done - every room downloaded or confirmed empty/all-0-byte, except ${failedCount} room${failedCount === 1 ? "" : "s"} that failed. Report and activity log saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.`);
       } else {
-        setStatus("Done - every room downloaded or confirmed empty. Report and activity log saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.");
+        setStatus("Done - every room downloaded or confirmed empty/all-0-byte. Report and activity log saved in Downloads / Docusign Rooms / _Download Reports and _Activity Logs.");
       }
     }
     return;

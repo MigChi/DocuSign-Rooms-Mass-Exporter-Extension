@@ -220,6 +220,34 @@ test("roomCreatedYear is UTC-based, not local-time-based, so a date-only string'
   assert.equal(utils.roomCreatedYear("2024-12-31"), "2024");
 });
 
+test("isZeroByteSizeText recognizes a document's file-size cell text as 0 bytes (regression: 'Bulk download button was not found' turned out to be caused, at least in part, by rooms with a mix of real and 0-byte documents - Docusign's own UI never shows the button when every selected document is 0 bytes)", () => {
+  assert.equal(utils.isZeroByteSizeText("0 B"), true);
+  assert.equal(utils.isZeroByteSizeText("0B"), true); // tolerate no space, even though every real sample seen has one
+  assert.equal(utils.isZeroByteSizeText("0.0 B"), true);
+  assert.equal(utils.isZeroByteSizeText(" 0 B "), true); // real cell text is trimmed by the caller, but tolerated here too
+  assert.equal(utils.isZeroByteSizeText("0 b"), true); // case-insensitive
+});
+
+test("isZeroByteSizeText does not match a real, non-zero size, including a value that merely starts with '0'", () => {
+  assert.equal(utils.isZeroByteSizeText("224 KB"), false);
+  assert.equal(utils.isZeroByteSizeText("1.2 MB"), false);
+  // Confirmed live: Docusign shows raw bytes for anything under 1KB in
+  // every real sample seen so far, but this must not match "0 KB"/"0 MB"
+  // even if such a value existed - a unit other than bytes attached to a
+  // "0" would mean genuine (if small) content, not an empty file, and
+  // wrongly excluding it would defeat the entire point of this fix (only
+  // skip documents that are truly, confirmed empty).
+  assert.equal(utils.isZeroByteSizeText("0 KB"), false);
+  assert.equal(utils.isZeroByteSizeText("0 MB"), false);
+});
+
+test("isZeroByteSizeText returns false for missing/empty/unrecognized text, never throws (a not-yet-rendered size cell must never be mistaken for a confirmed-empty one)", () => {
+  assert.equal(utils.isZeroByteSizeText(""), false);
+  assert.equal(utils.isZeroByteSizeText(null), false);
+  assert.equal(utils.isZeroByteSizeText(undefined), false);
+  assert.equal(utils.isZeroByteSizeText("Loading..."), false);
+});
+
 test("parseWorkerTabCountInput passes through an in-range integer string unchanged", () => {
   assert.equal(utils.parseWorkerTabCountInput("3", 1, 8, 3), 3);
   assert.equal(utils.parseWorkerTabCountInput("1", 1, 8, 3), 1);
@@ -412,6 +440,19 @@ test("parseUploadedCsv routes a 'Complete (Empty)' row to priorResults too (regr
   assert.equal(result.priorResults.length, 1);
   assert.equal(result.priorResults[0].status, "Complete (Empty)");
   assert.equal(result.priorResults[0].reason, "Room is empty (0 documents)");
+});
+
+test("parseUploadedCsv routes a 'Complete (All 0 Bytes)' row to priorResults too (regression: requested directly - without this, a room whose documents are all confirmed 0 bytes, so the Bulk Download button can never render no matter what, would get silently re-queued and re-attempted on every single future CSV-upload resume forever)", () => {
+  const rows = [
+    DOWNLOAD_REPORT_HEADER,
+    ["1", "All Empty Docs Room", "1", "https://rooms.docusign.com/rooms/1/documents", "Complete (All 0 Bytes)", "Every document in this room is 0 bytes", "", "", "2026-01-01T00:00:00.000Z"]
+  ];
+  const result = utils.parseUploadedCsv(rows);
+
+  assert.equal(result.rooms.length, 0, "a room confirmed all-0-byte must not be re-queued for processing");
+  assert.equal(result.priorResults.length, 1);
+  assert.equal(result.priorResults[0].status, "Complete (All 0 Bytes)");
+  assert.equal(result.priorResults[0].reason, "Every document in this room is 0 bytes");
 });
 
 test("parseUploadedCsv still queues 'Failed', 'Success/Attempted', and 'Waiting' rows for (re-)processing", () => {

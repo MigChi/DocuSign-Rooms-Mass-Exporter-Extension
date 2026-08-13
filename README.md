@@ -323,6 +323,7 @@ summary of it, not a second copy that can drift.
 | 5z. A third silent-"0 rooms" gap, found from real Downloads-folder evidence, plus real test coverage for the scan loop | User asked directly why no checkpoint CSV had ever appeared - answered by checking the actual filesystem, not by re-explaining what the feature was supposed to do | Done | The real evidence told a bigger story than the checkpoint question alone: the account's large 2023-2024 range had succeeded once (~7,463 rooms) but then failed with a genuine, repeatable 0-room "success" four separate times since, across multiple fix commits, while smaller ranges kept succeeding. Root cause: phase 5w's fix only checked whether *any* rooms were ever collected, not whether any fell inside the requested range - on an account with years of history before the requested range, a scan that stalls while still scrolling through that earlier history collects plenty of rooms (just none in range yet), so the old check never fired and the scan fell through as a false "success." Fixed by checking rooms actually within the requested date range at the point the loop ends via a stall, leaving the one condition that actually proves a range was reached and passed through (several consecutive out-of-range rooms) untouched. This is the third distinct time this exact loop has silently reported 0 rooms as success - pattern recognized as reason enough to add real test coverage of the loop's branching logic instead of relying on code review alone, revisiting `DESIGN.md` Decision 13's original scope-out of this file. Added a narrow, purpose-built DOM stub (not a general DOM library) and 12 new tests covering this bug directly, the prior two "0 rooms" bugs' checks, the stale-DOM-read guards, and the incomplete-room reconciliation. One test-fixture mistake (non-numeric fake room IDs silently failing the real URL-matching regex) was self-caught by tracing why a fixture produced an unexpectedly empty result, rather than accepting a passing-looking test at face value. Full suite: 128/128. See `DESIGN.md` Decision 41. |
 | 5aa. A scan-side Activity Log, plus a real bug found auditing the code it extended | "kinda like you did for the download maybe do an activity log... nice visual like it was for downloads" - and, going forward, an audit of what changed plus real test verification after every change | Done | Added periodic aggregate reporting (rooms found/in-range, DOM rows trimmed) at the same 1,000-room cadence as checkpoint saves, feeding the exact same Activity Log/export pipeline the download side already has - deliberately a summary, not a per-room entry, since a literal per-room log would mean tens of thousands of unreadable lines on a large scan. While auditing the stall-watchdog code this plugs into, found a second real bug unrelated to the new feature: its own comment claimed both `DS_SCAN_PROGRESS` and `DS_SCAN_CHECKPOINT` refresh the watchdog's sign-of-life timestamp, but the checkpoint handler never actually did - silently masked until now only because the progress message happens to fire on every scroll anyway. Fixed, and the comment corrected to match. Also found, while extending the Activity Log's event-description switch, that an existing test literally named "describes every logWorkerEvent() type background.js actually emits" was already false - five real event types from earlier in the project had no real description and no test coverage, silently falling back to a bare code in the actual log. Fixed all five plus the new scan-activity type, and made the test's own name true. Full suite: 134/134. See `DESIGN.md` Decision 42. |
 | 5ab. A standalone audit - a known-but-unfixed mode-loss risk, and an alarm that never stops ringing | "run another audit" - no new symptom, a deliberate re-read of `background.js` for the class of bug this project keeps finding | Done | Followed a comment's own loose cross-reference (from the lock-screen fix) to a real, previously-identified-but-never-actually-fixed gap: if the service worker restarts in the narrow window between a scan starting and finishing, `STATE.scanMode` (deliberately never persisted - scanning isn't resumable by design) resets to null, but the scan itself keeps running in its own tab and eventually delivers real results to a worker that's forgotten whether the user clicked "Export" or "Start." That used to silently fall through to "Start" behavior - meaning a user who only asked for a CSV export could see the "Found N rooms... Continue?" prompt that offers to kick off a full download run instead. Fixed by treating an unrecognized mode as its own real failure, reported to the user, rather than guessed at. Researched (not assumed) that `chrome.alarms` persist across a service-worker restart by default per Chrome's own documentation - confirming the scan-stall watchdog's alarm would otherwise keep waking the service worker every single minute, forever, after any mid-scan restart with no later scan to naturally replace it. Fixed by clearing it unconditionally at every service-worker startup. Also found and fixed a smaller, related gap: the map tracking in-flight report filenames was never cleaned up if a download itself failed to start, and unlike the three once-per-run exports, the scan checkpoint save (which fires repeatedly over a long scan) could have let failed entries actually accumulate. Every fix was verified by deliberately reverting it, confirming its new test failed for the right reason, then restoring the fix - not just written and trusted. Full suite: 137/137. See `DESIGN.md` Decision 43. |
+| 5ac. 0-byte documents silently blocking the Bulk Download button - found, fixed, and confirmed live | "any rooms with documents of a size of 0B will cause it so that when select all is pressed the download button does not show" | Done | Verified against real captured markup (pasted directly by the user) before writing any selector: every document row has a file-size cell, and Docusign's own Bulk Download button never renders unless at least one currently-selected document is non-zero - so a room mixing real and 0-byte documents was failing outright, even though its real documents were perfectly downloadable on their own. Fixed narrowly: the original, long-proven "click one Select All checkbox" path is untouched for rooms with no 0-byte documents; only a room that actually has one switches to selecting documents individually, skipping the 0-byte ones. First live test showed no change at all - not a logic bug, but a reminder that reloading the extension doesn't reload an already-open tab's content script. The second attempt, after an actual tab refresh, worked - confirmed live against the real room. Two further gaps were caught and closed before calling this finished, both raised directly by the user rather than found independently: the 0-byte check could run before every document row had actually rendered (the same stale-DOM class of bug already fixed twice for the room list), fixed with a poll against the group header's own document count; and a room that's genuinely, permanently unfixable (every document confirmed 0 bytes) needed its own status distinct from "Failed," since "Failed" gets silently retried on every future CSV-upload resume forever - fixed with a new "Complete (All 0 Bytes)" terminal status, threaded through the same places "Complete (Empty)" already is. 5 new tests, including one whose skip-condition fix was deliberately reverted and confirmed to fail for the right reason before being restored. Full suite: 142/142. See `DESIGN.md` Decision 44. |
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
 build-log framing) — this table exists so you don't have to read either in
@@ -1429,6 +1430,56 @@ here for the full story.
   reason, then restored - proof each test would actually have caught
   the bug it exists to catch, not just proof it passes today. Full
   suite: 137/137. Full reasoning in `DESIGN.md`'s Decision 43.
+
+#### Phase 5ac: 0-Byte Documents Silently Blocking the Bulk Download Button - Found, Fixed, and Confirmed Live
+
+- **Started from a direct, specific report** - "any rooms with
+  documents of a size of 0B will cause it so that when select all is
+  pressed the download button does not show." A real, previously
+  unknown root cause for at least some of the rooms already reported
+  as "Failed - Bulk download button was not found."
+- **Verified against real captured markup before writing a single
+  selector** - the user pasted the actual rendered HTML of a real
+  room. Confirmed: every document row has its own file-size cell, and
+  a follow-up narrowed the exact rule further - the Bulk Download
+  button only renders if at least one currently-*selected* document is
+  non-zero. A room mixing real and 0-byte documents was failing
+  outright, even though its real documents were perfectly downloadable
+  on their own.
+- **Fixed narrowly, not by replacing a long-proven interaction for
+  every room.** The original "click the one Select All checkbox" path
+  stays completely untouched for the common case (no 0-byte
+  documents). Only a room that actually has one switches to selecting
+  documents individually, skipping just the 0-byte ones.
+- **The first live test showed no change at all** - not a logic bug.
+  Reloading the extension doesn't reload an already-open tab's content
+  script; the Docusign tab itself needed a refresh too. Diagnosed with
+  real, targeted console output rather than guessing again. The second
+  attempt, after an actual tab refresh, **worked** - confirmed live by
+  the user against the real room from the captured markup.
+- **Two further, real gaps were caught before calling this finished -
+  both raised directly, not found independently:**
+  - The 0-byte check could run before every document row had actually
+    finished rendering - the same class of timing bug already fixed
+    twice for the room list. Fixed with a poll against the group
+    header's own document count before trusting any conclusion about
+    zero-byte-ness.
+  - A room that's genuinely, permanently unfixable (every document
+    confirmed 0 bytes) needed its own outcome distinct from "Failed" -
+    without one, it would get silently re-queued and re-attempted on
+    every single future CSV-upload resume, forever. Fixed with a new
+    "Complete (All 0 Bytes)" terminal status, given the exact same
+    treatment "Complete (Empty)" already has everywhere it appears.
+- **The pure size-matching logic was pulled out into the shared,
+  testable helpers file** rather than left inline and untested - and
+  one real oversight was caught before this was called done: the DOM-
+  reading code had briefly ended up with its own separate, untested
+  copy of the same matching logic after the extraction, rather than
+  calling the new tested version. Fixed to call it directly.
+- **5 new tests**, including one whose regression was deliberately
+  reproduced (a skip-condition fix reverted, confirmed the test failed
+  for the right reason, then restored) before being trusted. Full
+  suite: 142/142. Full reasoning in `DESIGN.md`'s Decision 44.
 
 ---
 

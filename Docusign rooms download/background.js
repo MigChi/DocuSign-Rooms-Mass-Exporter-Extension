@@ -961,9 +961,23 @@ async function processRoom(tabId, room) {
       // "Downloaded") instead of re-visiting a room already confirmed
       // empty, and so the panel's breakdown can count it distinctly
       // rather than mixing it into either bucket.
+      //
+      // "Complete (All 0 Bytes)" is the same idea, one layer deeper - a
+      // room that isn't empty (it has real document entries) but where
+      // every one of them is confirmed 0 bytes, so Docusign's own Bulk
+      // Download button never renders no matter what's selected (see
+      // content.js's selectAllDocuments()/getDocumentRows()). Reported
+      // directly as a real, distinct concern: without a status genuinely
+      // different from "Failed," a room like this would get silently
+      // retried on every single future CSV-upload resume forever, since
+      // "Failed" carries no signal that this particular failure is
+      // permanent rather than worth trying again.
       if (response?.empty) {
         result.status = "Complete (Empty)";
         result.reason = response?.reason || "Room is empty";
+      } else if (response?.allZeroByte) {
+        result.status = "Complete (All 0 Bytes)";
+        result.reason = response?.reason || "Every document in this room is 0 bytes";
       } else {
         result.status = response?.ok ? "Success/Attempted" : "Failed";
         result.reason = response?.reason || (response?.ok ? "Download click attempted" : "Unknown failure");
@@ -986,12 +1000,13 @@ async function processRoom(tabId, room) {
 
       // Real signal instead of a flat guess: wait for
       // chrome.downloads.onDeterminingFilename to actually fire for this
-      // room (up to 15s) rather than always paying a fixed 4.5s.
-      // Skipped for an empty room (!response?.empty) - there's no
-      // download to wait for, and waiting anyway would burn up to 15s per
-      // empty room for nothing, exactly the wasted time this whole
-      // "Complete (Empty)" status was added to avoid.
-      if (response?.ok && !response?.empty && !STATE.stopped) {
+      // room (up to 15s) rather than always paying a fixed 4.5s. Skipped
+      // for an empty room or an all-0-byte one (!response?.empty &&
+      // !response?.allZeroByte) - neither has a real download to wait
+      // for, and waiting anyway would burn up to 15s per room for
+      // nothing, exactly the wasted time "Complete (Empty)" was added to
+      // avoid in the first place.
+      if (response?.ok && !response?.empty && !response?.allZeroByte && !STATE.stopped) {
         await waitForDownloadStart(roomId, 15000);
       }
 

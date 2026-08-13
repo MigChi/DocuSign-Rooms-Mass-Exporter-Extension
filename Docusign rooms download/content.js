@@ -42,6 +42,30 @@
     return document.querySelectorAll('input[data-qa="document-checkbox"]:checked').length > 0;
   }
 
+  // Every document row (confirmed via captured markup, 2026-08) has 6
+  // columns - Checkbox, Type, Document, Owner, Added, Size, in that order -
+  // and the row's own file size lives in the LAST <td>, as a bare
+  // <strong>0 B</strong> / <strong>224 KB</strong> with no data-qa of its
+  // own. Anchored off input[data-qa="document-checkbox"] (a real, stable
+  // data-qa, same convention as everywhere else in this codebase) rather
+  // than the row's own data-qa, which is just that document's numeric ID -
+  // not a fixed string to match against, unlike tr[data-qa="room-list-row"]
+  // on the list page. A room genuinely can contain both real documents and
+  // 0-byte placeholder ones side by side (confirmed live), so this needs
+  // to be checked per-document, not once for the whole room. The actual
+  // 0-byte judgment is isZeroByteSizeText() (content/utils.js) - pure text
+  // matching, kept there (not duplicated here) so it has real test
+  // coverage; this function's only job is the DOM read.
+  function getDocumentRows() {
+    return [...document.querySelectorAll('input[data-qa="document-checkbox"]')].map(checkbox => {
+      const row = checkbox.closest("tr");
+      const label = row?.querySelector('label[data-qa="document-checkbox-label"]');
+      const cells = row ? [...row.querySelectorAll("td")] : [];
+      const sizeText = cells[cells.length - 1]?.textContent?.trim() || "";
+      return { checkbox, label, sizeText, cellCount: cells.length, isZeroByte: isZeroByteSizeText(sizeText) };
+    });
+  }
+
   // Confirmed live (twice): clicking the native <input> directly is
   // reverted by the page every time (checked stays false) - the label and
   // input are siblings in the markup (not label-wraps-input), and the
@@ -50,8 +74,11 @@
   // is confirmed working and tried first; the manually dispatched
   // MouseEvent on the checkbox remains as a fallback for any room where
   // the label isn't found. Verifies against the actual document
-  // checkboxes instead of assuming success.
-  async function selectAllDocuments() {
+  // checkboxes instead of assuming success. Split out from
+  // selectAllDocuments() below so the original, long-proven "click the one
+  // Select All toggle" path stays completely untouched for the common case
+  // (a room with no 0-byte documents).
+  async function selectAllViaToggle() {
     const checkbox = document.querySelector('input[data-qa="select-all-docs"]');
 
     if (!checkbox) {
@@ -75,6 +102,105 @@
     await sleep(400);
 
     return anyDocumentChecked();
+  }
+
+  // Confirmed live (reported directly): a room's Bulk Download button never
+  // renders if every currently-*selected* document is 0 bytes - even when
+  // the room also has real, non-empty documents sitting right alongside
+  // them. The blunt Select All toggle has no way to exclude specific
+  // documents, so a room with a mix of real and 0-byte files was failing
+  // outright ("Bulk download button was not found") even though its real
+  // documents were perfectly downloadable on their own.
+  //
+  // Deliberately only takes this per-document path when the room actually
+  // *has* a 0-byte document at all, and only once every one of its
+  // document rows is confirmed to have actually rendered (see the wait
+  // loop below) - a room with no 0-byte documents, or one whose row count
+  // couldn't be confirmed complete in time, behaves exactly as before,
+  // through selectAllViaToggle() above, unmodified. Keeps this fix's
+  // blast radius as narrow as the specific problem it addresses, rather
+  // than replacing a long-proven interaction pattern for every room just
+  // to cover an edge case most rooms don't have - and never risks a false
+  // "genuinely nothing downloadable here" conclusion from an incomplete
+  // read.
+  //
+  // Returns { selected, allZeroByte } rather than a plain boolean -
+  // processCurrentRoom() uses allZeroByte to give a specific, honest
+  // failure reason for the one case this still can't fix (every document
+  // in the room is 0 bytes, so there is nothing non-zero left to select
+  // and the button still won't appear) instead of the generic "not found"
+  // message that case would otherwise get, indistinguishable from a real
+  // page-structure problem. `documentCount` (from getDocumentCount(),
+  // already read by processCurrentRoom() before calling this) is the one
+  // thing that makes `allZeroByte` trustworthy - see the wait loop below.
+  async function selectAllDocuments(documentCount) {
+    // Guards against exactly the class of bug this project has hit before
+    // with the room list (Decisions 39/40): an element existing in the DOM
+    // is not the same as its own content, or its siblings, having finished
+    // rendering. `[data-qa="group-name"]` being present only proves the
+    // group HEADER has rendered, not that every one of its document ROWS
+    // has - if getDocumentRows() ran while only some rows had painted in,
+    // and those happened to all be 0-byte ones, this would wrongly report
+    // "every document in this room is 0 bytes" for a room that actually
+    // has real documents still loading. Polls for the row count to reach
+    // documentCount (the group header's own claimed total, already
+    // established as reliable - see getDocumentCount()'s own history in
+    // DESIGN.md Decision 4) before trusting anything about zero-byte-ness;
+    // gives up after a real, generous wait and falls back to the original,
+    // always-safe Select All toggle rather than ever risking a false
+    // "genuinely nothing downloadable" conclusion from a partial read.
+    let rows = getDocumentRows();
+    if (typeof documentCount === "number" && rows.length < documentCount) {
+      const start = Date.now();
+      while (rows.length < documentCount && Date.now() - start < 10000) {
+        await sleep(300);
+        rows = getDocumentRows();
+      }
+    }
+
+    const rowsIncomplete = typeof documentCount === "number" && rows.length < documentCount;
+    const hasZeroByteDoc = rows.some(r => r.isZeroByte);
+
+    // Only logged for the cases actually worth seeing - a room with no
+    // 0-byte documents (the common case) takes the untouched toggle path
+    // silently, same as it always has. A per-room dump on every single
+    // room in a multi-thousand-room run would otherwise be real console
+    // noise for no benefit.
+    if (hasZeroByteDoc || rowsIncomplete) {
+      console.log(
+        "[DSBD] getDocumentRows():", rows.map(r => ({ sizeText: r.sizeText, isZeroByte: r.isZeroByte })),
+        "documentCount:", documentCount, "rowsIncomplete:", rowsIncomplete
+      );
+    }
+
+    if (!rows.length || !hasZeroByteDoc || rowsIncomplete) {
+      const selected = await selectAllViaToggle();
+      return { selected, allZeroByte: false };
+    }
+
+    const nonZero = rows.filter(r => !r.isZeroByte);
+    const allZeroByte = nonZero.length === 0;
+    // Every document is 0 bytes - nothing gained by excluding all of them,
+    // so select everything anyway (matches the pre-existing behavior for
+    // this specific case) rather than selecting nothing at all.
+    const targets = allZeroByte ? rows : nonZero;
+
+    targets[0]?.checkbox?.scrollIntoView({ block: "center" });
+
+    for (const { checkbox, label } of targets) {
+      label?.click();
+      if (checkbox && !checkbox.checked) {
+        checkbox.dispatchEvent(new MouseEvent("click", {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          detail: 1
+        }));
+      }
+    }
+
+    await sleep(400);
+    return { selected: anyDocumentChecked(), allZeroByte };
   }
 
   async function waitForSelector(selector, timeoutMs = 45000) {
@@ -133,10 +259,10 @@
       };
     }
 
-    const selected = await selectAllDocuments();
-    console.log("[DSBD] selectAllDocuments() succeeded:", selected);
+    const selection = await selectAllDocuments(documentCount);
+    console.log("[DSBD] selectAllDocuments() succeeded:", selection.selected, "allZeroByte:", selection.allZeroByte);
 
-    if (!selected) {
+    if (!selection.selected) {
       return {
         ok: false,
         roomId,
@@ -155,6 +281,30 @@
     );
 
     if (!downloadButton) {
+      // A room where every document is 0 bytes is a correctly-determined
+      // terminal state, not a failure - the same reasoning the empty-room
+      // case above already uses. ok: true (not false) and a distinct
+      // allZeroByte flag, mirroring `empty` above exactly, so
+      // background.js's processRoom() can give it its own real status
+      // ("Complete (All 0 Bytes)") instead of "Failed" - which matters
+      // beyond just labeling: a "Failed" room gets silently retried on
+      // every future CSV-upload resume forever (parseUploadedCsv() only
+      // skips Downloaded/Complete rows), which would mean re-attempting
+      // this exact, permanently unresolvable room every single time
+      // someone re-uploads a report - a real, reported concern once this
+      // fix made "the button showed up" and "the button will never show
+      // up no matter what" two genuinely different, distinguishable
+      // outcomes for the first time.
+      if (selection.allZeroByte) {
+        return {
+          ok: true,
+          allZeroByte: true,
+          roomId,
+          roomName,
+          reason: "Every document in this room is 0 bytes - nothing to download"
+        };
+      }
+
       return {
         ok: false,
         roomId,
