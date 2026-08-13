@@ -187,11 +187,18 @@ function getRoomCardsAndLinks() {
  * way to inspect directly. If a scan ever seems to stall out right after
  * a trim (rather than for a genuine end-of-data reason - see
  * noNewRoomAttempts below), that buffer is the first thing to widen.
+ * Returns how many rows were actually removed (0 if under the keep
+ * threshold) - autoScrollAndCollectRooms() accumulates this across the
+ * whole scan and reports it periodically, so trimming's effect on DOM
+ * size is something the user can actually see happening, not just a
+ * silent internal detail to trust blindly.
  */
 function trimOldRoomRows(keepLastN) {
   const rows = [...document.querySelectorAll('tr[data-qa="room-list-row"]')];
-  if (rows.length <= keepLastN) return;
-  rows.slice(0, rows.length - keepLastN).forEach(row => row.remove());
+  if (rows.length <= keepLastN) return 0;
+  const toRemove = rows.slice(0, rows.length - keepLastN);
+  toRemove.forEach(row => row.remove());
+  return toRemove.length;
 }
 
 /**
@@ -408,26 +415,34 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
     // the kind of thing worth surfacing explicitly rather than leaving the
     // user to guess whether something went wrong.
     if (!stoppedEarly && noNewRoomAttempts >= 15) {
-      // Zero rooms ever collected, on a loop that only ends this way
-      // (never via outOfRangeStreak, which requires having found - and
-      // then outgrown - at least one real row) is a different situation
-      // from "ran out of new rooms after collecting some": it means the
-      // room-list table never rendered a single row for the entire
-      // ~22.5s this took, on an account/range already confirmed live to
-      // hold thousands of rooms - not a real "this range is empty"
-      // answer, the same class of "the page wasn't actually ready to
-      // scan" problem the sort-order check above already guards against,
-      // just not caught by that specific check (the sort can be correctly
-      // "Created (Oldest)" while the table itself still shows nothing -
-      // confirmed live: a real scan on this exact account/range produced
-      // a silently "successful" 0-room export with no checkpoint file
-      // ever created, meaning nothing was ever found from the very
-      // start). Thrown for the same reason as that check: an empty
-      // result here would otherwise take the normal success path
-      // straight through to a real, misleadingly "successful" 0-room CSV
-      // export instead of being reported as the failure it actually is.
-      if (collected.length === 0) {
-        throw new Error("No rooms loaded after scrolling for a while - the Rooms list table may not have finished loading. Make sure you're logged into Docusign and on the Rooms list page, then try again.");
+      // Checked against rooms actually *within* the requested range, not
+      // just collected.length - confirmed live as a real, distinct
+      // failure mode on this account: a range whose start date is far
+      // into the account's history (e.g. 2023, when the account also
+      // holds thousands of rooms from 2020-2022 sorted before it) can
+      // take long enough to scroll through everything before dateStart
+      // that the scan stalls - a network hiccup, brief tab-focus loss,
+      // or any other reason DOM growth briefly pauses - before it ever
+      // reaches a single in-range room. collected.length is very much
+      // nonzero in that case (thousands of pre-range rooms genuinely
+      // found), so the original version of this check, which only
+      // guarded collected.length === 0, missed it entirely and let it
+      // through as a normal "0 rooms in range" success: repeatable, live,
+      // header-only CSV exports for exactly this account/range while the
+      // same code correctly handled smaller, closer-to-the-start ranges.
+      // outOfRangeStreak (above) is the *only* legitimate way to prove a
+      // range was actually reached and scrolled past with nothing in it;
+      // ending via a stall instead means we genuinely don't know whether
+      // the range is empty or was just never reached, so - same
+      // reasoning as the sort-order check above - that ambiguity is
+      // treated as a failure rather than let through as a silently
+      // "successful" empty export.
+      const inRangeCount = collected.filter(room => room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd).length;
+      if (inRangeCount === 0) {
+        if (collected.length === 0) {
+          throw new Error("No rooms loaded after scrolling for a while - the Rooms list table may not have finished loading. Make sure you're logged into Docusign and on the Rooms list page, then try again.");
+        }
+        throw new Error(`Scan stalled after finding ${collected.length} room(s), but none were within the requested date range - it likely stopped before reaching that range rather than the range genuinely being empty. Try again; if it keeps happening, try scanning in smaller date chunks so each scan has less to scroll through before reaching its range.`);
       }
       updateStatus?.(`Finished scrolling: no new rooms loaded after ${noNewRoomAttempts} attempts (${collected.length} found so far).`);
     }
@@ -452,4 +467,23 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
     return collected.filter(room => {
         return room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd;
     });
+}
+
+// Test-only, same reasoning and shape as content/utils.js's own tail
+// (see its comment) - `module` never exists in a real content script, so
+// this is a no-op in the extension itself. Under Node, exports these for
+// require() against the actual module-scoped functions rather than a
+// re-implementation of their logic, so a test failure here means the
+// shipped code is actually broken, not just a parallel copy of it.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    getScrollContainer,
+    getSortLabel,
+    ensureListView,
+    ensureOldestSort,
+    getRoomCardsAndLinks,
+    trimOldRoomRows,
+    waitIfScanPausedOrStopped,
+    autoScrollAndCollectRooms
+  };
 }

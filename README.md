@@ -320,6 +320,7 @@ summary of it, not a second copy that can drift.
 | 5w. A second way a scan could silently report "0 rooms" | Fix a scan reporting a misleadingly "successful" empty export, reported directly right after phase 5v shipped | Done | The panel showed "Exported 0 rooms" - the success-path message, not the failure one phase 5v's sort-order fix would have produced - on an account/range already confirmed to hold 7,000+ real rooms. No checkpoint file existed for this scan, confirming it never accumulated even 1,000 rooms - ruling out data loss in the checkpoint system itself, which was separately re-verified end-to-end on request and found correct. Root cause: a second, distinct way `autoScrollAndCollectRooms()` could return an empty result successfully - the sort dropdown can be correctly set while the room-list table itself never renders a single row for the whole no-new-rooms window, which the sort-order check doesn't catch since the sort itself is fine. Fixed by throwing specifically when the loop ends via no-new-rooms *and* zero rooms were ever collected - a case that's never a legitimate empty-range answer, since even an out-of-range room would still render and be caught by the date check instead. The (common, legitimate) case of finding some rooms and then genuinely running out was left untouched. See `DESIGN.md` Decision 38. |
 | 5x. Research-grounded audit - stale-DOM read, a storage race, a "high-risk areas" map | Proactively audit the codebase against how comparable systems are documented to fail, not just react to the next reported symptom | Done | Researched real failure modes in similar systems (MV3 service workers, infinite-scroll scrapers, worker-pool task queues) before reading code, then verified every finding against this codebase directly rather than assuming the research applied. Confirmed all 7 of `background.js`'s top-level listeners are correctly synchronous (a real, documented MV3 pitfall - checked and found not to apply here). Found and fixed a genuine stale-DOM read in `getRoomCardsAndLinks()`: a room row caught mid-render (link present, name/date not yet rendered - React batches DOM updates) got marked "seen" permanently on that first, incomplete read, then silently vanished from the export forever once its null date failed the range filter - fixed by treating a not-yet-rendered row the same as a not-yet-rendered link, retried on a later scroll instead of lost. Found and fixed a real, documented storage race: `chrome.storage.local` provides no ordering guarantee for concurrent writes to the same key, and multiple worker tabs genuinely call `persistJob()` at effectively the same time - now serialized through a shared promise chain so writes can never overlap. A first version of the regression test for this had a flawed premise and was corrected after it failed, rather than the failure being papered over. Added a permanent "High-Risk Areas" reference section to `DESIGN.md`, organized by function/area instead of chronologically, so a future pass can quickly tell which parts of the codebase have needed real fixes more than once and what to check before touching them again. Full suite: 115/115. See `DESIGN.md` Decision 39. |
 | 5y. Closing the rest of the stale-DOM gap, proving neither side glosses over a room | Directly challenged: "we cannot tolerate a room being glossed over like the bug you described" - verify scanning and downloading, don't just assert they're fixed | Done | Found a second variant of phase 5x's stale-DOM bug: `getRoomCardsAndLinks()` checked that the date *element* existed but not that it had *text* yet - a present-but-empty element produces an Invalid Date, which is truthy (slides past an existence check) and fails every comparison silently, indistinguishable from a legitimately out-of-range room. Fixed the same way as before (treated as not-yet-rendered, retried). Then built a standing safeguard instead of just a second patch: the scan now tracks every room ever glimpsed as incomplete across the *whole* scan and reconciles that against what actually completed right before returning - if any room was seen but never resolved, for *any* reason (not just these two specific timing gaps), the scan now fails loudly instead of silently exporting an incomplete list. Traced by hand that this also correctly catches a room trimmed out of the DOM while still incomplete (Decision 37's DOM trimming) - a case neither original fix anticipated. On the download side, verified (rather than assumed) that `createReport()` already fully covers the equivalent risk - it walks the full original queue, not just recorded results, so a room interrupted between being claimed and given a result still gets a row, correctly marked "Waiting" - proved this with a new test that seeds a queue with a deliberately missing result and confirms the real CSV output includes it anyway. Full suite: 116/116. See `DESIGN.md` Decision 40. |
+| 5z. A third silent-"0 rooms" gap, found from real Downloads-folder evidence, plus real test coverage for the scan loop | User asked directly why no checkpoint CSV had ever appeared - answered by checking the actual filesystem, not by re-explaining what the feature was supposed to do | Done | The real evidence told a bigger story than the checkpoint question alone: the account's large 2023-2024 range had succeeded once (~7,463 rooms) but then failed with a genuine, repeatable 0-room "success" four separate times since, across multiple fix commits, while smaller ranges kept succeeding. Root cause: phase 5w's fix only checked whether *any* rooms were ever collected, not whether any fell inside the requested range - on an account with years of history before the requested range, a scan that stalls while still scrolling through that earlier history collects plenty of rooms (just none in range yet), so the old check never fired and the scan fell through as a false "success." Fixed by checking rooms actually within the requested date range at the point the loop ends via a stall, leaving the one condition that actually proves a range was reached and passed through (several consecutive out-of-range rooms) untouched. This is the third distinct time this exact loop has silently reported 0 rooms as success - pattern recognized as reason enough to add real test coverage of the loop's branching logic instead of relying on code review alone, revisiting `DESIGN.md` Decision 13's original scope-out of this file. Added a narrow, purpose-built DOM stub (not a general DOM library) and 12 new tests covering this bug directly, the prior two "0 rooms" bugs' checks, the stale-DOM-read guards, and the incomplete-room reconciliation. One test-fixture mistake (non-numeric fake room IDs silently failing the real URL-matching regex) was self-caught by tracing why a fixture produced an unexpectedly empty result, rather than accepting a passing-looking test at face value. Full suite: 128/128. See `DESIGN.md` Decision 41. |
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
 build-log framing) — this table exists so you don't have to read either in
@@ -1275,6 +1276,65 @@ here for the full story.
   report-building code, decodes the actual CSV output, and confirms
   all 3 rooms are present. Full suite: 116/116. Full reasoning in
   `DESIGN.md`'s Decision 40.
+
+#### Phase 5z: A Third Silent-"0 Rooms" Gap, Found From Real Evidence, Plus Real Test Coverage for the Scan Loop
+
+- **Started from a direct question, answered by checking real evidence
+  instead of re-explaining the feature** - "i thought you mentioned
+  csvs got downloaded gradually when scanning after like 1000 rooms so
+  far i havent seen anything." Checked the actual
+  `~/Downloads/Docusign Rooms/_Scan Lists/` folder rather than
+  answering from memory of what the checkpoint feature was supposed to
+  do.
+- **The evidence told a bigger story than the checkpoint question
+  alone.** The account's large 2023-2024 range had succeeded once
+  (~7,463 rooms, a real 850KB export) but then failed with a genuine,
+  repeatable 0-room "success" - a real header-only CSV, confirmed by
+  reading its actual contents, not a crash artifact - four separate
+  times since, spanning multiple fix commits made earlier in this same
+  session. Smaller ranges (2020, 2021) kept succeeding every time in
+  between.
+- **Root cause: the previous "did the scan find anything" check only
+  ever compared against the total rooms collected, not how many fell
+  inside the requested range.** This account's data goes back to at
+  least 2020, and the list is sorted oldest-first, so a 2023-2024 scan
+  has to scroll past thousands of earlier rooms before it ever reaches
+  one that's actually in range. If that preliminary scrolling stalls
+  for any reason before reaching the range, the total-collected count
+  is very much nonzero (thousands of real, earlier rooms) even though
+  the in-range count is genuinely zero - so the old check never fired,
+  and the scan fell through to a plain, misleadingly successful empty
+  export. This also fully explains the original checkpoint question:
+  the scan never got anywhere near collecting 1,000 in-range rooms,
+  because it never collected a single one before stalling.
+- **Fixed by checking rooms actually within the requested date range**
+  at the exact point the loop ends via a stall, leaving the one
+  legitimate proof that a range was actually reached and passed
+  through (several consecutive rooms confirmed past the end date)
+  completely untouched, so a genuinely empty range still succeeds
+  normally.
+- **This was the third distinct time this exact scan loop has silently
+  reported 0 rooms as a success** - each one only found after it
+  already happened for real. That repetition was treated as reason
+  enough to revisit an earlier scope decision (`DESIGN.md` Decision
+  13) that had deliberately left this file's DOM-driving logic outside
+  automated test coverage. Added a narrow, purpose-built fake of just
+  the DOM surface this file actually reads - not a general DOM
+  library, and not a change to how genuinely timing-dependent browser
+  behavior gets tested, which still needs a real browser - specifically
+  so the loop's own branching logic could be driven and verified
+  directly instead of trusted from code review alone.
+- **12 new tests**, including direct regression coverage of this exact
+  bug, a proof the fix doesn't overcorrect a genuinely empty range,
+  the original narrower check still working as before, and coverage of
+  the stale-DOM-read guards and incomplete-room reconciliation from the
+  two previous phases. One test-authoring mistake was self-caught along
+  the way: the first draft's fake room IDs weren't purely numeric,
+  which the real URL-matching logic correctly rejects as not a room URL
+  at all - silently producing an empty, passing-looking result instead
+  of a real one, caught by tracing *why* a supposedly working fixture
+  produced nothing rather than accepting the first explanation. Full
+  suite: 128/128. Full reasoning in `DESIGN.md`'s Decision 41.
 
 ---
 
