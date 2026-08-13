@@ -380,8 +380,8 @@
 
         // Periodic aggregate progress for the panel's Activity Log -
         // "nice visual like it was for downloads," requested directly.
-        // Deliberately a summary (rooms found/in-range/trimmed so far),
-        // not one entry per room - the download side's Activity Log
+        // Deliberately a summary (rooms found/in-range/pages fetched so
+        // far), not one entry per room - the download side's Activity Log
         // covers events like worker-tab lifecycle changes, which happen
         // at most a handful of times per run; a real per-room entry here
         // would mean tens of thousands of log lines on a large scan,

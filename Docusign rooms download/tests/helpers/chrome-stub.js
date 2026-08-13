@@ -55,7 +55,25 @@ function makeChromeStub() {
     // exactly what filename/conflictAction a download - a checkpoint
     // save, a real export, a room ZIP's routing - actually requested.
     downloadCalls: [],
-    download: async options => { downloads.downloadCalls.push(options); return {}; },
+    // Resolves with a real, distinct incrementing number - matching real
+    // chrome.downloads.download()'s actual resolved shape (a plain
+    // downloadId, not an object) - needed once background.js started
+    // relying on this value (STATE.lastCheckpointDownloadId, see its own
+    // comment on STATE) to later remove a stale checkpoint file via
+    // chrome.downloads.removeFile(). The old stub resolved with `{}`,
+    // harmless only because nothing had ever read the resolved value
+    // before that.
+    _nextDownloadId: 0,
+    download: async options => {
+      downloads.downloadCalls.push(options);
+      downloads._nextDownloadId += 1;
+      return downloads._nextDownloadId;
+    },
+    // Every call recorded (a plain array of the downloadId argument) so a
+    // test can assert exactly which download a cleanup call targeted, and
+    // that it happened (or, just as important, didn't) at all.
+    removeFileCalls: [],
+    removeFile: async downloadId => { downloads.removeFileCalls.push(downloadId); },
     search: async () => []
   };
 

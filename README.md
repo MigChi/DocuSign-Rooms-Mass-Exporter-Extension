@@ -29,10 +29,10 @@ that same guide (no GitHub account needed to view) is published at
 
 ## Features
 
-- **Auto-scan the Rooms list** — auto-switches to List View and
-  auto-selects the "Created (Oldest)" sort before scanning (both
-  required for the date-range logic to work; the extension refuses to
-  scan and explains why if either can't be set automatically).
+- **Auto-scan the Rooms list** — reads every room directly from
+  Docusign's own Rooms API (see `DESIGN.md` Decision 46), not by
+  scrolling the page; fast even on accounts with tens of thousands of
+  rooms.
 - **Manual From/To date range** — controls batch size per run without
   editing code.
 - **Scan & Export List (CSV)** — a dry-run mode: scans and saves a CSV
@@ -115,7 +115,9 @@ that same guide (no GitHub account needed to view) is published at
   rooms are actively processing across all worker tabs) regardless of
   which tab is doing the processing, and survives a Docusign page
   refresh or switching tabs — the original in-page panel died on both.
-  Scanning still requires an actual Docusign tab (it's DOM automation),
+  Scanning still requires an actual Docusign tab — not for DOM
+  automation anymore (see Decision 46), but because reading Docusign's
+  Rooms API needs same-origin access to the page's own session cookie —
   so the panel relays scan requests to it and back; see `DESIGN.md`
   Decision 24 for the full message-relay design.
 - **Per-worker-tab status breakdown** — the panel shows a live row per
@@ -208,12 +210,13 @@ opening the extension folder at all.
 | `manifest.json` | MV3 config: permissions, content script load order, service worker registration |
 | `background.js` | The service worker — queue engine, pause/resume/stop, `chrome.storage.local` persistence, CSV report generation, download-folder routing |
 | `content/utils.js` | Shared string/URL/CSV helpers with no DOM dependency — loaded by the other content scripts *and* by `background.js` via `importScripts()`, since a service worker and content scripts run in separate JS contexts and can't otherwise share code |
-| `content/scan.js` | Rooms-list scanning: scrolling, row parsing, date-range filtering, forcing List View/oldest-first sort |
+| `content/scan.js` | Rooms-list scanning: pages through Docusign's own internal Rooms API directly (`fetch()`, CSRF cookie handling), date-range filtering — no DOM scrolling or row parsing since Decision 46 |
 | `content/room.js` | Room-page helpers (currently just reading the room name from its Details page) |
 | `content.js` | DOM automation only — the single-room download pipeline (Select All → Bulk Download → confirm → wait) and the scan relay (`DS_BEGIN_SCAN`/`DS_SCAN_STOP`/`DS_SCAN_PAUSE`/`DS_SCAN_RESUME`) that lets the standalone panel trigger and control a scan it has no DOM access to run itself |
 | `panel.html` / `panel.js` | The standalone control panel window (opened via the toolbar icon), replacing the old in-page panel that used to live inside `content.js` — see `DESIGN.md` Decision 24 |
 | `package.json` | Just a `test` script (`node --test`) — no dependencies, not part of the loaded extension, exists purely so `npm test` works |
 | `tests/utils.test.js` | Tests for `content/utils.js`'s pure helpers |
+| `tests/scan.test.js` | Tests for `content/scan.js`'s API-based room scan — mocked `fetch()` and `document.cookie`, no DOM stub needed (see `DESIGN.md` Decision 46) |
 | `tests/background.test.js` | Tests for `background.js`'s pure/`STATE`-driven logic, including regression tests for several real bugs found via live testing at scale (see `DESIGN.md`) |
 | `tests/helpers/` | Minimal `chrome.*` stub and a fresh-module-load helper, both test-only — see `DESIGN.md`'s Decision 13 |
 | [`../HOW_TO_USE.md`](HOW_TO_USE.md) | Plain-language install/setup/usage guide for non-technical end users — separate from this README, which assumes an engineering audience |
@@ -297,7 +300,7 @@ summary of it, not a second copy that can drift.
 | 5. Multi-tab worker pool (concurrency) | Multiple tabs claiming from one shared queue, without a mutex | Done, fixed tab count | The index-based resume from phase 4 became actively unsafe under concurrency (could silently drop claimed-but-unfinished rooms) — replaced with "resume = queue minus anything with a result." A synchronous "already running" guard had a race window an `await` earlier had left open. Downloads stopped registering at all under concurrency; first suspected `active: false` on worker tabs, but the same symptom persisted after reverting it — the real cause was worker tabs' downloads opening in a `target="_blank"` browsing context, so `DownloadItem.tabId` never matched the tab that triggered it. The first fix's regex matched `/rooms/<id>/` but the real download URL used DocuSign's internal `/transaction/<id>/` path. Once folder routing worked again, two distinct rooms sharing the same display name were found silently merging into one folder. |
 | 5a. Automated testing | Cover the project's pure logic with a real test suite, without pretending DOM/timing-heavy code can be unit tested | Done — 78 tests as of phase 5h, `node:test`, growing as new pure logic is added | This machine had no Node/npm/Homebrew installed at all; installed Node's official `.pkg` via a GUI admin-privileges prompt (`osascript ... with administrator privileges`) since this environment's shell has no interactive `sudo`. `content/utils.js` and `background.js` were never written to be `require()`-able (plain globals / `importScripts()`, by design) - solved with guarded export tails that are no-ops in the real browser/service-worker runtime. |
 | 5b. Per-worker-tab status breakdown | Show which worker tab has which room, and a results-by-outcome tally | Done | `currentRooms` was already sent to the panel but had its tab-ID keys flattened away by `Object.values()`; `workerTabIds` (needed to label rows "Worker 1/2/3") wasn't sent at all. Both fixed by sending more of what `background.js` already had, not by inventing new tracking. |
-| 5c. 10k-scale readiness pass | Stress-test the assumptions behind "designed for 10,000 rooms" instead of just trusting the architecture | Done, persistence and dead-tab recovery confirmed live | A dead worker tab had no recovery mid-run - confirmed live by closing one (twice, including two at once), now fixed and confirmed working. The real persistence test (deliberately killing the service worker via `chrome://serviceworker-internals`, then reopening a Rooms tab) **succeeded** - confirmed twice in one session, each restart correctly resuming with a decreasing pending-room count. A stuck "Exporting CSV..." status was traced to a stale content script after an extension reload (`DESIGN.md` Decision 16) and fixed. Two risks flagged here as still open were resolved by real-scale testing later, not left open: the report-timing race (rooms that finished downloading but still showed "stuck in progress") was fixed in phase 5g; `chrome.storage.local`'s ~10MB quota (no `unlimitedStorage` permission declared) held up fine through the 8000-room run in phase 5f onward, though it remains untested at the very top of the 10k+ range this was designed for. |
+| 5c. 10k-scale readiness pass | Stress-test the assumptions behind "designed for 10,000 rooms" instead of just trusting the architecture | Done, persistence and dead-tab recovery confirmed live | A dead worker tab had no recovery mid-run - confirmed live by closing one (twice, including two at once), now fixed and confirmed working. The real persistence test (deliberately killing the service worker via `chrome://serviceworker-internals`, then reopening a Rooms tab) **succeeded** - confirmed twice in one session, each restart correctly resuming with a decreasing pending-room count. A stuck "Exporting CSV..." status was traced to a stale content script after an extension reload (`DESIGN.md` Decision 16) and fixed. Two risks flagged here as still open were resolved later, not left open: the report-timing race (rooms that finished downloading but still showed "stuck in progress") was fixed in phase 5g; `chrome.storage.local`'s ~10MB quota (no `unlimitedStorage` permission declared at this point) held up fine through the 8000-room run in phase 5f onward, and was later closed outright by adding the `unlimitedStorage` permission (`DESIGN.md` Decision 45), removing the quota ceiling entirely rather than continuing to rely on graceful degradation near the top of the 10k+ range this was designed for. |
 | 5d. Configurable worker-tab count | Manual, bounded control over concurrency (1-8) | Done | A first version of the validation function silently mishandled `null`/empty input as "the number zero" (via `Number(null) === 0`) instead of "no value provided" - caught by the tests written for it, before it ever reached live testing. A second, more consequential bug - `ensureWorkerTabs()` never *shrinking* the tab pool, so lowering the count between two runs in one session silently had no effect - was found in phase 5e's code review, not live testing. |
 | 5e. Pre-real-run review pass | Full code/logic/documentation/test audit before committing to a run larger than ~25 rooms | Done | Found the `ensureWorkerTabs()` shrink bug above and wrote up a live-confirmed "kept opening new tabs after Stop" fix that had shipped previously but was never documented. Found three pure helper functions (date-range labeling, worker-tab-count validation, activity-log event descriptions) sitting untested purely because they were written inside `content.js`'s closure instead of `content/utils.js` - moved, given real coverage, no functional change (44 → 53 tests). Along the way, a doc comment that accidentally contained the literal characters `*/` broke `content/utils.js`'s syntax - caught immediately by `node --check`, before it reached anything. |
 | 5f. First real-scale test (8000 rooms) | Actually run the tool at something close to the 10,000-room scale it was designed for, not just a ~25-room smoke test | Found two real gaps | CSV export hung forever with no error - `encodeURIComponent()` throwing on a lone UTF-16 surrogate somewhere in 8000 real room names, outside the handler's `try` block, so `sendResponse()` never fired and the caller never knew anything was wrong. Fixed with `safeEncodeURIComponent()` plus a widened `try/catch`, and the same latent bug closed in `createReport()`/`createEventLogReport()` before it could cause an identical silent failure there. Separately: scanning had no Stop/Pause at all, fine for a 25-room test that finishes in seconds, a real gap for an 8000-room scan running several minutes - added, session-scoped (not crash-persistent like the download run's). See `DESIGN.md` Decisions 20 and 21. |
@@ -325,6 +328,9 @@ summary of it, not a second copy that can drift.
 | 5ab. A standalone audit - a known-but-unfixed mode-loss risk, and an alarm that never stops ringing | "run another audit" - no new symptom, a deliberate re-read of `background.js` for the class of bug this project keeps finding | Done | Followed a comment's own loose cross-reference (from the lock-screen fix) to a real, previously-identified-but-never-actually-fixed gap: if the service worker restarts in the narrow window between a scan starting and finishing, `STATE.scanMode` (deliberately never persisted - scanning isn't resumable by design) resets to null, but the scan itself keeps running in its own tab and eventually delivers real results to a worker that's forgotten whether the user clicked "Export" or "Start." That used to silently fall through to "Start" behavior - meaning a user who only asked for a CSV export could see the "Found N rooms... Continue?" prompt that offers to kick off a full download run instead. Fixed by treating an unrecognized mode as its own real failure, reported to the user, rather than guessed at. Researched (not assumed) that `chrome.alarms` persist across a service-worker restart by default per Chrome's own documentation - confirming the scan-stall watchdog's alarm would otherwise keep waking the service worker every single minute, forever, after any mid-scan restart with no later scan to naturally replace it. Fixed by clearing it unconditionally at every service-worker startup. Also found and fixed a smaller, related gap: the map tracking in-flight report filenames was never cleaned up if a download itself failed to start, and unlike the three once-per-run exports, the scan checkpoint save (which fires repeatedly over a long scan) could have let failed entries actually accumulate. Every fix was verified by deliberately reverting it, confirming its new test failed for the right reason, then restoring the fix - not just written and trusted. Full suite: 137/137. See `DESIGN.md` Decision 43. |
 | 5ac. 0-byte documents silently blocking the Bulk Download button - found, fixed, and confirmed live | "any rooms with documents of a size of 0B will cause it so that when select all is pressed the download button does not show" | Done | Verified against real captured markup (pasted directly by the user) before writing any selector: every document row has a file-size cell, and Docusign's own Bulk Download button never renders unless at least one currently-selected document is non-zero - so a room mixing real and 0-byte documents was failing outright, even though its real documents were perfectly downloadable on their own. Fixed narrowly: the original, long-proven "click one Select All checkbox" path is untouched for rooms with no 0-byte documents; only a room that actually has one switches to selecting documents individually, skipping the 0-byte ones. First live test showed no change at all - not a logic bug, but a reminder that reloading the extension doesn't reload an already-open tab's content script. The second attempt, after an actual tab refresh, worked - confirmed live against the real room. Two further gaps were caught and closed before calling this finished, both raised directly by the user rather than found independently: the 0-byte check could run before every document row had actually rendered (the same stale-DOM class of bug already fixed twice for the room list), fixed with a poll against the group header's own document count; and a room that's genuinely, permanently unfixable (every document confirmed 0 bytes) needed its own status distinct from "Failed," since "Failed" gets silently retried on every future CSV-upload resume forever - fixed with a new "Complete (All 0 Bytes)" terminal status, threaded through the same places "Complete (Empty)" already is. 5 new tests, including one whose skip-condition fix was deliberately reverted and confirmed to fail for the right reason before being restored. Full suite: 142/142. See `DESIGN.md` Decision 44. |
 | 5ad. A second real tab crash - a silent checkpoint-naming bug, a stuck Stop button, and a watchdog that missed a 2-hour sleep | "website crashed again" ... "after the crash i press stop and the extension is stuck again" | Done | Investigated with real evidence at every step - the account had just been directly confirmed holding steady at 500 DOM rows through 13,700 rooms scanned, so this wasn't a DOM-size problem recurring. Checking the actual checkpoint files on disk turned up a separate, previously invisible bug: ten numbered files instead of one being overwritten, caused by `onDeterminingFilename`'s own `suggest()` call - the thing Chrome actually obeys for a `data:` URL - silently hardcoding "uniquify" regardless of what the checkpoint's own request for "overwrite" asked for; an existing test had real confidence in the wrong half of that mechanism the whole time. Fixed, and the test extended to actually check what gets suggested, not just what was requested. Separately, and more urgently: clicking Stop right after the crash left the extension stuck, because Stop only ever messaged the (now-dead) tab and hoped, with nothing guaranteeing an exit if that tab was already gone - fixed with a bounded 8-second wait before force-resetting state itself. Finally, reading the user's own Activity Log closely surfaced a third bug: checkpoints ran a consistent 6-12 minutes apart for eight checkpoints, then jumped to over 2 hours before the ninth - consistent with the computer sleeping through a scan - and the crash-detection watchdog never caught it, due to a real race where the scan's own resumed activity refreshed its "still alive" signal before the watchdog's next check ever got a chance to notice the gap that already happened. Fixed by giving the watchdog a second, independent signal - a gap in its own check-in schedule - that can't be raced the same way. 6 new tests, each verified against its actual regression via the same revert-confirm-restore discipline as the two audits before it. Full suite: 148/148. See `DESIGN.md` Decision 45. |
+| 5ae. Replacing the scan entirely - reading Docusign's own internal Rooms API directly instead of scrolling the page | "is there a way to ask the web page for the data within a range like in the console?" | Done | Investigated live via DevTools' Network tab, guided step by step, until the real request Docusign's own page uses to load more rooms was found and confirmed working with a direct `fetch()` call from the page's own Console - a real internal API (undocumented, but genuinely there), returning every room's ID, name, and a precise timestamp directly, sorted oldest-first, with a ready-to-follow link to the next page. A direct browser visit to the same URL failed with a CSRF error, which turned out to be useful evidence rather than a dead end - it confirmed exactly what header the real request needed and why this has to run from the actual page, not from anywhere else. Confirmed the account's real total (28,538 active rooms) directly rather than guessing, and confirmed scope (Active only, nothing else needed) before building anything. Replaced the DOM-scrolling scan entirely rather than keeping it as an untested fallback - a deliberate choice, explicitly discussed rather than assumed. The result eliminates the tab-crash problem at its root (the scan no longer asks the page to render anything at all) and, as a direct consequence, makes entire categories of this project's own past bugs structurally impossible rather than merely fixed - there's no more scrolling to stall, no sort dropdown to misread, and no such thing as a room caught "mid-render" in a JSON response. A real security moment came up twice during the investigation - DevTools panels that included live session cookies were flagged immediately both times, nothing was repeated or used, and the approach was changed to avoid a third occurrence rather than just warning about it again. 19 new tests (3 pure helper tests plus 16 scan tests), and testing became meaningfully simpler in the process, since the whole surface is now a network call and a cookie string instead of a simulated web page. Live-tested against the real account before committing (a 131-room scan, and a longer one checked mid-run to confirm the checkpoint CSV grows in place instead of duplicating). A follow-up audit found and fixed one real accuracy bug: the checkpoint-failure reminder could name a room count that didn't match what was actually in the checkpoint CSV on an account with lots of history outside the requested range. Full suite: 152/152. See `DESIGN.md` Decision 46. |
+| 5af. Stale "in progress" checkpoint files left behind after a successful scan | "it finally completed but it left a lot of inprogress scans is that meant to happen?" - reported right after the first real large scan under the new API-based scanner | Done | Traced to a real gap: nothing anywhere ever deleted a scan's checkpoint CSV once the scan actually finished. Worse for the tool's normal "Start" flow (scan then download) specifically - it never wrote any other Scan List CSV at all, so the checkpoint file, permanently named "in progress - partial," was the *only* record left behind even after both the scan and the full download run that followed had genuinely completed. Fixed by tracking the checkpoint file's real download ID and removing it from disk once its scan is confirmed to have finished successfully - unconditionally for "Start" mode, only after a real final export is confirmed written for "Export Scan List" mode, and never on an actual scan failure, where the checkpoint is the only surviving record of whatever progress was made. Found along the way: the test stub for `chrome.downloads.download()` resolved with a placeholder object instead of a real download ID, harmless until this fix needed to read that value - fixed alongside it. 6 new tests, each verified against its own regression via revert-confirm-restore. Full suite: 158/158. See `DESIGN.md` Decision 47. |
+| 5ag. A full codebase and documentation audit | "clean up documentation and tests and the codebase and audit" | Done | Split into a code audit (`background.js`/`content.js` against the API-based scan and the checkpoint-cleanup fix) and a documentation/test audit (`DESIGN.md`, README, `HOW_TO_USE.md`/`.txt`, the full test suite), each verified directly rather than trusted. Found and fixed a real mutual-exclusion gap: `DS_START_QUEUE` never checked `STATE.scanning` the way `DS_RUN_SCAN` already checked both flags, so uploading a CSV while a scan was still active would start a full download run in the same Docusign tab a scan was still reading from - fixed server-side and with a matching client-side guard on the CSV-upload button. Found a real but narrow race (a slow scan fetch past the 8-second forced-Stop timeout can make a genuinely-still-running scan's completion look like a service-worker restart) and gave it an honest fix - reworded the resulting message to name both real possible causes instead of confidently asserting the wrong one, deliberately not building a full scan-attempt-token system disproportionate to how narrow the window actually is. Cleaned up several stale docs found along the way: README's Features list still described deleted DOM-scan mechanics, `HOW_TO_USE.txt` (a plain-text mirror of `HOW_TO_USE.md`) had fallen out of sync with the `.md` file's own already-fixed scan description, two comments referenced a "Roadmap" section that was renamed to "Status" (which now says nothing further is planned), and a test-count mismatch between README and DESIGN.md for Decision 46 was reconciled. Everything else audited came back clean - no dead code, no orphaned message types, no weak or missing test coverage. 1 new regression test. Full suite: 159/159. See `DESIGN.md` Decision 48. |
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
 build-log framing) — this table exists so you don't have to read either in
@@ -1515,6 +1521,131 @@ here for the full story.
   bug - reverted, confirmed the test failed for the right reason,
   restored - before being trusted. Full suite: 148/148. Full
   reasoning in `DESIGN.md`'s Decision 45.
+
+#### Phase 5ae: Replacing the Scan Entirely - Reading Docusign's Own Internal Rooms API Directly Instead of Scrolling the Page
+
+- **Started from a sharp question**: "is there a way to ask the web
+  page for the data within a range like in the console?" Rather than
+  keep working around a crash that kept recurring at roughly the same
+  point on every attempt, this asked whether the underlying cause -
+  scrolling and rendering thousands of rooms in one long session -
+  could be avoided entirely.
+- **Investigated live, step by step, using Chrome's own DevTools** -
+  found the real network request Docusign's page itself uses to load
+  more rooms as you scroll, confirmed it with a direct call from the
+  page's own Console, and got back real room data: IDs, names, and
+  precise timestamps, sorted oldest-first, with a ready-to-follow link
+  to the next page built in. A first attempt at visiting the URL
+  directly failed with a security error - which turned out to be
+  useful, not a dead end, since it revealed exactly what else the
+  request needed.
+- **A real privacy moment came up twice along the way and was handled
+  directly** - a couple of the DevTools panels shared during this
+  investigation included live session credentials. Both times this was
+  flagged immediately, nothing was repeated or used, and the approach
+  was changed afterward specifically to stop it from happening a third
+  time, rather than just repeating the same warning.
+- **Confirmed real facts before building anything** - the account's
+  actual total (28,538 active rooms), and confirmed directly that only
+  the "Active" tab has ever actually been needed, avoiding scope creep
+  into data this tool was never meant to capture.
+- **Replaced the scrolling scan entirely**, a deliberate choice made
+  and discussed openly rather than assumed - keeping the old approach
+  around "just in case" was considered and turned down, since an
+  unused fallback nobody keeps testing is its own kind of risk.
+- **The result doesn't just fix the crash - it removes the reason for
+  it.** The scan no longer asks the page to render anything at all, so
+  several other bugs this project has hit and fixed before (a
+  misread sort order, a room caught half-loaded, an ambiguous "did it
+  really finish" stall) aren't just fixed anymore, they're no longer
+  possible in the first place, because the specific mechanism that
+  caused each one doesn't exist in this version.
+- **19 new tests** (3 pure helper tests plus 16 scan tests), and
+  testing genuinely got simpler in the process - the whole surface
+  being tested is now a network call and a plain
+  cookie string, not a simulated web page.
+- **Live-tested against the real account before anything was
+  committed** - a 131-room scan across a one-year range completed
+  correctly and fast, and a longer scan was checked twice mid-run to
+  confirm the checkpoint CSV grows in place under one stable filename
+  instead of piling up numbered duplicates.
+- **A requested follow-up audit ("double check the new scanning...
+  error handling") found and fixed one real accuracy bug**: the
+  checkpoint-failure reminder could tell the user a room count that
+  didn't match what was actually saved, because it was derived from
+  every room scanned rather than only the ones actually in the
+  requested date range - on an account with years of history outside
+  a narrow requested range, those can be very different numbers. Full
+  suite: 152/152. Full reasoning in `DESIGN.md`'s Decision 46.
+
+#### Phase 5af: Stale "In Progress" Checkpoint Files Left Behind After a Successful Scan
+
+- **Reported directly from real use**, right after the first real
+  large scan under the new API-based scanner actually finished: "it
+  finally completed but it left a lot of inprogress scans is that
+  meant to happen?"
+- **Traced to a real gap, not a misunderstanding** - nothing anywhere
+  in the codebase ever deleted a scan's checkpoint CSV once the scan
+  it belonged to actually finished. Worse for the tool's normal
+  "Start" flow (scan, then download) specifically: that mode never
+  wrote any other Scan List CSV at all, so the checkpoint file -
+  permanently named "in progress - partial" - was the *only* record
+  ever left behind, even once both the scan and the entire download
+  run after it had genuinely completed.
+- **Fixed by tracking the checkpoint file's real download ID and
+  removing it from disk once its scan is confirmed to have finished
+  successfully** - unconditionally for "Start" mode (the download run
+  about to begin doesn't depend on this file at all), only after a
+  real final export is confirmed written for "Export Scan List" mode,
+  and never on an actual scan failure, where the checkpoint file is
+  the only surviving record of whatever progress was actually made.
+- **A real gap in the test setup itself was found and fixed along the
+  way** - the test stand-in for `chrome.downloads.download()` resolved
+  with a placeholder object instead of a real download ID, harmless
+  only because nothing had ever needed to read that value before this
+  fix did.
+- **6 new tests**, each verified against its own regression the same
+  way as the audits before it - reverted, confirmed the right two
+  tests failed for the right reason, restored. Full suite: 158/158.
+  Full reasoning in `DESIGN.md`'s Decision 47.
+
+#### Phase 5ag: A Full Codebase and Documentation Audit
+
+- **Requested directly**: "clean up documentation and tests and the
+  codebase and audit" - a standalone audit, not tied to one specific
+  reported symptom this time, in the same spirit as two earlier
+  audits in this project's history.
+- **Split into a code audit and a documentation/test audit**, run in
+  parallel, each finding verified directly against the real code and
+  a real test run rather than trusted at face value.
+- **Found and fixed a real mutual-exclusion gap**: the download-run
+  starter never checked whether a scan was still active the way the
+  scan starter already checked for an active run - so uploading a CSV
+  while a scan was genuinely still running would start a full
+  download run in the same Docusign tab the scan was still reading
+  from. Fixed on both the background logic and the panel button that
+  could trigger it.
+- **Found a real but narrow race and gave it an honest fix rather than
+  a full one** - a scan that takes unusually long to acknowledge Stop
+  can, in a rare timing window, have its real completion arrive after
+  the extension already gave up tracking it, producing a status
+  message that names the wrong cause. Reworded the message to
+  honestly cover both real possible causes instead of confidently
+  naming the wrong one - deliberately not building more machinery than
+  a window this narrow actually warrants.
+- **Cleaned up several stale documentation references found along the
+  way**: the Features list still described scan mechanics that no
+  longer exist, a plain-text mirror of the setup guide had fallen out
+  of sync with its own already-corrected source and was actively
+  contradicting it, two code comments pointed at a documentation
+  section that no longer exists under that name, and a test-count
+  mismatch between this file and `DESIGN.md` was reconciled.
+- **Everything else checked came back clean** - no dead code, no
+  message types without a matching handler, no weak or missing test
+  coverage anywhere in the suite.
+- **1 new regression test**, verified the same revert-confirm-restore
+  way as every fix in this project. Full suite: 159/159. Full
+  reasoning in `DESIGN.md`'s Decision 48.
 
 ---
 

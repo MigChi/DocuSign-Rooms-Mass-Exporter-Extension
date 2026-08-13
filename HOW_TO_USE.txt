@@ -165,11 +165,11 @@ disappear or lose your progress.
    (CSV)." This scans the account and saves a list of every room that
    would be processed, without downloading anything. Use this to
    sanity-check the room count before committing to a full run.
-5. Click "Start." This first triggers a scan -- the tool automatically
-   scrolls through the Rooms list collecting every room in your date
-   range. For a large account (thousands of rooms), this can take
-   several minutes on its own. The panel's status line will update as
-   it works.
+5. Click "Start." This first triggers a scan -- the tool reads every
+   room in your date range directly, without needing to scroll through
+   the Rooms list page. Even for a large account (thousands of rooms),
+   this is typically fast. The panel's status line will update as it
+   works.
 6. When scanning finishes, a confirmation popup appears showing the
    total number of rooms found and asking "Continue?" Check that the
    number looks reasonable, then click OK to actually begin

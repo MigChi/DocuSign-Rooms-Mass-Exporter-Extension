@@ -494,6 +494,116 @@ test("DS_SCAN_COMPLETE reports a real failure instead of silently defaulting to 
   assert.ok(failedEvent, "expected a scan_failed worker event logged too");
 });
 
+test("DS_SCAN_CHECKPOINT records the resolved download ID in STATE.lastCheckpointDownloadId on a successful write (regression: needed so a later DS_SCAN_COMPLETE can remove this exact file from disk - see STATE.lastCheckpointDownloadId's own comment)", async () => {
+  const { STATE } = freshBackground();
+  STATE.scanCheckpointFilename = "Docusign Rooms/_Scan Lists/Scan List (in progress - partial).csv";
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_CHECKPOINT", rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }] },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.equal(typeof STATE.lastCheckpointDownloadId, "number");
+});
+
+test("DS_SCAN_COMPLETE (mode 'start') removes the stale checkpoint file from disk once the scan finishes successfully (regression: 'it left a lot of in progress scans' - 'start' mode never wrote its own final Scan List CSV, so a checkpoint file crossed during a large scan was never cleaned up and stayed on disk forever, permanently mislabeled 'in progress - partial' even after the scan and its download run had genuinely finished)", async () => {
+  const { STATE } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "start";
+  STATE.scanDateRangeLabel = null;
+  STATE.lastCheckpointDownloadId = 42; // simulates a checkpoint already written earlier in this scan
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_COMPLETE", rooms: [{ roomId: "1" }] },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.deepEqual(global.chrome.downloads.removeFileCalls, [42], "expected the stale checkpoint file to be removed by its download ID");
+  assert.equal(STATE.lastCheckpointDownloadId, null, "expected the ID to be cleared once handled, so a later scan never reuses it");
+});
+
+test("DS_SCAN_COMPLETE (mode 'export') removes the stale checkpoint file only once the real, final Scan List CSV export has actually succeeded", async () => {
+  const { STATE } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "export";
+  STATE.scanDateRangeLabel = null;
+  STATE.lastCheckpointDownloadId = 99;
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_COMPLETE", rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }] },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.deepEqual(global.chrome.downloads.removeFileCalls, [99]);
+});
+
+test("DS_SCAN_COMPLETE (mode 'export') does NOT remove the checkpoint file when the export itself fails (regression: must never delete the only saved backup when its intended replacement was never actually written)", async () => {
+  const { STATE } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "export";
+  STATE.scanDateRangeLabel = null;
+  STATE.lastCheckpointDownloadId = 7;
+
+  global.chrome.downloads.download = async () => { throw new Error("disk full"); };
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_COMPLETE", rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }] },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.deepEqual(global.chrome.downloads.removeFileCalls, [], "the checkpoint backup must survive a failed export, not just a failed checkpoint write");
+});
+
+test("DS_SCAN_COMPLETE with an error does NOT remove the checkpoint file (regression: on a real failure, the checkpoint is the only surviving record of whatever progress was made - it must never be deleted on this path)", async () => {
+  const { STATE } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "start";
+  STATE.lastCheckpointDownloadId = 5;
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_COMPLETE", rooms: [], error: "boom" },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.deepEqual(global.chrome.downloads.removeFileCalls, []);
+});
+
+test("DS_SCAN_COMPLETE never calls removeFile when no checkpoint was ever written for this scan (STATE.lastCheckpointDownloadId still null - a short scan that never crossed 1,000 rooms)", async () => {
+  const { STATE } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "start";
+  // STATE.lastCheckpointDownloadId intentionally left at its default (null)
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_COMPLETE", rooms: [{ roomId: "1" }] },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.deepEqual(global.chrome.downloads.removeFileCalls, []);
+});
+
 test("service worker startup clears the scan-stall watchdog alarm unconditionally, even with no persisted job (regression: chrome.alarms persist across a service-worker restart by default, confirmed against Chrome's own documentation - an orphaned alarm left over from a mid-scan restart would otherwise keep firing every minute forever, since nothing else replaces or clears it until a new scan happens to start)", () => {
   const { SCAN_WATCHDOG_ALARM } = freshBackground();
   assert.ok(global.chrome.alarms.clearCalls.includes(SCAN_WATCHDOG_ALARM), "expected the watchdog alarm to be cleared at startup");
@@ -592,6 +702,28 @@ async function waitUntil(conditionFn, timeoutMs = 5000) {
     await new Promise(resolve => setTimeout(resolve, 20));
   }
 }
+
+test("DS_START_QUEUE refuses to start a download run while a scan is in progress (regression: found in an audit - DS_RUN_SCAN already refused to start a scan while STATE.running or STATE.scanning was true, but DS_START_QUEUE only ever checked STATE.running, so a scan and a download run could end up active in the same Docusign tab at once)", async () => {
+  const { STATE } = freshBackground();
+  STATE.scanning = true;
+
+  let responded = null;
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_START_QUEUE",
+      rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }],
+      priorResults: [],
+      workerTabCount: 1
+    },
+    {},
+    response => { responded = response; }
+  );
+  await flushAsync();
+
+  assert.equal(responded?.ok, false);
+  assert.match(responded?.reason || "", /scan.*progress/i);
+  assert.equal(STATE.running, false, "must never have started the run at all");
+});
 
 test("an uncaught error inside runQueue() resets STATE.running and broadcasts DS_RUN_FAILED, instead of leaving the run stuck true forever (regression: runQueue() had no top-level try/catch, and both its call sites - DS_START_QUEUE and the startup-resume IIFE - invoke it fire-and-forget, so nothing else could ever catch an unexpected throw anywhere in ensureWorkerTabs()/runWorker()/processRoom() - see DESIGN.md)", async () => {
   const { STATE } = freshBackground();
@@ -787,7 +919,7 @@ test("DS_SCAN_ACTIVITY logs a scan_activity event and broadcasts it live via DS_
   const { STATE } = freshBackground();
 
   global.chrome.runtime.onMessage._listener(
-    { type: "DS_SCAN_ACTIVITY", totalFound: 3200, inRangeFound: 1250, totalTrimmed: 2500, final: false },
+    { type: "DS_SCAN_ACTIVITY", totalFound: 3200, inRangeFound: 1250, pagesLoaded: 64, final: false },
     {},
     () => {}
   );
@@ -798,7 +930,7 @@ test("DS_SCAN_ACTIVITY logs a scan_activity event and broadcasts it live via DS_
   assert.ok(evt, "expected a scan_activity event to be logged");
   assert.equal(evt.totalFound, 3200);
   assert.equal(evt.inRangeFound, 1250);
-  assert.equal(evt.totalTrimmed, 2500);
+  assert.equal(evt.pagesLoaded, 64);
   assert.equal(evt.final, false);
 
   const broadcast = global.chrome.runtime.sentMessages.find(m => m.type === "DS_BULK_STATUS");
@@ -811,7 +943,7 @@ test("DS_SCAN_ACTIVITY counts as sign of life for the scan-stall watchdog", asyn
   STATE.lastScanActivityAt = Date.now() - 500000; // stale, well past SCAN_STALL_THRESHOLD_MS
 
   global.chrome.runtime.onMessage._listener(
-    { type: "DS_SCAN_ACTIVITY", totalFound: 10, inRangeFound: 5, totalTrimmed: 0, final: false },
+    { type: "DS_SCAN_ACTIVITY", totalFound: 10, inRangeFound: 5, pagesLoaded: 1, final: false },
     {},
     () => {}
   );

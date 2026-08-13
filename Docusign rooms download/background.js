@@ -31,9 +31,11 @@ if (typeof importScripts === "function") {
 // 3 (worker tabs dying, chrome.storage.local's quota, DocuSign rate-
 // limiting) - letting someone dial this up to 20 before those are
 // resolved would compound exactly the risks being chased down, not help
-// diagnose them. This is a stepping stone toward Roadmap item 3's
-// original plan (suggesting a value from measured per-room timing, see
-// DESIGN.md Decision 8) - manual control now, automatic suggestion later.
+// diagnose them. Decision 8's original plan called for suggesting this
+// value from measured per-room timing rather than manual entry - that
+// half was never built (see DESIGN.md Decision 8's own note on it), and
+// per README.md's Status section this is the tool's final state, not a
+// stepping stone toward it.
 const DEFAULT_WORKER_TAB_COUNT = 3;
 const MIN_WORKER_TAB_COUNT = 1;
 const MAX_WORKER_TAB_COUNT = 8;
@@ -112,6 +114,20 @@ const STATE = {
   // scan starts, not per-checkpoint, so repeated checkpoint saves actually
   // overwrite the same file instead of each getting its own timestamp.
   scanCheckpointFilename: null,
+  // The chrome.downloads download ID from the most recent successful
+  // DS_SCAN_CHECKPOINT write for the current scan - null if no checkpoint
+  // has been written yet (a short scan that never crossed 1,000 rooms).
+  // Confirmed live as a real gap: nothing ever deleted this file once a
+  // scan finished successfully, so every scan that crossed the checkpoint
+  // threshold left a stale file behind forever, permanently mislabeled "in
+  // progress - partial" even though the scan genuinely completed - worse
+  // for a "Start" scan specifically, since that mode never wrote any other
+  // Scan List CSV at all (only "Export Scan List" does, via
+  // handleExportScanList()). DS_SCAN_COMPLETE now uses this ID to remove
+  // the stale checkpoint file via chrome.downloads.removeFile() once a scan
+  // finishes successfully - never on a failure, since the checkpoint is the
+  // only surviving record of progress in that case.
+  lastCheckpointDownloadId: null,
   // Timestamp of the most recent sign of life from an active scan
   // (DS_SCAN_PROGRESS or DS_SCAN_CHECKPOINT arriving) - what the
   // chrome.alarms-driven watchdog below compares against to detect a
@@ -150,12 +166,12 @@ const MAX_WORKER_EVENTS = 300;
 // listener, near the tab-lifecycle listeners below) and how long a scan
 // can go without any sign of life (a DS_SCAN_PROGRESS or
 // DS_SCAN_CHECKPOINT message) before it's treated as stalled. 2 minutes
-// is comfortably longer than any single legitimate step in the scan loop
-// (a scroll+wait cycle is ~1.5-2s; even the slowest normal operation -
-// waiting for the sort-order popover at scan start - is bounded well
-// under a minute), so a silence this long is a strong, safe signal
+// is comfortably longer than any single legitimate step in the scan (a
+// page fetch plus its deliberate ~200ms pacing delay - see
+// content/scan.js's PAGE_FETCH_DELAY_MS - normally completes in well
+// under a second), so a silence this long is a strong, safe signal
 // something is genuinely wrong, not a false positive from an unusually
-// slow page.
+// slow network request.
 const SCAN_WATCHDOG_ALARM = "scanStallWatchdog";
 const SCAN_STALL_THRESHOLD_MS = 2 * 60 * 1000;
 
@@ -1310,10 +1326,11 @@ async function handleExportScanList(rooms, dateRangeLabel) {
 // real DS_SCAN_COMPLETE) before concluding it's unreachable and
 // force-resetting state itself - see DS_SCAN_STOP's own comment for why
 // this exists at all. Generous enough that a genuinely alive tab (which
-// only checks scanControl.stopped once per ~1.5-2s scroll cycle) has real
-// room to respond normally without racing this, short enough that a truly
-// dead tab no longer leaves the user waiting anywhere close to the full
-// SCAN_STALL_THRESHOLD_MS (2 minutes) the passive watchdog alone would take.
+// only checks scanControl.stopped once per page fetch, normally well under
+// a second each) has real room to respond normally without racing this,
+// short enough that a truly dead tab no longer leaves the user waiting
+// anywhere close to the full SCAN_STALL_THRESHOLD_MS (2 minutes) the
+// passive watchdog alone would take.
 const SCAN_STOP_FORCE_TIMEOUT_MS = 8000;
 
 // Extracted from DS_SCAN_STOP's setTimeout callback so a test can invoke it
@@ -1350,6 +1367,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "DS_START_QUEUE") {
       if (STATE.running) {
         sendResponse({ ok: false, reason: "A download run is already active." });
+        return;
+      }
+      // Missing until found in an audit: DS_RUN_SCAN already refuses to
+      // start a new scan while STATE.scanning is true, but this handler
+      // only ever checked STATE.running - nothing stopped a download run
+      // from starting (via the panel's CSV-upload path, which has no
+      // client-side guard either) while a scan was genuinely still active
+      // in the same Docusign tab, running two independent operations
+      // against it at once.
+      if (STATE.scanning) {
+        sendResponse({ ok: false, reason: "A scan is currently in progress. Wait for it to finish (or stop it) before starting a run." });
         return;
       }
       // Reserved synchronously, before the first `await` below - the
@@ -1624,6 +1652,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // repeated checkpoint saves actually overwrite each other instead
         // of piling up a new timestamped file every time.
         STATE.scanCheckpointFilename = `Docusign Rooms/_Scan Lists/Scan List${STATE.scanDateRangeLabel ? ` (${cleanName(STATE.scanDateRangeLabel)})` : ""} (in progress - partial).csv`;
+        // Reset, not carried over from a previous scan - a stale ID here
+        // would point at a different scan's already-cleaned-up checkpoint
+        // file, or one that's since been deleted, either way not something
+        // this new scan should ever try to remove.
+        STATE.lastCheckpointDownloadId = null;
         STATE.lastScanActivityAt = Date.now();
         // Periodic alarm (minimum period Chrome allows for chrome.alarms is
         // 1 minute) - the watchdog listener below fires on this, checking
@@ -1665,9 +1698,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "DS_SCAN_PROGRESS") {
       // Doubles as the scan-stall watchdog's sign-of-life signal (see
       // SCAN_STALL_THRESHOLD_MS/the chrome.alarms listener below) - this
-      // fires on every scroll iteration under normal conditions (~every
-      // 1.5-2s), so a real gap here is a strong signal something's wrong,
-      // not just a coincidence of message timing.
+      // fires on every page fetch under normal conditions (normally well
+      // under a second each), so a real gap here is a strong signal
+      // something's wrong, not just a coincidence of message timing.
       STATE.lastScanActivityAt = Date.now();
 
       // Relay only - content scripts can't reach the standalone panel
@@ -1696,11 +1729,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Corrected during an audit: the comment on SCAN_STALL_THRESHOLD_MS
       // above has always claimed both DS_SCAN_PROGRESS *and*
       // DS_SCAN_CHECKPOINT update this, but this line was actually
-      // missing here - only DS_SCAN_PROGRESS (which happens to fire every
-      // scroll regardless, ~1.5-2s) was keeping the watchdog's sign-of-life
-      // signal accurate, purely by coincidence of timing rather than by
-      // this handler actually doing what its own neighboring comment said
-      // it did.
+      // missing here - only DS_SCAN_PROGRESS (which happens to fire
+      // regardless, once per page fetch - ~1.5-2s per DOM scroll at the
+      // time this was found, now normally well under a second per page
+      // since Decision 46's rewrite to a direct API call) was keeping the
+      // watchdog's sign-of-life signal accurate, purely by coincidence of
+      // timing rather than by this handler actually doing what its own
+      // neighboring comment said it did.
       STATE.lastScanActivityAt = Date.now();
 
       const rooms = Array.isArray(message.rooms) ? message.rooms : [];
@@ -1721,6 +1756,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         filename: STATE.scanCheckpointFilename,
         saveAs: false,
         conflictAction: "overwrite"
+      }).then(downloadId => {
+        // Recorded so DS_SCAN_COMPLETE can remove this file from disk once
+        // the scan finishes successfully - see STATE.lastCheckpointDownloadId's
+        // own comment for why that cleanup didn't exist before now.
+        STATE.lastCheckpointDownloadId = downloadId;
       }).catch(err => {
         console.warn("[DSBD] checkpoint CSV write failed", err);
         logWorkerEvent("scan_checkpoint_failed", { error: err?.message || String(err) });
@@ -1757,7 +1797,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       logWorkerEvent("scan_activity", {
         totalFound: message.totalFound,
         inRangeFound: message.inRangeFound,
-        totalTrimmed: message.totalTrimmed,
+        pagesLoaded: message.pagesLoaded,
         final: !!message.final
       });
       await broadcastStatus();
@@ -1770,9 +1810,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       STATE.scanTabId = null;
       const mode = STATE.scanMode;
       const dateRangeLabel = STATE.scanDateRangeLabel;
+      // Captured before being reset below - this is the download ID (if
+      // any) of the most recent checkpoint CSV write for this scan, kept
+      // around just long enough to remove that file from disk once this
+      // scan is confirmed to have finished successfully (see
+      // STATE.lastCheckpointDownloadId's own comment on STATE for why).
+      const checkpointDownloadIdToClean = STATE.lastCheckpointDownloadId;
       STATE.scanMode = null;
       STATE.scanDateRangeLabel = null;
       STATE.scanCheckpointFilename = null;
+      STATE.lastCheckpointDownloadId = null;
       chrome.alarms.clear(SCAN_WATCHDOG_ALARM);
 
       // content.js sets this when autoScrollAndCollectRooms() itself threw
@@ -1781,7 +1828,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // legitimately found 0 rooms, so it gets routed through the same
       // DS_SCAN_FAILED path the panel already understands (used today when
       // the scan tab gets closed mid-scan) rather than silently proceeding
-      // as if nothing were wrong.
+      // as if nothing were wrong. Deliberately does NOT clean up the
+      // checkpoint file on this path - on a real failure, it's the only
+      // surviving record of whatever progress was made.
       if (message.error) {
         logWorkerEvent("scan_failed", { error: message.error });
         chrome.runtime.sendMessage({ type: "DS_SCAN_FAILED", reason: `Scan failed: ${message.error}` }).catch(() => {});
@@ -1793,6 +1842,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (mode === "export") {
         const response = await handleExportScanList(rooms, dateRangeLabel);
         chrome.runtime.sendMessage({ type: "DS_SCAN_RESULT", mode: "export", response }).catch(() => {});
+        // Only once a real, final Scan List CSV is confirmed written -
+        // never on a failed export, which would otherwise leave the user
+        // with neither a final export nor the in-progress backup that
+        // would have covered for it.
+        if (response.ok && checkpointDownloadIdToClean) {
+          chrome.downloads.removeFile(checkpointDownloadIdToClean).catch(() => {});
+        }
       } else if (mode === "start") {
         // Deliberately NOT auto-starting the queue here - the panel still
         // shows its own confirm() dialog ("Found N rooms... Continue?")
@@ -1800,17 +1856,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // right after autoScrollAndCollectRooms() returned. Auto-starting
         // would have silently dropped that confirmation step.
         chrome.runtime.sendMessage({ type: "DS_SCAN_RESULT", mode: "start", rooms, dateRangeLabel }).catch(() => {});
+        // "start" mode never writes its own Scan List CSV (only "Export
+        // Scan List" does) - confirmed live as a real gap: without this,
+        // every "start" scan that crossed the 1,000-room checkpoint
+        // threshold left the checkpoint file behind forever, permanently
+        // mislabeled "in progress - partial" even though the scan (and
+        // often the whole download run after it) had genuinely finished.
+        // Safe to remove unconditionally here (no response.ok gate the way
+        // "export" has) - the scan itself already completed with no error,
+        // and the download run about to start has its own independent
+        // resume mechanism (STATE.queue / chrome.storage.local) that
+        // doesn't depend on this CSV existing at all.
+        if (checkpointDownloadIdToClean) {
+          chrome.downloads.removeFile(checkpointDownloadIdToClean).catch(() => {});
+        }
       } else {
         // mode is only ever "export" or "start" when a real DS_RUN_SCAN
         // request set it (see panel.js's two scan buttons) - reaching here
-        // with anything else (null, in practice) means the service worker
-        // itself restarted sometime between this scan starting and
-        // finishing: STATE.scanMode is deliberately never persisted (see
-        // its own comment on STATE - "a scan is never resumed across a
+        // with anything else (null, in practice) means something reset
+        // STATE.scanMode before this scan's own completion arrived. The
+        // originally-identified cause: the service worker itself
+        // restarted sometime between this scan starting and finishing -
+        // STATE.scanMode is deliberately never persisted (see its own
+        // comment on STATE - "a scan is never resumed across a
         // service-worker restart"), so a fresh worker has no way to know
         // which button the user originally clicked, even though the scan
         // itself, running independently in the content script the whole
         // time, finished normally and is still reporting real results.
+        // Found in a later audit: forceResetStoppedScanIfStillActive()
+        // (Decision 45) can reach the exact same state a second way - if
+        // the Docusign tab takes longer than SCAN_STOP_FORCE_TIMEOUT_MS
+        // (8s) to acknowledge a Stop click (fetchRoomsPage() has no
+        // request timeout of its own), the forced reset gives up and
+        // clears scanMode before this genuinely-still-running scan's real
+        // completion arrives afterward. The message below is deliberately
+        // worded to not assert a single specific cause, since both are
+        // real and this handler has no reliable way to tell them apart
+        // (distinguishing them would need a scan-attempt token threaded
+        // through every scan-relay message - not built, since this
+        // requires stacking two already-narrow timing windows and only
+        // produces a wording inaccuracy, not lost data or a stuck state).
         // Previously this fell through to the `else` branch above
         // unconditionally, silently treating a lost "export" (a simple
         // CSV Scan List request) as if it were "start" instead - which
@@ -1820,13 +1905,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // project's standing principle of failing loudly over guessing
         // silently at an ambiguous outcome (Decisions 36/38/41) - the
         // user just has to re-run the scan, which by this point is rare
-        // enough (a worker restart in this exact narrow window, further
-        // reduced by chrome.power.requestKeepAwake - Decision 36) to be a
-        // fair trade against the risk of an unintended download run.
-        logWorkerEvent("scan_failed", { error: "service worker restarted mid-scan - lost track of whether this was an export or start request" });
+        // enough (both underlying causes are already narrow windows, the
+        // service-worker-restart one further reduced by
+        // chrome.power.requestKeepAwake - Decision 36) to be a fair trade
+        // against the risk of an unintended download run.
+        logWorkerEvent("scan_failed", { error: "lost track of whether this was an export or start request (service worker restarted mid-scan, or a forced Stop timeout gave up on tracking this scan before its real completion arrived)" });
         chrome.runtime.sendMessage({
           type: "DS_SCAN_FAILED",
-          reason: `The scan finished (found ${rooms.length} room${rooms.length === 1 ? "" : "s"}), but the extension's background process restarted while it was running, so it lost track of whether you wanted a CSV export or to start downloading. Please run the scan again.`
+          reason: `The scan finished (found ${rooms.length} room${rooms.length === 1 ? "" : "s"}), but the extension lost track of whether you wanted a CSV export or to start downloading - either the background process restarted while it was running, or an earlier Stop click timed out and gave up on this scan before it actually finished. Please run the scan again.`
         }).catch(() => {});
       }
       return;
@@ -2174,7 +2260,7 @@ chrome.alarms.onAlarm.addListener(alarm => {
   // SCAN_STALL_THRESHOLD_MS, this alarm itself stops firing for the whole
   // duration (a suspended OS can't run scheduled tasks) - but on wake, the
   // scan tab's own content script resumes at essentially the same moment
-  // this alarm's next tick does, and if its next scroll iteration sends a
+  // this alarm's next tick does, and if its next page fetch sends a
   // DS_SCAN_PROGRESS/CHECKPOINT/ACTIVITY message (refreshing
   // STATE.lastScanActivityAt to "now") before this callback actually runs
   // and checks that value, the race is won by the scan's own refresh - the

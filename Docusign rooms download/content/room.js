@@ -8,9 +8,9 @@
  * (clickElement, selectAllDocuments, getDocumentCount, waitForSelector,
  * processCurrentRoom) still live in content.js rather than here - they
  * could move into this file for consistency, but that's a pure
- * reorganization with no functional benefit, so it's been left alone in
- * favor of the roadmap items that actually change behavior (see
- * README.md's Roadmap section).
+ * reorganization with no functional benefit, so it's been left alone
+ * (per README.md's Status section, this project is in its final state -
+ * there's no remaining roadmap this deferral is trading against).
  *
  * Depends on content/utils.js (cleanName, getRoomIdFromUrl) -
  * manifest.json must load utils.js first.

@@ -1,270 +1,308 @@
 /**************************************************************
  * tests/scan.test.js
- * Covers content/scan.js's scraping/scroll/date-range logic - previously
- * untested under Node (no module.exports tail existed until this file
- * was added). First real regression coverage for the exact bug fixed
- * here: a scan that stalls before ever reaching the requested date range
- * (found thousands of rooms, all *before* dateStart) used to fall
- * through as a silently "successful" 0-room export instead of the
- * failure it actually is - confirmed live on the real account/range this
- * kept happening on. See content/scan.js's own comment on the
- * autoScrollAndCollectRooms() check for the full reasoning.
+ * Covers content/scan.js's API-based room scan (rewritten 2026-08 - see
+ * content/scan.js's own header comment for why: a real, repeated tab
+ * crash kept happening even after DOM row count was independently
+ * confirmed bounded, strong evidence the real cause was Docusign's own
+ * app accumulating internal state as it rendered rooms, not the DOM
+ * itself - reading data directly from the same internal API the page's
+ * own infinite scroll calls, never triggering that rendering pipeline at
+ * all, removes the risk at its root).
+ *
+ * Much simpler to test than the old DOM-scrolling version: no DOM stub
+ * needed at all now (see git history for tests/helpers/dom-stub.js,
+ * retired along with the DOM-scrolling scan it existed to test) - just
+ * global.fetch, a plain document.cookie string, and window.location.
  **************************************************************/
 
-const { test, before } = require("node:test");
+const { test, before, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("path");
-const { makeRoomRow, makeDocumentStub } = require("./helpers/dom-stub.js");
 
 let scan;
 
 before(() => {
-  global.window = { location: { origin: "https://rooms.docusign.com", href: "https://rooms.docusign.com/" } };
-  require(path.join(__dirname, "..", "content", "utils.js")); // attaches cleanName/getRoomIdFromUrl/roomUrlToDocumentsUrl/sleep to globalThis
-  global.sleep = () => Promise.resolve(); // real sleep() paces scrolling at 1500ms/iteration - too slow for a 15-attempt stall test
+  global.window = { location: { origin: "https://rooms.docusign.com", href: "https://rooms.docusign.com/rooms" } };
+  require(path.join(__dirname, "..", "content", "utils.js")); // attaches cleanName/parseCookieValue/sleep to globalThis
+  global.sleep = () => Promise.resolve(); // real sleep() paces page-fetch delays - too slow for tests
   scan = require(path.join(__dirname, "..", "content", "scan.js"));
 });
 
-function setDom(doc) {
-  global.document = doc;
+beforeEach(() => {
+  global.document = { cookie: "X-DocuSign-Rooms-CSRF-Token=csrf-abc; XSRF-TOKEN=xsrf-xyz" };
+});
+
+function makeApiRoom({ roomId, roomName = `Room ${roomId}`, createdDate }) {
+  return {
+    roomId,
+    roomName,
+    address: { countryId: "US" },
+    owners: [],
+    officeId: 1,
+    latitude: 0,
+    longitude: 0,
+    createdDate,
+    closedStatusId: "",
+    isUnderContract: false,
+    status: "Active",
+    isNew: false,
+    viewingUserIsManagerOwner: false,
+    transactionSideId: "sell"
+  };
 }
 
-// ---- getRoomCardsAndLinks ----
+function makeApiPage({ rooms, nextUri = null, totalRowCount }) {
+  return {
+    rooms,
+    previousUri: null,
+    resultSetSize: rooms.length,
+    startPosition: 0,
+    endPosition: Math.max(0, rooms.length - 1),
+    nextUri,
+    priorUri: null,
+    totalRowCount: totalRowCount ?? rooms.length
+  };
+}
 
-test("getRoomCardsAndLinks reads a fully-rendered row", () => {
-  const row = makeRoomRow({ roomId: "111", name: "Test Room", dateText: "Jan 4, 2024" });
-  setDom(makeDocumentStub([row]));
+// Serves canned page objects in order, one per fetch() call, repeating the
+// last one if called more times than provided (tests assert on call count
+// directly, so over-calling would already fail loudly elsewhere). Records
+// every call (url + options) so a test can assert on headers/URLs sent.
+function mockFetchSequence(pages) {
+  let i = 0;
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url, options });
+    const page = pages[Math.min(i, pages.length - 1)];
+    i++;
+    if (page.networkError) throw new Error(page.networkError);
+    return {
+      ok: page.ok !== false,
+      status: page.status || 200,
+      json: page.jsonError
+        ? async () => { throw new Error(page.jsonError); }
+        : async () => page.body
+    };
+  };
+  return calls;
+}
 
-  const { ready, incompleteUrls } = scan.getRoomCardsAndLinks();
+test("normalizeApiRoom converts an API room object into this project's standard shape", () => {
+  const room = scan.normalizeApiRoom({ roomId: 2438591, roomName: "Podd - Listing", createdDate: "2019-09-04T18:50:51.833Z" });
 
-  assert.equal(ready.length, 1);
-  assert.equal(incompleteUrls.length, 0);
-  assert.equal(ready[0].roomId, "111");
-  assert.equal(ready[0].roomName, "Test Room");
-  assert.equal(ready[0].createdDate.getUTCFullYear(), 2024);
+  assert.equal(room.roomId, "2438591", "roomId must be a string, matching every other room-shape producer in this codebase");
+  assert.equal(room.roomName, "Podd - Listing");
+  assert.equal(room.documentsUrl, "https://rooms.docusign.com/rooms/2438591/documents");
+  assert.equal(room.createdDate.toISOString(), "2019-09-04T18:50:51.833Z");
 });
 
-test("getRoomCardsAndLinks treats a missing name element as incomplete, not a placeholder room", () => {
-  const row = makeRoomRow({ roomId: "222", dateText: "Jan 4, 2024" }); // name left undefined
-  setDom(makeDocumentStub([row]));
+test("normalizeApiRoom falls back to a generated name when roomName is missing, and null for a missing createdDate", () => {
+  const room = scan.normalizeApiRoom({ roomId: 42, roomName: "", createdDate: null });
 
-  const { ready, incompleteUrls } = scan.getRoomCardsAndLinks();
-
-  assert.equal(ready.length, 0);
-  assert.equal(incompleteUrls.length, 1);
+  assert.equal(room.roomName, "Docusign Room 42");
+  assert.equal(room.createdDate, null);
 });
 
-test("getRoomCardsAndLinks treats a present-but-empty date element as incomplete (Invalid Date guard)", () => {
-  // dateEl exists but its text hasn't painted in yet - real element,
-  // empty string. new Date("") is a truthy Invalid Date; this must be
-  // caught before it ever reaches a room object, not after.
-  const row = makeRoomRow({ roomId: "333", name: "Test Room", dateText: "" });
-  setDom(makeDocumentStub([row]));
+test("fetchRoomsPage sends the CSRF cookie values as request headers (regression: a plain navigation to this same URL fails with 'Could not validate CSRF token' - confirmed live - this header is what a real fetch needs to succeed where that failed)", async () => {
+  const calls = mockFetchSequence([{ body: makeApiPage({ rooms: [] }) }]);
 
-  const { ready, incompleteUrls } = scan.getRoomCardsAndLinks();
+  await scan.fetchRoomsPage("https://rooms.docusign.com/restapi/vdev/rooms?count=50");
 
-  assert.equal(ready.length, 0);
-  assert.deepEqual(incompleteUrls, ["https://rooms.docusign.com/rooms/333/documents"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.headers["X-DocuSign-Rooms-CSRF-Token"], "csrf-abc");
+  assert.equal(calls[0].options.headers["X-XSRF-TOKEN"], "xsrf-xyz");
+  assert.equal(calls[0].options.credentials, "same-origin");
 });
 
-test("getRoomCardsAndLinks dedupes rows sharing the same documentsUrl", () => {
-  const rowA = makeRoomRow({ roomId: "444", name: "Room A", dateText: "Jan 4, 2024" });
-  const rowB = makeRoomRow({ roomId: "444", name: "Room A", dateText: "Jan 4, 2024" }); // same id -> same documentsUrl
-  setDom(makeDocumentStub([rowA, rowB]));
-
-  const { ready } = scan.getRoomCardsAndLinks();
-
-  assert.equal(ready.length, 1);
-});
-
-// ---- trimOldRoomRows ----
-
-test("trimOldRoomRows removes only the oldest rows past the keep threshold, returns count removed", () => {
-  const rows = Array.from({ length: 10 }, (_, i) => makeRoomRow({ roomId: String(i) }));
-  const doc = makeDocumentStub(rows);
-  setDom(doc);
-
-  const removed = scan.trimOldRoomRows(4);
-
-  assert.equal(removed, 6);
-  assert.equal(doc._rows.length, 4);
-  assert.deepEqual(doc._rows.map(r => r.roomId), ["6", "7", "8", "9"]); // newest (last-loaded) 4 kept
-});
-
-test("trimOldRoomRows removes nothing and returns 0 when under the keep threshold", () => {
-  const rows = Array.from({ length: 3 }, (_, i) => makeRoomRow({ roomId: String(i) }));
-  const doc = makeDocumentStub(rows);
-  setDom(doc);
-
-  const removed = scan.trimOldRoomRows(4);
-
-  assert.equal(removed, 0);
-  assert.equal(doc._rows.length, 3);
-});
-
-// ---- autoScrollAndCollectRooms ----
-
-test("autoScrollAndCollectRooms throws (does not silently export 0 rooms) when the scan stalls before ever reaching the requested range", async () => {
-  // Reproduces the real bug: an account with lots of pre-range history
-  // (here, 20 rooms dated 2020) where the scan stalls - no new rows ever
-  // load - before it ever scrolls far enough to reach the 2023-2024
-  // range actually requested. collected.length is nonzero (20), but none
-  // of it is in range - this must fail loudly, not export an empty CSV.
-  const preRangeRows = Array.from({ length: 20 }, (_, i) =>
-    makeRoomRow({ roomId: String(1000 + i), name: `Old Room ${i}`, dateText: "Jan 1, 2020" })
-  );
-  setDom(makeDocumentStub(preRangeRows)); // no onScroll - nothing new ever loads
+test("fetchRoomsPage throws a clear error on a network-level failure", async () => {
+  mockFetchSequence([{ networkError: "getaddrinfo ENOTFOUND" }]);
 
   await assert.rejects(
-    () => scan.autoScrollAndCollectRooms(null, { start: new Date("2023-01-01"), end: new Date("2024-12-31") }),
+    () => scan.fetchRoomsPage("https://rooms.docusign.com/restapi/vdev/rooms"),
+    /Could not reach Docusign's room list.*network error/
+  );
+});
+
+test("fetchRoomsPage throws a clear error on a non-2xx HTTP response", async () => {
+  mockFetchSequence([{ ok: false, status: 403, body: {} }]);
+
+  await assert.rejects(
+    () => scan.fetchRoomsPage("https://rooms.docusign.com/restapi/vdev/rooms"),
+    /HTTP 403/
+  );
+});
+
+test("fetchRoomsPage throws a clear error when the response body isn't valid JSON", async () => {
+  mockFetchSequence([{ jsonError: "Unexpected token" }]);
+
+  await assert.rejects(
+    () => scan.fetchRoomsPage("https://rooms.docusign.com/restapi/vdev/rooms"),
+    /wasn't valid data/
+  );
+});
+
+test("fetchRoomsPage throws a clear, specific error for a 200 OK response with no 'rooms' array (regression: confirmed live - a CSRF rejection comes back as {\"message\":\"Could not validate CSRF token.\",...} with HTTP 200, not an error status, so status alone can't catch this)", async () => {
+  mockFetchSequence([{ ok: true, status: 200, body: { message: "Could not validate CSRF token.", referenceId: "abc-123" } }]);
+
+  await assert.rejects(
+    () => scan.fetchRoomsPage("https://rooms.docusign.com/restapi/vdev/rooms"),
+    /Could not validate CSRF token/
+  );
+});
+
+test("autoScrollAndCollectRooms follows nextUri across multiple pages until it's empty, returning every in-range room", async () => {
+  mockFetchSequence([
+    { body: makeApiPage({
+        rooms: [makeApiRoom({ roomId: 1, createdDate: "2023-01-05T00:00:00.000Z" }), makeApiRoom({ roomId: 2, createdDate: "2023-02-01T00:00:00.000Z" })],
+        nextUri: "https://rooms.docusign.com/restapi/vdev/rooms?startPosition=2"
+      }) },
+    { body: makeApiPage({
+        rooms: [makeApiRoom({ roomId: 3, createdDate: "2023-03-01T00:00:00.000Z" })],
+        nextUri: null
+      }) }
+  ]);
+
+  const result = await scan.autoScrollAndCollectRooms(null, { start: new Date("2023-01-01"), end: new Date("2023-12-31") });
+
+  assert.equal(result.length, 3);
+  assert.deepEqual(result.map(r => r.roomId), ["1", "2", "3"]);
+});
+
+test("autoScrollAndCollectRooms stops paging once 5 consecutive rooms are confirmed past the date range, without fetching further pages", async () => {
+  const outOfRangeRooms = Array.from({ length: 5 }, (_, i) => makeApiRoom({ roomId: 100 + i, createdDate: "2025-01-01T00:00:00.000Z" }));
+  const calls = mockFetchSequence([
+    { body: makeApiPage({
+        rooms: [makeApiRoom({ roomId: 1, createdDate: "2023-06-01T00:00:00.000Z" }), ...outOfRangeRooms],
+        nextUri: "https://rooms.docusign.com/restapi/vdev/rooms?startPosition=6" // must never actually be fetched
+      }) }
+  ]);
+
+  const result = await scan.autoScrollAndCollectRooms(null, { start: new Date("2023-01-01"), end: new Date("2023-12-31") });
+
+  assert.equal(result.length, 1, "only the one genuinely in-range room should be returned");
+  assert.equal(calls.length, 1, "must stop after the first page once the streak is confirmed, not follow nextUri further");
+});
+
+test("autoScrollAndCollectRooms calls onCheckpoint/onActivity at the 1,000-room cadence, and once more at the end", async () => {
+  const page1Rooms = Array.from({ length: 1000 }, (_, i) => makeApiRoom({ roomId: i, createdDate: "2023-01-01T00:00:00.000Z" }));
+  const page2Rooms = Array.from({ length: 5 }, (_, i) => makeApiRoom({ roomId: 1000 + i, createdDate: "2023-01-02T00:00:00.000Z" }));
+
+  mockFetchSequence([
+    { body: makeApiPage({ rooms: page1Rooms, nextUri: "https://rooms.docusign.com/restapi/vdev/rooms?startPosition=1000" }) },
+    { body: makeApiPage({ rooms: page2Rooms, nextUri: null }) }
+  ]);
+
+  const checkpoints = [];
+  const activity = [];
+
+  const result = await scan.autoScrollAndCollectRooms(
+    null,
+    { start: new Date("2022-01-01"), end: new Date("2023-12-31") },
+    null,
+    rooms => checkpoints.push(rooms),
+    evt => activity.push(evt)
+  );
+
+  assert.equal(result.length, 1005);
+  assert.equal(checkpoints.length, 1, "expected exactly one checkpoint, crossing 1,000 on the first page");
+  assert.equal(checkpoints[0].length, 1000);
+
+  assert.equal(activity.length, 2, "expected one periodic report plus one final report");
+  assert.equal(activity[0].final, false);
+  assert.equal(activity[0].totalFound, 1000);
+  assert.equal(activity[1].final, true);
+  assert.equal(activity[1].totalFound, 1005);
+  assert.equal(activity[1].inRangeFound, 1005);
+});
+
+test("autoScrollAndCollectRooms stops when scanControl.stopped is true, returning whatever was already collected", async () => {
+  mockFetchSequence([
+    { body: makeApiPage({ rooms: [makeApiRoom({ roomId: 1, createdDate: "2023-01-01T00:00:00.000Z" })], nextUri: "https://rooms.docusign.com/restapi/vdev/rooms?startPosition=1" }) },
+    { body: makeApiPage({ rooms: [makeApiRoom({ roomId: 2, createdDate: "2023-01-02T00:00:00.000Z" })], nextUri: "https://rooms.docusign.com/restapi/vdev/rooms?startPosition=2" }) }
+  ]);
+
+  const scanControl = { stopped: false, paused: false };
+  const statuses = [];
+  const updateStatus = text => {
+    statuses.push(text);
+    if (text?.startsWith("Loading rooms")) scanControl.stopped = true; // simulate Stop being clicked mid-scan
+  };
+
+  const result = await scan.autoScrollAndCollectRooms(updateStatus, { start: new Date("2023-01-01"), end: new Date("2023-12-31") }, scanControl);
+
+  assert.equal(result.length, 1, "only the first page's room should have been collected before Stop took effect");
+  assert.ok(statuses.includes("Scan stopped."));
+});
+
+test("autoScrollAndCollectRooms propagates a real fetch failure mid-pagination as a throw, not a silently incomplete result", async () => {
+  mockFetchSequence([
+    { body: makeApiPage({ rooms: [makeApiRoom({ roomId: 1, createdDate: "2023-01-01T00:00:00.000Z" })], nextUri: "https://rooms.docusign.com/restapi/vdev/rooms?startPosition=1" }) },
+    { ok: false, status: 500, body: {} }
+  ]);
+
+  await assert.rejects(
+    () => scan.autoScrollAndCollectRooms(null, { start: new Date("2023-01-01"), end: new Date("2023-12-31") }),
+    /HTTP 500/
+  );
+});
+
+test("autoScrollAndCollectRooms's thrown error reminds the user a checkpoint was already saved, once real progress has actually crossed the 1,000-room threshold (regression: requested directly - 'ensure if a failure happens things are getting recorded' - a failure after real checkpointed progress must not read like a total loss)", async () => {
+  const page1Rooms = Array.from({ length: 1000 }, (_, i) => makeApiRoom({ roomId: i, createdDate: "2023-01-01T00:00:00.000Z" }));
+
+  mockFetchSequence([
+    { body: makeApiPage({ rooms: page1Rooms, nextUri: "https://rooms.docusign.com/restapi/vdev/rooms?startPosition=1000" }) },
+    { ok: false, status: 500, body: {} } // fails on the page *after* crossing the checkpoint
+  ]);
+
+  await assert.rejects(
+    () => scan.autoScrollAndCollectRooms(null, { start: new Date("2023-01-01"), end: new Date("2023-12-31") }),
     err => {
-      assert.match(err.message, /stalled/i);
-      assert.match(err.message, /20 room/);
-      assert.doesNotMatch(err.message, /No rooms loaded after scrolling/); // must be the new, more specific message, not the old "nothing ever loaded" one
+      assert.match(err.message, /HTTP 500/, "the real underlying failure reason must still be present");
+      assert.match(err.message, /Progress through 1000 in-range rooms was already saved/, "must reassure the user real progress was already checkpointed");
       return true;
     }
   );
 });
 
-test("autoScrollAndCollectRooms still throws its original message when literally nothing ever loads", () => {
-  setDom(makeDocumentStub([])); // zero rows, ever
-
-  return assert.rejects(
-    () => scan.autoScrollAndCollectRooms(null, { start: new Date("2023-01-01"), end: new Date("2024-12-31") }),
-    /No rooms loaded after scrolling for a while/
-  );
-});
-
-test("autoScrollAndCollectRooms returns an empty result (no throw) for a range genuinely scrolled all the way through with nothing in it", async () => {
-  // Proves the fix didn't overcorrect: outOfRangeStreak firing is the one
-  // signal that actually proves the range was reached and passed through
-  // - a genuinely empty range must still succeed with [], not be treated
-  // as a stall failure.
-  const rows = [
-    ...Array.from({ length: 3 }, (_, i) => makeRoomRow({ roomId: String(2000 + i), name: `Before ${i}`, dateText: "Jan 1, 2022" })),
-    ...Array.from({ length: 5 }, (_, i) => makeRoomRow({ roomId: String(3000 + i), name: `After ${i}`, dateText: "Feb 1, 2023" }))
-  ];
-  setDom(makeDocumentStub(rows));
-
-  const result = await scan.autoScrollAndCollectRooms(null, { start: new Date("2022-06-01"), end: new Date("2022-06-30") });
-
-  assert.deepEqual(result, []);
-});
-
-test("autoScrollAndCollectRooms returns matching rooms on a normal scan that ends via a genuine stall after finding real in-range results", async () => {
-  const rows = Array.from({ length: 5 }, (_, i) =>
-    makeRoomRow({ roomId: String(4000 + i), name: `Room ${i}`, dateText: "Jun 1, 2021" })
-  );
-  setDom(makeDocumentStub(rows));
-
-  const result = await scan.autoScrollAndCollectRooms(null, { start: new Date("2021-01-01"), end: new Date("2021-12-31") });
-
-  assert.equal(result.length, 5);
-  assert.deepEqual(result.map(r => r.roomId).sort(), ["4000", "4001", "4002", "4003", "4004"]);
-});
-
-test("autoScrollAndCollectRooms throws if a room stays incomplete (name/date never render) for the rest of the scan", async () => {
-  const goodRows = Array.from({ length: 3 }, (_, i) =>
-    makeRoomRow({ roomId: String(5000 + i), name: `Room ${i}`, dateText: "Jun 1, 2021" })
-  );
-  const stuckRow = makeRoomRow({ roomId: "5999", dateText: "Jun 1, 2021" }); // name never arrives, ever
-  setDom(makeDocumentStub([...goodRows, stuckRow]));
+test("autoScrollAndCollectRooms's thrown error does NOT falsely claim a checkpoint exists when the failure happens before the first 1,000-room threshold is ever crossed", async () => {
+  mockFetchSequence([
+    { ok: false, status: 500, body: {} } // fails on the very first page - nothing was ever checkpointed
+  ]);
 
   await assert.rejects(
-    () => scan.autoScrollAndCollectRooms(null, { start: new Date("2021-01-01"), end: new Date("2021-12-31") }),
-    /could not be fully read/
+    () => scan.autoScrollAndCollectRooms(null, { start: new Date("2023-01-01"), end: new Date("2023-12-31") }),
+    err => {
+      assert.match(err.message, /HTTP 500/);
+      assert.doesNotMatch(err.message, /already saved/, "must not claim a checkpoint exists when none was ever written");
+      return true;
+    }
   );
 });
 
-test("autoScrollAndCollectRooms picks up a room that starts incomplete but finishes rendering on a later scroll", async () => {
-  const stuckRow = makeRoomRow({ roomId: "6000", dateText: "Jun 1, 2021" }); // name missing at first
-  const doc = makeDocumentStub([stuckRow], {
-    onScroll(d) {
-      // Simulate the row finishing its render one scroll later - replace
-      // the incomplete row with a complete one sharing the same roomId
-      // (same documentsUrl), the way a real re-render would.
-      if (d._rows.includes(stuckRow) && stuckRow._filled !== true) {
-        stuckRow._filled = true;
-        d._rows = d._rows.map(r => (r === stuckRow ? makeRoomRow({ roomId: "6000", name: "Late Room", dateText: "Jun 1, 2021" }) : r));
-        d._rows.forEach(r => { r._doc = d; });
-      }
-    }
-  });
-  setDom(doc);
+test("autoScrollAndCollectRooms's thrown error does NOT falsely claim a checkpoint exists when 1,000 rooms were scanned but all of them were outside the requested date range (regression: the account has years of history before the requested range, so an ascending scan from position 0 can cross a 1,000-room checkpoint boundary while the checkpoint CSV itself is still empty - collected.length alone can't tell the difference, only the actual in-range count handed to onCheckpoint can)", async () => {
+  const tooOldRooms = Array.from({ length: 1000 }, (_, i) => makeApiRoom({ roomId: i, createdDate: "2015-01-01T00:00:00.000Z" }));
 
-  const result = await scan.autoScrollAndCollectRooms(null, { start: new Date("2021-01-01"), end: new Date("2021-12-31") });
+  mockFetchSequence([
+    { body: makeApiPage({ rooms: tooOldRooms, nextUri: "https://rooms.docusign.com/restapi/vdev/rooms?startPosition=1000" }) },
+    { ok: false, status: 500, body: {} } // fails right after crossing the 1,000-room *scanned* mark, but 0 of them were in-range
+  ]);
+
+  await assert.rejects(
+    () => scan.autoScrollAndCollectRooms(null, { start: new Date("2023-01-01"), end: new Date("2023-12-31") }),
+    err => {
+      assert.match(err.message, /HTTP 500/);
+      assert.doesNotMatch(err.message, /already saved/, "1,000 rooms scanned but 0 in-range must not be reported as saved progress");
+      return true;
+    }
+  );
+});
+
+test("autoScrollAndCollectRooms works correctly with onCheckpoint/onActivity omitted entirely (optional parameters, existing callers unaffected)", async () => {
+  mockFetchSequence([
+    { body: makeApiPage({ rooms: [makeApiRoom({ roomId: 1, createdDate: "2023-01-01T00:00:00.000Z" })], nextUri: null }) }
+  ]);
+
+  const result = await scan.autoScrollAndCollectRooms(null, { start: new Date("2023-01-01"), end: new Date("2023-12-31") });
 
   assert.equal(result.length, 1);
-  assert.equal(result[0].roomName, "Late Room");
-});
-
-// ---- onActivity (scan-side Activity Log reporting) ----
-
-test("autoScrollAndCollectRooms calls onActivity at the same 1,000-room cadence as onCheckpoint, then once more with final:true when the scan ends", async () => {
-  // Loads 3 batches of 350 rooms (1,050 total) via onScroll, one batch per
-  // scroll, then stops loading anything new - simulates a scan that
-  // crosses the 1,000-room checkpoint threshold partway through and then
-  // legitimately runs out of new rooms. DOM_TRIM_KEEP (500) is smaller
-  // than the running total well before the threshold is crossed, so
-  // trimming is also genuinely exercised here, not just the checkpoint
-  // cadence.
-  let batchesLoaded = 0;
-  const doc = makeDocumentStub([], {
-    onScroll(d) {
-      if (batchesLoaded >= 3) return; // permanent stall after 1,050 rooms
-      const batch = Array.from({ length: 350 }, (_, i) =>
-        makeRoomRow({ roomId: String(7000 + batchesLoaded * 350 + i), name: `Room ${i}`, dateText: "Jun 1, 2021" })
-      );
-      batch.forEach(row => d.addRow(row));
-      batchesLoaded++;
-    }
-  });
-  setDom(doc);
-
-  const activityEvents = [];
-  const onActivity = evt => activityEvents.push(evt);
-
-  const result = await scan.autoScrollAndCollectRooms(null, { start: new Date("2021-01-01"), end: new Date("2021-12-31") }, null, null, onActivity);
-
-  assert.equal(result.length, 1050, "sanity check: all 1,050 rooms should have been collected and be in range");
-
-  assert.equal(activityEvents.length, 2, "expected exactly one periodic report (crossing 1,000) plus one final report");
-
-  const [periodic, final] = activityEvents;
-  assert.equal(periodic.final, false);
-  assert.equal(periodic.totalFound, 1050);
-  assert.equal(periodic.inRangeFound, 1050);
-  assert.ok(periodic.totalTrimmed > 0, "DOM_TRIM_KEEP (500) should already have been exceeded and trimmed by the time 1,050 rooms have loaded");
-
-  assert.equal(final.final, true);
-  assert.equal(final.totalFound, 1050);
-  assert.equal(final.inRangeFound, 1050);
-  assert.ok(final.totalTrimmed >= periodic.totalTrimmed, "trimming only ever accumulates, never resets");
-});
-
-test("autoScrollAndCollectRooms still calls onActivity once, with final:true, on a scan that never reaches the 1,000-room checkpoint threshold at all", async () => {
-  const rows = Array.from({ length: 5 }, (_, i) =>
-    makeRoomRow({ roomId: String(8000 + i), name: `Room ${i}`, dateText: "Jun 1, 2021" })
-  );
-  setDom(makeDocumentStub(rows)); // nothing more ever loads
-
-  const activityEvents = [];
-  await scan.autoScrollAndCollectRooms(null, { start: new Date("2021-01-01"), end: new Date("2021-12-31") }, null, null, evt => activityEvents.push(evt));
-
-  assert.equal(activityEvents.length, 1, "a small scan should still get exactly one, final activity report - not zero");
-  assert.equal(activityEvents[0].final, true);
-  assert.equal(activityEvents[0].totalFound, 5);
-  assert.equal(activityEvents[0].inRangeFound, 5);
-  assert.equal(activityEvents[0].totalTrimmed, 0, "5 rooms never exceeds DOM_TRIM_KEEP (500), so nothing should have been trimmed");
-});
-
-test("autoScrollAndCollectRooms works correctly with onActivity omitted entirely (optional parameter, existing callers unaffected)", async () => {
-  const rows = Array.from({ length: 3 }, (_, i) =>
-    makeRoomRow({ roomId: String(9000 + i), name: `Room ${i}`, dateText: "Jun 1, 2021" })
-  );
-  setDom(makeDocumentStub(rows));
-
-  const result = await scan.autoScrollAndCollectRooms(null, { start: new Date("2021-01-01"), end: new Date("2021-12-31") });
-
-  assert.equal(result.length, 3);
 });

@@ -83,9 +83,16 @@ function getRoomIdFromUrl(url = window.location.href) {
 /**
  * Normalize any room-related URL into the canonical
  * ".../rooms/<id>/documents" form. Returns null if `url` isn't a room URL
- * at all (e.g. an unrelated nav link) - callers use that null to skip the
- * element. Called once per row inside content/scan.js's
- * getRoomCardsAndLinks().
+ * at all (e.g. an unrelated nav link) - callers use that null to skip it.
+ * Used by background.js's DS_START_QUEUE handler as a fallback for a room
+ * object that arrives with a bare `url`/`href` instead of an already
+ * -normalized `documentsUrl` (defensive - today's two real producers,
+ * a live scan and parseUploadedCsv() below, both already set
+ * documentsUrl directly, but this covers a differently-shaped room object
+ * without silently dropping it). No longer used by content/scan.js itself
+ * - the API-based scan (2026-08) builds documentsUrl directly from the
+ * API's own roomId instead of reading it off a DOM link (see scan.js's
+ * normalizeApiRoom()).
  */
 function roomUrlToDocumentsUrl(url) {
     try {
@@ -252,6 +259,25 @@ function isZeroByteSizeText(text) {
 }
 
 /**
+ * Extracts a named cookie's value from a raw document.cookie-style string
+ * ("a=1; b=2; c=3"), or null if not present. Pure string parsing - kept
+ * here rather than content/scan.js so it has real test coverage; the
+ * actual document.cookie read (which needs a real DOM) stays in
+ * content/scan.js's getCookieValue(), the same split already used for
+ * isZeroByteSizeText() above. Added for the API-based scan (2026-08),
+ * which needs to read Docusign's own CSRF cookie
+ * (X-DocuSign-Rooms-CSRF-Token) and echo it back as a request header -
+ * a standard double-submit CSRF pattern, confirmed live as required: a
+ * plain navigation to the same URL (no custom header, cookies only)
+ * fails with "Could not validate CSRF token."
+ */
+function parseCookieValue(cookieString, name) {
+    const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = String(cookieString || "").match(new RegExp("(?:^|; )" + escaped + "=([^;]*)"));
+    return match ? decodeURIComponent(match[1]) : null;
+}
+
+/**
  * Coerces a raw "Worker tabs" panel input value (a string from an
  * <input type="number">, possibly "") into a safe integer in [min, max],
  * falling back to `fallback` for anything not a real number. Mirrors
@@ -298,8 +324,12 @@ function describeWorkerEvent(evt) {
       case "scan_tab_closed":
         return `Scan cancelled: tab ${evt.tabId} was closed`;
       case "scan_activity": {
+        // pagesLoaded (API pages fetched) replaced totalTrimmed (DOM rows
+        // trimmed) once scanning moved from DOM scrolling to reading
+        // Docusign's own Rooms API directly (2026-08) - there's no more
+        // DOM to trim at all, so that number stopped being meaningful.
         const label = evt.final ? "Scan finished" : "Scan progress";
-        return `${label}: ${evt.totalFound} room${evt.totalFound === 1 ? "" : "s"} found so far (${evt.inRangeFound} in range), ${evt.totalTrimmed} DOM row${evt.totalTrimmed === 1 ? "" : "s"} trimmed`;
+        return `${label}: ${evt.totalFound} room${evt.totalFound === 1 ? "" : "s"} found so far (${evt.inRangeFound} in range), ${evt.pagesLoaded} page${evt.pagesLoaded === 1 ? "" : "s"} fetched`;
       }
       case "scan_checkpoint_failed":
         return `Checkpoint CSV save failed: ${evt.error}`;
@@ -440,6 +470,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatCreatedDateForCsv,
     roomCreatedYear,
     isZeroByteSizeText,
+    parseCookieValue,
     parseWorkerTabCountInput,
     describeWorkerEvent,
     parseUploadedCsv

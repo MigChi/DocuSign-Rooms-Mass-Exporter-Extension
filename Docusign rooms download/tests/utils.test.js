@@ -248,6 +248,32 @@ test("isZeroByteSizeText returns false for missing/empty/unrecognized text, neve
   assert.equal(utils.isZeroByteSizeText("Loading..."), false);
 });
 
+test("parseCookieValue extracts a named cookie's value from a raw document.cookie-style string (regression: the API-based scan needs to read Docusign's own CSRF cookie and echo it back as a request header - confirmed live as required, a plain navigation without it fails with 'Could not validate CSRF token')", () => {
+  const cookieString = "ds_a=abc; X-DocuSign-Rooms-CSRF-Token=6f2cffc2-50e0-4cd8-ad82-27476e64680c; XSRF-TOKEN=CfDJ8Dhve3LY";
+  assert.equal(utils.parseCookieValue(cookieString, "X-DocuSign-Rooms-CSRF-Token"), "6f2cffc2-50e0-4cd8-ad82-27476e64680c");
+  assert.equal(utils.parseCookieValue(cookieString, "XSRF-TOKEN"), "CfDJ8Dhve3LY");
+  assert.equal(utils.parseCookieValue(cookieString, "ds_a"), "abc");
+});
+
+test("parseCookieValue returns null for a missing cookie, empty string, or missing input, never throws", () => {
+  assert.equal(utils.parseCookieValue("a=1; b=2", "c"), null);
+  assert.equal(utils.parseCookieValue("", "a"), null);
+  assert.equal(utils.parseCookieValue(null, "a"), null);
+  assert.equal(utils.parseCookieValue(undefined, "a"), null);
+});
+
+test("parseCookieValue URL-decodes the value, and doesn't match a cookie name that only appears as a substring of a different cookie's name", () => {
+  assert.equal(utils.parseCookieValue("a=hello%20world", "a"), "hello world");
+  // "XSRF-TOKEN=" appears as a literal substring inside "X-XSRF-TOKEN=..."
+  // too (right after the "X-") - a naive, unanchored search for
+  // "XSRF-TOKEN=" would incorrectly match there instead of the real
+  // "XSRF-TOKEN" cookie later in the string. The (?:^|; ) anchor exists
+  // specifically to rule this out - confirmed by both real cookies
+  // actually coexisting on the real Docusign page.
+  const cookieString = "X-XSRF-TOKEN=wrong-value; XSRF-TOKEN=right-value";
+  assert.equal(utils.parseCookieValue(cookieString, "XSRF-TOKEN"), "right-value");
+});
+
 test("parseWorkerTabCountInput passes through an in-range integer string unchanged", () => {
   assert.equal(utils.parseWorkerTabCountInput("3", 1, 8, 3), 3);
   assert.equal(utils.parseWorkerTabCountInput("1", 1, 8, 3), 1);
@@ -347,12 +373,12 @@ test("describeWorkerEvent describes every logWorkerEvent() type background.js ac
   // to the generic default (raw event type, no real detail) in the actual
   // Activity Log a user would see, not just untested.
   assert.equal(
-    utils.describeWorkerEvent({ type: "scan_activity", totalFound: 3200, inRangeFound: 1250, totalTrimmed: 2500, final: false }),
-    "Scan progress: 3200 rooms found so far (1250 in range), 2500 DOM rows trimmed"
+    utils.describeWorkerEvent({ type: "scan_activity", totalFound: 3200, inRangeFound: 1250, pagesLoaded: 64, final: false }),
+    "Scan progress: 3200 rooms found so far (1250 in range), 64 pages fetched"
   );
   assert.equal(
-    utils.describeWorkerEvent({ type: "scan_activity", totalFound: 1, inRangeFound: 1, totalTrimmed: 0, final: true }),
-    "Scan finished: 1 room found so far (1 in range), 0 DOM rows trimmed"
+    utils.describeWorkerEvent({ type: "scan_activity", totalFound: 1, inRangeFound: 1, pagesLoaded: 1, final: true }),
+    "Scan finished: 1 room found so far (1 in range), 1 page fetched"
   );
   assert.equal(
     utils.describeWorkerEvent({ type: "scan_checkpoint_failed", error: "QUOTA_BYTES exceeded" }),

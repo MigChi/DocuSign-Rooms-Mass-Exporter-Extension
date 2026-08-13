@@ -253,6 +253,18 @@ csvInput.addEventListener("change", async () => {
   csvInput.value = "";
   if (!file) return;
 
+  // Missing until found in an audit - the "Scan & Export List" button
+  // already refuses to start while scanInProgress/isRunning, but this
+  // path had no such guard at all, client- or server-side (background.js's
+  // DS_START_QUEUE didn't check STATE.scanning either - fixed there too).
+  // Without this, uploading a CSV while a scan was still running would
+  // start a full download run in the same Docusign tab a scan was still
+  // actively reading from.
+  if (scanInProgress || isRunning) {
+    setStatus("A scan or run is already in progress.");
+    return;
+  }
+
   setStatus(`Reading ${file.name}...`);
 
   const text = await file.text();

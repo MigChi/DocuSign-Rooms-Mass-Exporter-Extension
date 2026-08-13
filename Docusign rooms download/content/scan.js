@@ -1,204 +1,134 @@
 /**************************************************************
  * content/scan.js
- * Room-LIST scanning: finds every room row on the Rooms list page,
- * scrolls to load more, and filters by a caller-supplied created-date
- * range (set via the panel's own date inputs, not hardcoded here).
+ * Room-LIST scanning: reads every room in the account directly from
+ * Docusign's own internal Rooms API and filters by a caller-supplied
+ * created-date range (set via the panel's own date inputs, not
+ * hardcoded here).
  *
- * Depends on content/utils.js (cleanName, getRoomIdFromUrl,
- * roomUrlToDocumentsUrl, sleep) - manifest.json must load utils.js
- * first. Does not depend on content/room.js or content.js; nothing in
- * this file cares what page you're processing, only the list page.
+ * Rewritten from a DOM-scrolling scraper to a direct API reader
+ * (2026-08) after a real, repeated tab crash ("Aw, Snap!") kept
+ * recurring even after DOM row count was independently confirmed
+ * bounded (trimOldRoomRows() - see git history) - strong evidence the
+ * crash's real cause was Docusign's own React app accumulating internal
+ * state as it *rendered* rooms, not the DOM itself, something no amount
+ * of DOM cleanup on this extension's side could ever reach. Reading data
+ * directly from the same internal endpoint the page's own infinite
+ * scroll calls - never triggering that rendering pipeline at all -
+ * removes the risk at its root instead of mitigating it further.
+ *
+ * Confirmed live, 2026-08, via the user's own DevTools Network tab
+ * capture (not assumed or reverse-engineered from documentation - none
+ * exists, this is an internal, undocumented endpoint):
+ *   GET https://rooms.docusign.com/restapi/vdev/rooms
+ *     ?count=50&sort=createddate&roomStatus=Active&ownedOnly=False
+ *     &restrictSides=True&dateRangeType=None&closingStatus=All
+ *     &startPosition=0
+ * Response shape: { rooms: [...], nextUri, previousUri, resultSetSize,
+ * startPosition, endPosition, totalRowCount }. Each room object includes
+ * roomId, roomName, and createdDate as a precise ISO 8601 timestamp -
+ * confirmed sorted oldest-first with sort=createddate (matches the same
+ * ascending-order requirement the old DOM scan depended on the page's
+ * own sort dropdown for - this version controls it directly via the
+ * query string instead of trusting a UI control's current state).
+ * nextUri is a complete, ready-to-fetch URL for the next page - the scan
+ * below just follows it until it's empty (genuinely no more data) rather
+ * than computing offsets itself.
+ *
+ * Requires a same-origin custom header (X-DocuSign-Rooms-CSRF-Token,
+ * confirmed live - a plain navigation to this URL fails with "Could not
+ * validate CSRF token") matching a cookie of the same name - a standard
+ * double-submit CSRF pattern, which is exactly why this has to run as a
+ * content script on the actual Rooms page (same origin, real session
+ * cookies) rather than from anywhere else. X-XSRF-TOKEN is sent
+ * alongside it from the standard ASP.NET antiforgery cookie, in case the
+ * API ever prefers that one instead - harmless to send both.
+ *
+ * Undocumented and internal - Docusign has made no commitment this stays
+ * stable. Every response is checked for the expected shape before being
+ * trusted; any HTTP failure, CSRF rejection, or unexpected shape throws
+ * immediately with a clear reason rather than silently producing a wrong
+ * or incomplete result (per this project's standing "no room glossed
+ * over" requirement) - deliberately replacing the old DOM-scrolling scan
+ * entirely rather than keeping it as an untested fallback, a choice made
+ * directly rather than assumed.
+ *
+ * Depends on content/utils.js (cleanName, parseCookieValue, sleep) -
+ * manifest.json must load utils.js first.
  **************************************************************/
 
-/**
- * Confirmed (via DevTools computed-style check, 2026-08) that this page
- * has no internally-scrolling wrapper - the Rooms list scrolls with the
- * plain document, not a nested div. document.scrollingElement is the
- * browser's own reference to whatever the document scrolls (~always
- * <html>); documentElement is a fallback for browsers without it.
- */
-function getScrollContainer() {
-    return document.scrollingElement || document.documentElement;
+/** Reads a named cookie's current value via document.cookie - the DOM
+ * read this needs to be a content script for; the actual parsing is
+ * pure and lives in content/utils.js's parseCookieValue() so it has real
+ * test coverage. */
+function getCookieValue(name) {
+  return parseCookieValue(document.cookie, name);
 }
 
 /**
- * Reads the current value of the Rooms list's own "Created (Oldest)" /
- * "Created (Newest)" sort control. The entire skip/collect/stop
- * date-range algorithm below depends on the list being sorted oldest
- * first - this is not a fixed property of the account, it can be either
- * direction depending on what was last selected, so it must be checked
- * at scan time rather than assumed.
+ * Turns one raw room object from the API response into this project's
+ * standard room shape ({roomId, roomName, documentsUrl, createdDate}) -
+ * the same shape every other part of this codebase (background.js,
+ * content/utils.js's parseUploadedCsv, etc.) already expects. roomId is
+ * coerced to a string - the API returns it as a JSON number, but every
+ * comparison elsewhere in this codebase (Set/Map keys, CSV round-trips)
+ * assumes a string, the same type getRoomIdFromUrl()'s regex match
+ * always produced. documentsUrl is built directly from roomId rather
+ * than read off any link, since there's no DOM element to read it from
+ * anymore. createdDate parses directly from the API's own ISO 8601
+ * timestamp - unambiguous cross-locale, unlike the old DOM scan's
+ * "8/23/2019"-style text that had to be trusted to parse correctly.
  */
-function getSortLabel() {
-  return document.querySelector('[data-qa="filter-sort-drop-down-button"] span[title]')?.getAttribute("title") || null;
+function normalizeApiRoom(apiRoom) {
+  const roomId = String(apiRoom.roomId);
+  const roomName = cleanName(apiRoom.roomName || `Docusign Room ${roomId}`);
+  const documentsUrl = `${window.location.origin}/rooms/${roomId}/documents`;
+  const createdDate = apiRoom.createdDate ? new Date(apiRoom.createdDate) : null;
+  return { roomId, roomName, documentsUrl, createdDate };
 }
 
 /**
- * The Rooms page has two view modes toggled by button[data-qa="grid"] /
- * button[data-qa="list"] (data-selected="true" on whichever is active).
- * getRoomCardsAndLinks() only knows how to read the List View markup
- * (tr[data-qa="room-list-row"]) - Grid View uses a completely different
- * card layout (div[data-qa="room-card"]) with none of those rows, which
- * is why a scan run in Grid View silently found 0 rooms. Rather than
- * maintain two parallel sets of selectors, force List View before every
- * scan.
+ * Fetches one page of the Rooms API and validates its shape before
+ * trusting it - an internal, undocumented endpoint deserves more
+ * suspicion than a documented one, not less. Three distinct failure
+ * modes, each with its own clear, actionable message rather than one
+ * generic "something went wrong": a network-level failure (fetch()
+ * itself rejects), a non-2xx HTTP response, and a 2xx response that
+ * doesn't actually contain a `rooms` array - confirmed live as a real
+ * shape for this last case: {"message":"Could not validate CSRF
+ * token.","referenceId":"..."} comes back with a 200 status, not an
+ * error status code, so status alone isn't enough to catch it.
  */
-function ensureListView() {
-  const listButton = document.querySelector('button[data-qa="list"]');
-  if (!listButton || listButton.getAttribute("data-selected") === "true") return;
-  listButton.click();
-}
-
-/**
- * The sort control isn't a native <select> - it's a button that opens a
- * portal-rendered div[role="listbox"] of button[data-qa="option-<label>"]
- * options (confirmed via the opened-menu markup, 2026-08). Setting the
- * value takes a click to open it, then a click on the matching option.
- * Polls briefly for the option to appear since the popover renders after
- * the click, not synchronously with it.
- */
-async function ensureOldestSort() {
-  if (getSortLabel() === "Created (Oldest)") return;
-
-  const trigger = document.querySelector('[data-qa="filter-sort-drop-down-button"]');
-  if (!trigger) return;
-  trigger.click();
-
-  let option = null;
-  for (let i = 0; i < 10 && !option; i++) {
-    await sleep(200);
-    option = document.querySelector('[data-qa="option-Created (Oldest)"]');
-  }
-  option?.click();
-  await sleep(300);
-}
-
-/**
- * Core scraper for the Rooms LIST page. Reads every currently-rendered
- * tr[data-qa="room-list-row"], pulls {roomId, roomName, documentsUrl,
- * createdDate} out of each fully-rendered one, dedupes by documentsUrl,
- * and returns { ready, incompleteUrls }: `ready` is that array; `incompleteUrls`
- * lists the documentsUrl of every row that has a real link but is still
- * missing its name/date content this pass (see the inline comment where
- * that's checked) - `autoScrollAndCollectRooms()` below tracks these
- * across the whole scan to detect a room that never finishes rendering
- * before the scan itself ends, not just to retry it silently. Only sees
- * rows that have loaded into the DOM so far - that's why
- * autoScrollAndCollectRooms() calls this again after every scroll, not
- * just once.
- */
-function getRoomCardsAndLinks() {
-  const rows = [...document.querySelectorAll('tr[data-qa="room-list-row"]')];
-
-  // Every row with a real link that this pass could NOT read as a
-  // complete room - name/date element missing, or present but still
-  // empty (see below). Deliberately kept even though rows here are
-  // expected to be picked up again on a later call once they finish
-  // rendering: autoScrollAndCollectRooms() unions this across the whole
-  // scan and, at the very end, checks whether any of these URLs *never*
-  // made it into a real result - a room that stays stuck incomplete for
-  // the entire rest of the scan is exactly the silent-loss scenario a
-  // per-iteration retry alone can't catch, and it needs to be reported,
-  // not just quietly retried forever.
-  const incompleteUrls = [];
-
-  const rooms = rows.map(row => {
-    const link = row.querySelector('a[href]');
-    if (!link) return null;
-
-    const documentsUrl = roomUrlToDocumentsUrl(link.href);
-    if (!documentsUrl) return null;
-
-    const roomId = getRoomIdFromUrl(documentsUrl);
-
-    // Both required, not optional, for a row to count as read at all -
-    // a documented real risk with scraping infinite-scroll/virtualized
-    // lists under a framework that batches its DOM updates (confirmed
-    // against how other scrapers hit this same class of bug): a row can
-    // exist in the DOM - <tr> present, link present - a few render passes
-    // before its own child content (name, date) has actually painted in.
-    // The previous version fell back to a placeholder name and a null
-    // date for a row caught in that state, which is far worse than it
-    // looks: autoScrollAndCollectRooms() dedupes by documentsUrl the
-    // *first* time a room is ever seen, so a room read mid-render got
-    // permanently marked "already seen" right then - it would never be
-    // re-read later once its real date actually rendered, and a null
-    // createdDate fails the final date-range filter, so the room just
-    // silently vanished from the export entirely. Returning null here
-    // instead - exactly like the "no link yet" case above already did -
-    // means a not-yet-rendered row is simply skipped *this* iteration and
-    // picked up again on a later one, once getRoomCardsAndLinks() re-runs
-    // and finds it fully populated (the whole reason this function is
-    // re-called after every scroll instead of once).
-    const nameEl = row.querySelector('strong[data-qa="room-name"]');
-    const dateEl = row.querySelector('strong[data-qa="room-date"]');
-    // dateEl *existing* isn't enough on its own - a React element can be
-    // created before its own text child paints in, so an empty-but-present
-    // date element is just as much "not ready yet" as a missing one.
-    // new Date("") is an Invalid Date, which is a real object (truthy) -
-    // it would slip straight past a plain `!dateEl` check and then fail
-    // every comparison in the final range filter silently, indistinguishable
-    // from a room that's legitimately out of range. Checked here, at the
-    // source, instead of trusting every downstream comparison to happen
-    // to handle Invalid Date correctly.
-    const dateText = dateEl?.textContent?.trim();
-    if (!nameEl || !dateText) {
-      if (documentsUrl) incompleteUrls.push(documentsUrl);
-      return null;
-    }
-
-    const roomName = nameEl.getAttribute("title") || `Docusign Room ${roomId}`;
-    const createdDate = new Date(dateText);
-
-    return { roomId, roomName: cleanName(roomName), documentsUrl, createdDate };
-  }).filter(Boolean);
-
-  // Get unique rooms based on documentsUrl
-  const unique = [];
-  const seen = new Set();
-
-  for (const room of rooms) {
-    if (!seen.has(room.documentsUrl)) {
-        seen.add(room.documentsUrl);
-        unique.push(room);
-    }
+async function fetchRoomsPage(url) {
+  let response;
+  try {
+    response = await fetch(url, {
+      credentials: "same-origin",
+      headers: {
+        "X-DocuSign-Rooms-CSRF-Token": getCookieValue("X-DocuSign-Rooms-CSRF-Token") || "",
+        "X-XSRF-TOKEN": getCookieValue("XSRF-TOKEN") || ""
+      }
+    });
+  } catch (e) {
+    throw new Error(`Could not reach Docusign's room list (network error: ${e?.message || e}) - check your internet connection and try again.`);
   }
 
-  return { ready: unique, incompleteUrls };
-}
+  if (!response.ok) {
+    throw new Error(`Docusign's room list returned an error (HTTP ${response.status}) - make sure you're still logged into Docusign and on the Rooms list page, then try again.`);
+  }
 
-/**
- * Removes all but the most recently-rendered `keepLastN` room rows from
- * the DOM. Docusign's Rooms list is a plain infinite-scroll page - every
- * room ever loaded stays in the DOM forever, nothing is recycled as you
- * scroll past it. Confirmed live as a real, serious bug: on a large
- * account, the tab itself crashes (or hangs unresponsive) partway through
- * a long scan, once enough rooms have piled up that the browser can't
- * keep holding and re-rendering all of them - not tied to any specific
- * date, just to how much has accumulated by that point. Safe to call
- * mid-scan because autoScrollAndCollectRooms() below has already copied
- * anything it needs out of the DOM into its own JS-side accumulator
- * before this ever runs, so nothing is lost by removing a row here.
- * Removes from the *start* of the list (the oldest-loaded rows, furthest
- * above the viewport, since the list is sorted oldest-first and new rows
- * always load at the bottom) - `keepLastN` is a generous buffer meant to
- * stay well clear of whatever Docusign's own infinite-scroll trigger is
- * watching near the bottom of the rendered list, which this code has no
- * way to inspect directly. If a scan ever seems to stall out right after
- * a trim (rather than for a genuine end-of-data reason - see
- * noNewRoomAttempts below), that buffer is the first thing to widen.
- * Returns how many rows were actually removed (0 if under the keep
- * threshold) - autoScrollAndCollectRooms() accumulates this across the
- * whole scan and reports it periodically, so trimming's effect on DOM
- * size is something the user can actually see happening, not just a
- * silent internal detail to trust blindly.
- */
-function trimOldRoomRows(keepLastN) {
-  const rows = [...document.querySelectorAll('tr[data-qa="room-list-row"]')];
-  if (rows.length <= keepLastN) return 0;
-  const toRemove = rows.slice(0, rows.length - keepLastN);
-  toRemove.forEach(row => row.remove());
-  return toRemove.length;
+  let data;
+  try {
+    data = await response.json();
+  } catch (e) {
+    throw new Error("Docusign's room list returned something that wasn't valid data - try again in a moment.");
+  }
+
+  if (!Array.isArray(data?.rooms)) {
+    const detail = typeof data?.message === "string" ? `: "${data.message}"` : "";
+    throw new Error(`Docusign's room list didn't return the expected data${detail} - try refreshing the Rooms list page and starting the scan again. If this keeps happening, the extension may need updating to match a change on Docusign's side.`);
+  }
+
+  return data;
 }
 
 /**
@@ -226,271 +156,159 @@ async function waitIfScanPausedOrStopped(scanControl, updateStatus) {
  * listener when the standalone panel window (panel.js) requests a scan,
  * passing the date range it read from its own date inputs
  * (`{ start: Date, end: Date }`, relayed through background.js since the
- * panel has no DOM access of its own - see DESIGN.md Decision 24) - this
- * used to be a pair of hardcoded module constants; now the caller
- * controls batch size directly instead of needing a code edit per run.
+ * panel has no DOM access of its own - see DESIGN.md Decision 24).
  *
  * `scanControl` (optional, `{ stopped, paused }`) lets the panel's
- * Start/Stop and Pause/Resume buttons interrupt a long scan - confirmed
- * live as a real gap at real scale: an 8000-room scan has no way to stop
- * or pause it once started, only Ctrl+scroll-and-wait. Checked once per
- * loop iteration (before the next scroll), not continuously - pausing or
- * stopping takes effect within one scroll cycle (~1.5-2s), not instantly,
- * which is a fine tradeoff against polling more aggressively. Stopping
- * mid-scan still returns whatever rooms were collected up to that point
- * (the same `getRoomCardsAndLinks().filter(...)` call after the loop runs
- * whether the loop finished naturally or was interrupted) rather than an
- * empty list - a stopped scan's partial results are still usable.
+ * Start/Stop and Pause/Resume buttons interrupt a scan - checked once per
+ * page fetch, not continuously; pausing or stopping takes effect within
+ * one fetch cycle, which is now typically well under a second instead of
+ * the old ~1.5-2s scroll cycle.
  *
- * Forces List View via ensureListView() first (Grid View has no readable
- * rows for getRoomCardsAndLinks()), then attempts to set the sort to
- * "Created (Oldest)" via ensureOldestSort(). Still refuses to run
- * (throws) if that didn't stick - checked via getSortLabel() - since
- * the whole skip/collect/stop algorithm below depends on ascending order
- * and a UI change could silently break the auto-select without breaking
- * the safety check. Also throws if the sort *did* stick but the table
- * never renders a single row for the whole noNewRoomAttempts window -
- * confirmed live as a real, distinct case from the sort-order one (an
- * account/range already known to hold thousands of rooms produced a
- * silently "successful" 0-room export instead), so it gets the same
- * failure treatment rather than being read as a genuinely empty range.
- * Otherwise repeatedly scrolls the container found by
- * getScrollContainer() and re-runs getRoomCardsAndLinks() until either:
- * no new rooms appear for several tries (noNewRoomAttempts), or several
- * consecutive rooms are found past dateRange.end (outOfRangeStreak) -
- * valid as a stop signal only because the list is confirmed ascending by
- * this point. Deliberately has no scroll-count ceiling (see DESIGN.md
- * Decision 35) - `outOfRangeStreak` is the one signal that actually means
- * "done." Periodically trims already-seen rows out of the DOM (see
- * trimOldRoomRows()) so a large account's tab doesn't crash under its own
- * weight - confirmed live as a real, serious failure ("Aw, Snap!") on a
- * ~13,000-room scan - which is why results are now accumulated into a
- * JS-side array as the scan progresses instead of only ever being read
- * back out of the DOM at the very end; the DOM can no longer be trusted
- * to still hold everything once trimming is in play. `onCheckpoint`
- * (optional) is called periodically with everything collected so far,
- * filtered to the requested range - lets the caller save real progress to
- * disk during a long scan rather than only at the very end, so an
- * interruption doesn't lose hours of work the way a tab crash otherwise
- * would (this session's own next real request, raised alongside the
- * crash report). `onActivity` (optional) fires at the same 1,000-room
- * cadence as `onCheckpoint`, plus once more right before returning - a
- * periodic aggregate ("N rooms found so far, M in range, T DOM rows
- * trimmed"), not a per-room diary, which would be both impractical to
- * render and pointless to read at this project's real scale
- * (13,000+ rooms) - lets the caller surface scan progress through the
- * same Activity Log the download side already has, requested directly:
- * "kinda like you did for the download... nice visual like it was for
- * downloads." Before returning, reconciles every room ever glimpsed
- * as an incomplete row (a real link, but name/date never finished
- * rendering - see getRoomCardsAndLinks()) against what actually made it
- * into the final result, and throws if any never resolved - explicitly
- * requested after the fact: "we cannot tolerate a room being glossed
- * over." A per-iteration retry alone only handles a room that *later*
- * completes; this is the check that catches one that never does.
+ * Pages through the API oldest-first (sort=createddate, confirmed
+ * ascending - see this file's own header comment) by following each
+ * response's `nextUri` until it's empty - a genuinely, structurally
+ * reliable "done" signal, unlike the old DOM scan's "no new rooms after
+ * several scroll attempts," which could mean either "actually done" or
+ * "still loading, just slow this once" with no way to tell them apart.
+ * Stops early via `outOfRangeStreak` once several consecutive rooms are
+ * confirmed past `dateRange.end` - valid only because the list is
+ * confirmed ascending. `onCheckpoint`/`onActivity` (both optional) fire
+ * at the same 1,000-room cadence as before, for the same reasons (see
+ * DESIGN.md Decisions 37/42) - periodic checkpoint saves and Activity
+ * Log entries, not a per-room diary.
+ *
+ * Notably absent, on purpose, compared to the old DOM-based version:
+ * no sort-order check (the API call controls sort directly via its own
+ * query string, not by trusting a UI dropdown's current state), and no
+ * incomplete-row reconciliation (every room in a JSON API response is
+ * complete and atomic by construction - there's no such thing as a
+ * "mid-render" API response the way a virtualized-list DOM row could be
+ * caught mid-paint, which is what that whole mechanism existed to catch
+ * - see DESIGN.md Decisions 39/40 for the bug class this structurally
+ * can no longer happen). Any real failure (network, HTTP, unexpected
+ * shape) throws from fetchRoomsPage() and propagates straight out of
+ * this function, same as before.
+ *
  * Returns the final list, filtered to [dateRange.start, dateRange.end].
  */
 async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = null, onCheckpoint = null, onActivity = null) {
-    ensureListView();
-    await sleep(500);
+  const { start: dateStart, end: dateEnd } = dateRange;
 
-    await ensureOldestSort();
+  // Confirmed live, 2026-08 - the exact size the page's own infinite
+  // scroll requests. Untested whether a larger count is accepted; not
+  // worth risking an unconfirmed value when this one is proven working.
+  const PAGE_SIZE = 50;
+  // Same threshold the old DOM-scrolling scan used, kept unchanged - but
+  // what it actually means in wall-clock time changed completely with
+  // this rewrite. The old scan's own comment estimated "a crash loses at
+  // most a few minutes of progress" for this same 1,000-room gap (at
+  // ~7.3 rooms/scroll and a ~1.5-2s scroll cycle); at PAGE_SIZE rooms per
+  // fetch and PAGE_FETCH_DELAY_MS between them, reaching another 1,000
+  // rooms now takes on the order of a few seconds, not minutes - the
+  // real gap between checkpoints shrank by roughly two orders of
+  // magnitude as a direct side effect of no longer scrolling at all.
+  const CHECKPOINT_EVERY = 1000;
+  // A deliberate, modest pause between page fetches - not required for
+  // correctness (no rate-limit response has been observed), but
+  // reasonable restraint against an undocumented, internal endpoint this
+  // project has no formal agreement to call at any particular rate.
+  const PAGE_FETCH_DELAY_MS = 200;
 
-    const sortLabel = getSortLabel();
+  const collected = [];
+  let roomsSinceCheckpoint = 0;
+  let outOfRangeStreak = 0;
+  let stoppedEarly = false;
+  let pageCount = 0;
+  // The in-range room count actually written to the checkpoint CSV as of
+  // the most recent onCheckpoint() call - not collected.length, which also
+  // counts rooms scanned outside the requested date range. Ascending scans
+  // starting from position 0 on an account with years of history read
+  // straight through every too-old room before ever reaching the requested
+  // range, so "1,000 rooms collected" and "rooms actually in the saved
+  // checkpoint CSV" can be very different numbers, especially early in a
+  // long scan over a narrow recent range.
+  let lastCheckpointInRangeCount = 0;
 
-    if (sortLabel !== "Created (Oldest)") {
-      // Thrown, not returned as an empty result - confirmed live as a real,
-      // confusing gap: a `return []` here was indistinguishable downstream
-      // from a genuine "this date range really has zero rooms" outcome,
-      // since content.js's DS_BEGIN_SCAN handler only treats a *throw* as a
-      // failure worth reporting (see its own comment) - an empty array
-      // takes the normal success path straight through to a real, silently
-      // unhelpful 0-room CSV export. This case isn't "no rooms match" at
-      // all; it means the scan couldn't even start, most often because the
-      // page isn't in the state a scan needs it to be in - logged out,
-      // reloaded, or reset to a different sort/view since the panel was
-      // last used, which can happen after the tab sat backgrounded through
-      // a system sleep/lock-screen interruption. Throwing routes this
-      // through the existing DS_SCAN_FAILED path instead, which reports a
-      // real, visible reason rather than a status line easy to miss if
-      // nobody's watching when it happens.
-      throw new Error(`Set the sort dropdown to "Created (Oldest)" before scanning (currently: ${sortLabel || "unknown"}) - if you weren't expecting this, make sure you're still logged into Docusign and on the Rooms list page.`);
+  let url = `${window.location.origin}/restapi/vdev/rooms?count=${PAGE_SIZE}&sort=createddate&roomStatus=Active&ownedOnly=False&restrictSides=True&dateRangeType=None&closingStatus=All&startPosition=0`;
+
+  while (url) {
+    if (!(await waitIfScanPausedOrStopped(scanControl, updateStatus))) {
+      updateStatus?.("Scan stopped.");
+      stoppedEarly = true;
+      break;
     }
 
-    const { start: dateStart, end: dateEnd } = dateRange;
-
-    const scrollContainer = getScrollContainer();
-
-    // Accumulated independently of the live DOM, not read back out of it
-    // at the end the way this used to work - trimOldRoomRows() below means
-    // the DOM can no longer be trusted to still hold everything that's
-    // ever been seen. `seenUrls` is what makes trimming safe: a room
-    // that's already been recorded and then removed from the DOM won't be
-    // mistaken for "new" the next time getRoomCardsAndLinks() reads
-    // whatever's currently rendered.
-    const seenUrls = new Set();
-    // Every documentsUrl ever seen as an incomplete row (a real link, but
-    // name/date not yet rendered) across the *whole* scan, not just the
-    // current iteration - see getRoomCardsAndLinks()'s own comment. A row
-    // that's incomplete on one pass is expected to complete on a later
-    // one; a room whose URL is still in here but never made it into
-    // `seenUrls` by the time the scan ends is the residual case that
-    // matters - checked explicitly right before returning, below.
-    const everIncompleteUrls = new Set();
-    const collected = [];
-    let roomsSinceCheckpoint = 0;
-    // Total rows ever removed by trimOldRoomRows() below, across the whole
-    // scan - purely for onActivity reporting (see this function's own
-    // comment); trimOldRoomRows() itself doesn't need this, it only ever
-    // looks at the DOM's current state.
-    let totalTrimmed = 0;
-
-    let noNewRoomAttempts = 0;
-    let totalScrolls = 0;
-    let outOfRangeStreak = 0
-    let stoppedEarly = false;
-
-    // Keeps the DOM from ever growing much past this many rendered room
-    // rows, regardless of how many the scan has collected in total by
-    // that point - see trimOldRoomRows()'s own comment for why, and why
-    // this specific number is a generous-but-arbitrary buffer rather than
-    // a value confirmed safe against Docusign's own scroll-trigger logic.
-    const DOM_TRIM_KEEP = 500;
-    // How many newly-collected rooms trigger a checkpoint save. Chosen so
-    // a crash loses at most a few minutes of progress (~1000 rooms at this
-    // account's observed ~7.3 rooms/scroll is roughly 137 scrolls, ~3-4
-    // minutes) without checkpointing so often that it floods the Downloads
-    // folder / downloads shelf with saves on a long scan.
-    const CHECKPOINT_EVERY = 1000;
-
-    while (noNewRoomAttempts < 15) {
-      if (!(await waitIfScanPausedOrStopped(scanControl, updateStatus))) {
-        updateStatus?.("Scan stopped.");
-        stoppedEarly = true;
-        break;
+    // Enriched here, not inside fetchRoomsPage() itself, specifically so
+    // the reminder is only ever added when it's actually true - a failure
+    // on the very first page (before any checkpoint could possibly exist
+    // yet) must not tell the user to go check for one. Uses
+    // lastCheckpointInRangeCount (the exact in-range count actually handed
+    // to onCheckpoint last time), not collected.length or any number
+    // derived from it - those count every room scanned regardless of date
+    // range, which can badly overstate what's actually sitting in the
+    // checkpoint CSV on an account with years of history outside the
+    // requested range (see this variable's own comment above).
+    let data;
+    try {
+      data = await fetchRoomsPage(url);
+    } catch (error) {
+      if (lastCheckpointInRangeCount > 0) {
+        throw new Error(`${error.message} Progress through ${lastCheckpointInRangeCount} in-range room${lastCheckpointInRangeCount === 1 ? "" : "s"} was already saved to a checkpoint CSV in Downloads / Docusign Rooms / _Scan Lists (filename ending "in progress - partial").`);
       }
+      throw error;
+    }
+    pageCount++;
 
-      const { ready: domRooms, incompleteUrls } = getRoomCardsAndLinks();
-      incompleteUrls.forEach(url => everIncompleteUrls.add(url));
-      const newRooms = domRooms.filter(room => !seenUrls.has(room.documentsUrl));
+    const totalRowCount = typeof data.totalRowCount === "number" ? data.totalRowCount : null;
+    updateStatus?.(`Loading rooms... found ${collected.length + data.rooms.length} total${totalRowCount ? ` of ${totalRowCount}` : ""} (page ${pageCount})`);
 
-      // Includes the scroll count now that nothing bounds how long this
-      // loop can legitimately run for a large account - without it, a
-      // scan still working through scroll #4000 looks identical, from the
-      // status line alone, to one that's silently frozen.
-      updateStatus?.(`Loading rooms... found ${collected.length + newRooms.length} total (scroll ${totalScrolls})`);
+    for (const apiRoom of data.rooms) {
+      const room = normalizeApiRoom(apiRoom);
+      collected.push(room);
+      roomsSinceCheckpoint++;
 
-      for (const room of newRooms) {
-        seenUrls.add(room.documentsUrl);
-        collected.push(room);
-        roomsSinceCheckpoint++;
-
-        if (room.createdDate && room.createdDate > dateEnd) {
-          outOfRangeStreak++;
-        } else {
-            outOfRangeStreak = 0;
-        }
-      }
-
-      if (outOfRangeStreak >= 5) {
-        updateStatus?.(`Stopping scroll: ${outOfRangeStreak} consecutive rooms out of date range.`);
-        stoppedEarly = true;
-        break;
-      }
-
-      if (newRooms.length > 0) {
-        noNewRoomAttempts = 0;
+      if (room.createdDate && room.createdDate > dateEnd) {
+        outOfRangeStreak++;
       } else {
-        noNewRoomAttempts++;
+        outOfRangeStreak = 0;
       }
-
-      if (roomsSinceCheckpoint >= CHECKPOINT_EVERY) {
-        roomsSinceCheckpoint = 0;
-        const inRange = collected.filter(room => room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd);
-        onCheckpoint?.(inRange);
-        onActivity?.({ totalFound: collected.length, inRangeFound: inRange.length, totalTrimmed, final: false });
-      }
-
-      totalTrimmed += trimOldRoomRows(DOM_TRIM_KEEP);
-
-      scrollContainer.scrollTo({
-        top: scrollContainer.scrollHeight,
-        behavior: "smooth"
-      });
-
-      await sleep(1500);
-      totalScrolls++;
     }
 
-    // The loop-condition exit (as opposed to a `break` above) was
-    // previously silent - no updateStatus() call at all, unlike every other
-    // way the loop can end. That made a scan that legitimately ran out of
-    // new rooms to load indistinguishable, from the panel's perspective,
-    // from one that just stopped updating for no visible reason - exactly
-    // the kind of thing worth surfacing explicitly rather than leaving the
-    // user to guess whether something went wrong.
-    if (!stoppedEarly && noNewRoomAttempts >= 15) {
-      // Checked against rooms actually *within* the requested range, not
-      // just collected.length - confirmed live as a real, distinct
-      // failure mode on this account: a range whose start date is far
-      // into the account's history (e.g. 2023, when the account also
-      // holds thousands of rooms from 2020-2022 sorted before it) can
-      // take long enough to scroll through everything before dateStart
-      // that the scan stalls - a network hiccup, brief tab-focus loss,
-      // or any other reason DOM growth briefly pauses - before it ever
-      // reaches a single in-range room. collected.length is very much
-      // nonzero in that case (thousands of pre-range rooms genuinely
-      // found), so the original version of this check, which only
-      // guarded collected.length === 0, missed it entirely and let it
-      // through as a normal "0 rooms in range" success: repeatable, live,
-      // header-only CSV exports for exactly this account/range while the
-      // same code correctly handled smaller, closer-to-the-start ranges.
-      // outOfRangeStreak (above) is the *only* legitimate way to prove a
-      // range was actually reached and scrolled past with nothing in it;
-      // ending via a stall instead means we genuinely don't know whether
-      // the range is empty or was just never reached, so - same
-      // reasoning as the sort-order check above - that ambiguity is
-      // treated as a failure rather than let through as a silently
-      // "successful" empty export.
-      const inRangeCount = collected.filter(room => room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd).length;
-      if (inRangeCount === 0) {
-        if (collected.length === 0) {
-          throw new Error("No rooms loaded after scrolling for a while - the Rooms list table may not have finished loading. Make sure you're logged into Docusign and on the Rooms list page, then try again.");
-        }
-        throw new Error(`Scan stalled after finding ${collected.length} room(s), but none were within the requested date range - it likely stopped before reaching that range rather than the range genuinely being empty. Try again; if it keeps happening, try scanning in smaller date chunks so each scan has less to scroll through before reaching its range.`);
-      }
-      updateStatus?.(`Finished scrolling: no new rooms loaded after ${noNewRoomAttempts} attempts (${collected.length} found so far).`);
+    if (outOfRangeStreak >= 5) {
+      updateStatus?.(`Stopping: ${outOfRangeStreak} consecutive rooms past the requested date range.`);
+      stoppedEarly = true;
+      break;
     }
 
-    // Final reconciliation, not just a per-iteration retry - a room stuck
-    // incomplete (real link, but name/date never finished rendering) on
-    // every single pass for the rest of the scan is exactly the silent-
-    // loss shape of bug this project has already shipped once (see
-    // getRoomCardsAndLinks()'s own comment) and was asked directly not to
-    // let happen again: "we cannot tolerate a room being glossed over."
-    // Thrown, not just warned about in a status line that the next
-    // updateStatus() call would immediately overwrite - this routes
-    // through the same DS_SCAN_FAILED path every other real scan failure
-    // does, and any checkpoint already saved (see onCheckpoint above)
-    // still holds everything collected up to the last 1,000-room
-    // milestone, so this isn't a full loss even when it fires.
-    const neverCompleted = [...everIncompleteUrls].filter(url => !seenUrls.has(url));
-    if (neverCompleted.length > 0) {
-      throw new Error(`${neverCompleted.length} room${neverCompleted.length === 1 ? "" : "s"} could not be fully read before the scan ended (found a link, but the room's name/date never finished loading) - re-run the scan; if this keeps happening, try a smaller date range. Affected room URL${neverCompleted.length === 1 ? "" : "s"}: ${neverCompleted.slice(0, 5).join(", ")}${neverCompleted.length > 5 ? ` (+${neverCompleted.length - 5} more)` : ""}`);
+    if (roomsSinceCheckpoint >= CHECKPOINT_EVERY) {
+      roomsSinceCheckpoint = 0;
+      const inRange = collected.filter(room => room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd);
+      onCheckpoint?.(inRange);
+      lastCheckpointInRangeCount = inRange.length;
+      onActivity?.({ totalFound: collected.length, inRangeFound: inRange.length, pagesLoaded: pageCount, final: false });
     }
 
-    const finalRooms = collected.filter(room => {
-        return room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd;
-    });
+    url = data.nextUri || null;
 
-    // One last activity report, even if the loop ended after fewer than
-    // CHECKPOINT_EVERY new rooms since the previous one (or found none at
-    // all) - without this, a scan collecting under 1,000 rooms total would
-    // never produce a single activity entry, and the Activity Log would
-    // look exactly like nothing happened.
-    onActivity?.({ totalFound: collected.length, inRangeFound: finalRooms.length, totalTrimmed, final: true });
+    if (url) await sleep(PAGE_FETCH_DELAY_MS);
+  }
 
-    return finalRooms;
+  if (!stoppedEarly) {
+    updateStatus?.(`Finished: reached the end of the room list (${collected.length} found).`);
+  }
+
+  const finalRooms = collected.filter(room => {
+    return room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd;
+  });
+
+  // One last activity report, even if the loop ended after fewer than
+  // CHECKPOINT_EVERY new rooms since the previous one (or found none at
+  // all) - without this, a scan collecting under 1,000 rooms total would
+  // never produce a single activity entry, and the Activity Log would
+  // look exactly like nothing happened.
+  onActivity?.({ totalFound: collected.length, inRangeFound: finalRooms.length, pagesLoaded: pageCount, final: true });
+
+  return finalRooms;
 }
 
 // Test-only, same reasoning and shape as content/utils.js's own tail
@@ -501,12 +319,9 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
 // shipped code is actually broken, not just a parallel copy of it.
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    getScrollContainer,
-    getSortLabel,
-    ensureListView,
-    ensureOldestSort,
-    getRoomCardsAndLinks,
-    trimOldRoomRows,
+    getCookieValue,
+    normalizeApiRoom,
+    fetchRoomsPage,
     waitIfScanPausedOrStopped,
     autoScrollAndCollectRooms
   };
