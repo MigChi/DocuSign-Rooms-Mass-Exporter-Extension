@@ -322,6 +322,7 @@ summary of it, not a second copy that can drift.
 | 5y. Closing the rest of the stale-DOM gap, proving neither side glosses over a room | Directly challenged: "we cannot tolerate a room being glossed over like the bug you described" - verify scanning and downloading, don't just assert they're fixed | Done | Found a second variant of phase 5x's stale-DOM bug: `getRoomCardsAndLinks()` checked that the date *element* existed but not that it had *text* yet - a present-but-empty element produces an Invalid Date, which is truthy (slides past an existence check) and fails every comparison silently, indistinguishable from a legitimately out-of-range room. Fixed the same way as before (treated as not-yet-rendered, retried). Then built a standing safeguard instead of just a second patch: the scan now tracks every room ever glimpsed as incomplete across the *whole* scan and reconciles that against what actually completed right before returning - if any room was seen but never resolved, for *any* reason (not just these two specific timing gaps), the scan now fails loudly instead of silently exporting an incomplete list. Traced by hand that this also correctly catches a room trimmed out of the DOM while still incomplete (Decision 37's DOM trimming) - a case neither original fix anticipated. On the download side, verified (rather than assumed) that `createReport()` already fully covers the equivalent risk - it walks the full original queue, not just recorded results, so a room interrupted between being claimed and given a result still gets a row, correctly marked "Waiting" - proved this with a new test that seeds a queue with a deliberately missing result and confirms the real CSV output includes it anyway. Full suite: 116/116. See `DESIGN.md` Decision 40. |
 | 5z. A third silent-"0 rooms" gap, found from real Downloads-folder evidence, plus real test coverage for the scan loop | User asked directly why no checkpoint CSV had ever appeared - answered by checking the actual filesystem, not by re-explaining what the feature was supposed to do | Done | The real evidence told a bigger story than the checkpoint question alone: the account's large 2023-2024 range had succeeded once (~7,463 rooms) but then failed with a genuine, repeatable 0-room "success" four separate times since, across multiple fix commits, while smaller ranges kept succeeding. Root cause: phase 5w's fix only checked whether *any* rooms were ever collected, not whether any fell inside the requested range - on an account with years of history before the requested range, a scan that stalls while still scrolling through that earlier history collects plenty of rooms (just none in range yet), so the old check never fired and the scan fell through as a false "success." Fixed by checking rooms actually within the requested date range at the point the loop ends via a stall, leaving the one condition that actually proves a range was reached and passed through (several consecutive out-of-range rooms) untouched. This is the third distinct time this exact loop has silently reported 0 rooms as success - pattern recognized as reason enough to add real test coverage of the loop's branching logic instead of relying on code review alone, revisiting `DESIGN.md` Decision 13's original scope-out of this file. Added a narrow, purpose-built DOM stub (not a general DOM library) and 12 new tests covering this bug directly, the prior two "0 rooms" bugs' checks, the stale-DOM-read guards, and the incomplete-room reconciliation. One test-fixture mistake (non-numeric fake room IDs silently failing the real URL-matching regex) was self-caught by tracing why a fixture produced an unexpectedly empty result, rather than accepting a passing-looking test at face value. Full suite: 128/128. See `DESIGN.md` Decision 41. |
 | 5aa. A scan-side Activity Log, plus a real bug found auditing the code it extended | "kinda like you did for the download maybe do an activity log... nice visual like it was for downloads" - and, going forward, an audit of what changed plus real test verification after every change | Done | Added periodic aggregate reporting (rooms found/in-range, DOM rows trimmed) at the same 1,000-room cadence as checkpoint saves, feeding the exact same Activity Log/export pipeline the download side already has - deliberately a summary, not a per-room entry, since a literal per-room log would mean tens of thousands of unreadable lines on a large scan. While auditing the stall-watchdog code this plugs into, found a second real bug unrelated to the new feature: its own comment claimed both `DS_SCAN_PROGRESS` and `DS_SCAN_CHECKPOINT` refresh the watchdog's sign-of-life timestamp, but the checkpoint handler never actually did - silently masked until now only because the progress message happens to fire on every scroll anyway. Fixed, and the comment corrected to match. Also found, while extending the Activity Log's event-description switch, that an existing test literally named "describes every logWorkerEvent() type background.js actually emits" was already false - five real event types from earlier in the project had no real description and no test coverage, silently falling back to a bare code in the actual log. Fixed all five plus the new scan-activity type, and made the test's own name true. Full suite: 134/134. See `DESIGN.md` Decision 42. |
+| 5ab. A standalone audit - a known-but-unfixed mode-loss risk, and an alarm that never stops ringing | "run another audit" - no new symptom, a deliberate re-read of `background.js` for the class of bug this project keeps finding | Done | Followed a comment's own loose cross-reference (from the lock-screen fix) to a real, previously-identified-but-never-actually-fixed gap: if the service worker restarts in the narrow window between a scan starting and finishing, `STATE.scanMode` (deliberately never persisted - scanning isn't resumable by design) resets to null, but the scan itself keeps running in its own tab and eventually delivers real results to a worker that's forgotten whether the user clicked "Export" or "Start." That used to silently fall through to "Start" behavior - meaning a user who only asked for a CSV export could see the "Found N rooms... Continue?" prompt that offers to kick off a full download run instead. Fixed by treating an unrecognized mode as its own real failure, reported to the user, rather than guessed at. Researched (not assumed) that `chrome.alarms` persist across a service-worker restart by default per Chrome's own documentation - confirming the scan-stall watchdog's alarm would otherwise keep waking the service worker every single minute, forever, after any mid-scan restart with no later scan to naturally replace it. Fixed by clearing it unconditionally at every service-worker startup. Also found and fixed a smaller, related gap: the map tracking in-flight report filenames was never cleaned up if a download itself failed to start, and unlike the three once-per-run exports, the scan checkpoint save (which fires repeatedly over a long scan) could have let failed entries actually accumulate. Every fix was verified by deliberately reverting it, confirming its new test failed for the right reason, then restoring the fix - not just written and trusted. Full suite: 137/137. See `DESIGN.md` Decision 43. |
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
 build-log framing) — this table exists so you don't have to read either in
@@ -1387,6 +1388,47 @@ here for the full story.
   CSV rather than left as something a user might notice in their own
   export. Full suite: 134/134. Full reasoning in `DESIGN.md`'s
   Decision 42.
+
+#### Phase 5ab: A Standalone Audit - a Known-but-Unfixed Mode-Loss Risk, and an Alarm That Never Stops Ringing
+
+- **No new symptom prompted this one** - "run another audit," on its
+  own, with nothing specific reported broken. A deliberate, full re-read
+  of `background.js` for the same class of bug this project keeps
+  finding: a comment promising something the code doesn't actually do,
+  or a resource created without a guaranteed cleanup path.
+- **Followed a comment's own cross-reference to a real, previously
+  spotted but never actually fixed gap.** The lock-screen fix's own
+  comment mentioned, in passing, a "mode-loss risk" from that same
+  incident - never written up, never closed. Traced fully: if the
+  extension's background process restarts in the narrow window between
+  a scan starting and finishing, it forgets whether the user clicked
+  "Export" or "Start" (that detail is deliberately never saved, since a
+  scan itself was never meant to be resumable) - but the scan keeps
+  running independently and still delivers real results afterward.
+  That used to silently get treated as "Start," meaning someone who
+  only wanted a CSV list could instead see the prompt offering to kick
+  off downloading everything. Fixed to report this honestly as a
+  failure requiring a re-run, instead of guessing at an intent it no
+  longer actually knows.
+- **Researched rather than assumed:** confirmed against Chrome's own
+  documentation that the scan-stall watchdog's underlying alarm
+  persists across a restart by design - which is exactly why it works
+  at all, but also means an alarm left over from a mid-scan restart
+  would otherwise keep waking the extension up once every minute,
+  forever, until another scan happened to start and replace it. Fixed
+  by clearing it unconditionally every time the extension's background
+  process starts up.
+- **A smaller, related cleanup gap found the same way** - the
+  in-flight download-filename tracking used by every CSV export was
+  never cleaned up if a save itself failed to start, and unlike the
+  three once-per-run exports, the periodic scan checkpoint save (which
+  can fire many times over one long scan) could have let failed
+  entries actually build up over time. Fixed.
+- **Every fix verified the same way, not just written and trusted:**
+  deliberately reverted, confirmed its new test failed for the right
+  reason, then restored - proof each test would actually have caught
+  the bug it exists to catch, not just proof it passes today. Full
+  suite: 137/137. Full reasoning in `DESIGN.md`'s Decision 43.
 
 ---
 

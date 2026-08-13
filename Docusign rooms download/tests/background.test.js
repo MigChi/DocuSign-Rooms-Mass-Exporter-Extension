@@ -468,6 +468,62 @@ test("a real DS_SCAN_COMPLETE (no error) still reports DS_SCAN_RESULT normally",
   assert.equal(failed, undefined, "a successful scan should never be reported as failed");
 });
 
+test("DS_SCAN_COMPLETE reports a real failure instead of silently defaulting to 'start' mode when STATE.scanMode was lost (regression: a service-worker restart mid-scan resets STATE.scanMode to null - it's deliberately never persisted, see its own STATE comment - and this used to fall straight through to 'start' mode, meaning a scan the user only asked to export as a CSV could instead show the panel's 'Found N rooms... Continue?' download-run prompt)", async () => {
+  const { STATE } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = null; // simulates the fresh-worker state right after a mid-scan restart
+  STATE.scanDateRangeLabel = null;
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_COMPLETE", rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }] },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.ok(failed, "expected a DS_SCAN_FAILED broadcast");
+  assert.match(failed.reason, /restarted/);
+
+  const result = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_RESULT");
+  assert.equal(result, undefined, "must never silently fall through to a DS_SCAN_RESULT (mode: start) - that's the exact misrouting this regression guards against");
+
+  const failedEvent = STATE.workerEvents.find(e => e.type === "scan_failed");
+  assert.ok(failedEvent, "expected a scan_failed worker event logged too");
+});
+
+test("service worker startup clears the scan-stall watchdog alarm unconditionally, even with no persisted job (regression: chrome.alarms persist across a service-worker restart by default, confirmed against Chrome's own documentation - an orphaned alarm left over from a mid-scan restart would otherwise keep firing every minute forever, since nothing else replaces or clears it until a new scan happens to start)", () => {
+  const { SCAN_WATCHDOG_ALARM } = freshBackground();
+  assert.ok(global.chrome.alarms.clearCalls.includes(SCAN_WATCHDOG_ALARM), "expected the watchdog alarm to be cleared at startup");
+});
+
+test("DS_SCAN_CHECKPOINT cleans up its pendingReportFilenames entry when the download itself fails (regression: each checkpoint dataUrl embeds the entire CSV as a string, and unlike the one-per-run report exports, this handler can fire many times over a single long scan - a failed write that's never cleaned up would otherwise accumulate real memory)", async () => {
+  const { STATE, pendingReportFilenames } = freshBackground();
+  STATE.scanCheckpointFilename = "Docusign Rooms/_Scan Lists/Scan List (in progress - partial).csv";
+
+  global.chrome.downloads.download = async () => { throw new Error("disk full"); };
+
+  const sizeBefore = pendingReportFilenames.size;
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_SCAN_CHECKPOINT",
+      rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }]
+    },
+    {},
+    () => {}
+  );
+  await flushAsync();
+
+  assert.equal(pendingReportFilenames.size, sizeBefore, "the failed checkpoint's entry should have been cleaned up, not left to accumulate");
+
+  const failedEvent = STATE.workerEvents.find(e => e.type === "scan_checkpoint_failed");
+  assert.ok(failedEvent, "expected a scan_checkpoint_failed worker event");
+  assert.match(failedEvent.error, /disk full/);
+});
+
 test("chrome.tabs.onUpdated resets a stuck scan when the scan tab navigates or reloads mid-scan (regression: only tab CLOSE was previously handled via chrome.tabs.onRemoved - a reload/navigation destroys the content script's execution context the same way but never fires that event, since the tab itself never closes)", async () => {
   const { STATE } = freshBackground();
 

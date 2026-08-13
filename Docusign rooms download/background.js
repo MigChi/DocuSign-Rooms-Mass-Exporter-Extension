@@ -631,9 +631,16 @@ async function ensureWorkerTabs(count) {
 // mechanism already proven reliable for every room ZIP, so reusing it
 // here closes the gap with a proven approach rather than guessing at a
 // second fix for the same class of problem. Cleaned up by the listener
-// itself once consumed - at most 3 entries ever pending at once (one
-// run's Scan List, Download Report, and Activity Log), so there's no
-// meaningful growth risk even without a cap.
+// itself once consumed - on the happy path, at most a handful of entries
+// are ever pending at once (a run's Scan List/Download Report/Activity
+// Log, plus at most one in-flight scan checkpoint - see DS_SCAN_CHECKPOINT
+// below, which unlike the other three can fire many times over one long
+// scan), so there's no meaningful growth risk there even without a cap.
+// The one place this isn't automatically true: if chrome.downloads.download()
+// itself rejects, onDeterminingFilename never fires for that dataUrl and
+// this listener never gets a chance to clean it up - each call site that
+// can fire more than once per run deletes its own entry explicitly in
+// that failure case rather than leaning on this comment's assumption.
 const pendingReportFilenames = new Map();
 
 async function createReport() {
@@ -1632,6 +1639,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }).catch(err => {
         console.warn("[DSBD] checkpoint CSV write failed", err);
         logWorkerEvent("scan_checkpoint_failed", { error: err?.message || String(err) });
+        // pendingReportFilenames' own comment assumes "at most 3 entries
+        // ever pending at once" - true for the three one-per-run exports,
+        // but not for this handler, which can legitimately fire many
+        // times over one long scan (every 1,000 rooms). If download()
+        // itself rejects, onDeterminingFilename never fires for this
+        // dataUrl and would never otherwise clean this entry up - each
+        // dataUrl embeds the entire CSV content as a string, so a scan
+        // with repeated write failures could otherwise accumulate real
+        // memory in a long-lived service worker. Deleted here explicitly
+        // rather than left to whatever cap doesn't actually exist.
+        pendingReportFilenames.delete(dataUrl);
       });
       return;
     }
@@ -1690,13 +1708,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (mode === "export") {
         const response = await handleExportScanList(rooms, dateRangeLabel);
         chrome.runtime.sendMessage({ type: "DS_SCAN_RESULT", mode: "export", response }).catch(() => {});
-      } else {
+      } else if (mode === "start") {
         // Deliberately NOT auto-starting the queue here - the panel still
         // shows its own confirm() dialog ("Found N rooms... Continue?")
         // once it receives this, exactly like the pre-relay flow did
         // right after autoScrollAndCollectRooms() returned. Auto-starting
         // would have silently dropped that confirmation step.
         chrome.runtime.sendMessage({ type: "DS_SCAN_RESULT", mode: "start", rooms, dateRangeLabel }).catch(() => {});
+      } else {
+        // mode is only ever "export" or "start" when a real DS_RUN_SCAN
+        // request set it (see panel.js's two scan buttons) - reaching here
+        // with anything else (null, in practice) means the service worker
+        // itself restarted sometime between this scan starting and
+        // finishing: STATE.scanMode is deliberately never persisted (see
+        // its own comment on STATE - "a scan is never resumed across a
+        // service-worker restart"), so a fresh worker has no way to know
+        // which button the user originally clicked, even though the scan
+        // itself, running independently in the content script the whole
+        // time, finished normally and is still reporting real results.
+        // Previously this fell through to the `else` branch above
+        // unconditionally, silently treating a lost "export" (a simple
+        // CSV Scan List request) as if it were "start" instead - which
+        // shows the panel's "Found N rooms... Continue?" prompt, offering
+        // to kick off a full download run the user never actually asked
+        // for. Reported as a real failure instead, consistent with this
+        // project's standing principle of failing loudly over guessing
+        // silently at an ambiguous outcome (Decisions 36/38/41) - the
+        // user just has to re-run the scan, which by this point is rare
+        // enough (a worker restart in this exact narrow window, further
+        // reduced by chrome.power.requestKeepAwake - Decision 36) to be a
+        // fair trade against the risk of an unintended download run.
+        logWorkerEvent("scan_failed", { error: "service worker restarted mid-scan - lost track of whether this was an export or start request" });
+        chrome.runtime.sendMessage({
+          type: "DS_SCAN_FAILED",
+          reason: `The scan finished (found ${rooms.length} room${rooms.length === 1 ? "" : "s"}), but the extension's background process restarted while it was running, so it lost track of whether you wanted a CSV export or to start downloading. Please run the scan again.`
+        }).catch(() => {});
       }
       return;
     }
@@ -2079,6 +2125,28 @@ chrome.action.onClicked.addListener(async () => {
 // via the toolbar icon, which fires its own DS_GET_STATUS call on load -
 // unlike the old in-page panel, that no longer happens automatically on
 // every Docusign Rooms page, only when the user actually opens it.
+// chrome.alarms persist across a service-worker restart by design (that's
+// the entire reason the scan-stall watchdog uses one instead of
+// setInterval - see its own comment) - confirmed directly against Chrome's
+// own documentation: an alarm defaults to persistAcrossSessions: true,
+// surviving not just a worker restart but a full browser restart too,
+// unless explicitly cleared. That cuts both ways: if the service worker
+// restarts while a scan is genuinely active, STATE.scanning resets to
+// false in the fresh worker (it's deliberately never persisted - see
+// STATE's own comment), but the alarm itself keeps right on firing every
+// minute, forever, since nothing else was ever going to clear it. The
+// watchdog listener's own !STATE.scanning check means this is harmless in
+// the sense that it can never misfire a false DS_SCAN_FAILED - but with
+// nothing to naturally replace it (chrome.alarms.create() only overwrites
+// an alarm of the same name when a *new* scan actually starts), an
+// orphaned alarm from one mid-scan restart would otherwise keep waking
+// this service worker up once a minute indefinitely, for a market center
+// that doesn't happen to run another scan any time soon. Cleared
+// unconditionally here, not just when a job was actually found below -
+// this has nothing to do with the download-run resume logic that follows,
+// it's cleanup for a completely different kind of leftover state.
+chrome.alarms.clear(SCAN_WATCHDOG_ALARM);
+
 (async () => {
   const stored = await chrome.storage.local.get(PERSIST_KEY);
   const job = stored[PERSIST_KEY];
@@ -2178,6 +2246,7 @@ if (typeof module !== "undefined" && module.exports) {
     persistJob,
     clearPersistedJob,
     PERSIST_KEY,
-    createReport
+    createReport,
+    pendingReportFilenames
   };
 }
