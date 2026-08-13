@@ -190,7 +190,13 @@ async function waitIfScanPausedOrStopped(scanControl, updateStatus) {
  * (throws) if that didn't stick - checked via getSortLabel() - since
  * the whole skip/collect/stop algorithm below depends on ascending order
  * and a UI change could silently break the auto-select without breaking
- * the safety check. Otherwise repeatedly scrolls the container found by
+ * the safety check. Also throws if the sort *did* stick but the table
+ * never renders a single row for the whole noNewRoomAttempts window -
+ * confirmed live as a real, distinct case from the sort-order one (an
+ * account/range already known to hold thousands of rooms produced a
+ * silently "successful" 0-room export instead), so it gets the same
+ * failure treatment rather than being read as a genuinely empty range.
+ * Otherwise repeatedly scrolls the container found by
  * getScrollContainer() and re-runs getRoomCardsAndLinks() until either:
  * no new rooms appear for several tries (noNewRoomAttempts), or several
  * consecutive rooms are found past dateRange.end (outOfRangeStreak) -
@@ -336,6 +342,27 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
     // the kind of thing worth surfacing explicitly rather than leaving the
     // user to guess whether something went wrong.
     if (!stoppedEarly && noNewRoomAttempts >= 15) {
+      // Zero rooms ever collected, on a loop that only ends this way
+      // (never via outOfRangeStreak, which requires having found - and
+      // then outgrown - at least one real row) is a different situation
+      // from "ran out of new rooms after collecting some": it means the
+      // room-list table never rendered a single row for the entire
+      // ~22.5s this took, on an account/range already confirmed live to
+      // hold thousands of rooms - not a real "this range is empty"
+      // answer, the same class of "the page wasn't actually ready to
+      // scan" problem the sort-order check above already guards against,
+      // just not caught by that specific check (the sort can be correctly
+      // "Created (Oldest)" while the table itself still shows nothing -
+      // confirmed live: a real scan on this exact account/range produced
+      // a silently "successful" 0-room export with no checkpoint file
+      // ever created, meaning nothing was ever found from the very
+      // start). Thrown for the same reason as that check: an empty
+      // result here would otherwise take the normal success path
+      // straight through to a real, misleadingly "successful" 0-room CSV
+      // export instead of being reported as the failure it actually is.
+      if (collected.length === 0) {
+        throw new Error("No rooms loaded after scrolling for a while - the Rooms list table may not have finished loading. Make sure you're logged into Docusign and on the Rooms list page, then try again.");
+      }
       updateStatus?.(`Finished scrolling: no new rooms loaded after ${noNewRoomAttempts} attempts (${collected.length} found so far).`);
     }
 
