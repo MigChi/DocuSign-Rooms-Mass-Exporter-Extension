@@ -813,6 +813,46 @@ test("a worker tab's message channel failing on one room - simulating a crashed 
   assert.ok(reportCall, "expected a Download Report CSV to still be written after the run finished, even though one room's tab communication failed mid-run");
 });
 
+test("persistJob() serializes concurrent calls so chrome.storage.local.set() is never issued a second time while an earlier call is still in flight (regression: chrome.storage.local gives no ordering guarantee of its own for concurrent set() calls to the same key - confirmed against the Chromium extensions team's own description of the API, not assumed - and multiple worker tabs genuinely call persistJob() at effectively the same time during a real run)", async () => {
+  const { STATE, persistJob } = freshBackground();
+
+  // Records exactly when each call started and finished, in one shared
+  // order - not just a count - so the assertions below can check real
+  // interleaving, not just "how many calls happened so far."
+  const order = [];
+  let resolveFirstWrite;
+  let callCount = 0;
+  global.chrome.storage.local.set = () => {
+    callCount++;
+    const n = callCount;
+    order.push(`start:${n}`);
+    if (n === 1) {
+      // Deliberately left pending - if calls weren't serialized, nothing
+      // would stop a second call from starting (and even finishing)
+      // while this one is still open, which is exactly the unordered,
+      // "not ACID compliant" behavior chrome.storage.local is documented
+      // to allow on its own.
+      return new Promise(resolve => {
+        resolveFirstWrite = () => { order.push(`finish:${n}`); resolve(); };
+      });
+    }
+    order.push(`finish:${n}`);
+    return Promise.resolve();
+  };
+
+  STATE.queue = [{ roomId: "1" }];
+  const firstCall = persistJob();
+  const secondCall = persistJob();
+
+  await flushAsync();
+  assert.deepEqual(order, ["start:1"], "the second call must not even start chrome.storage.local.set() while the first one is still pending");
+
+  resolveFirstWrite();
+  await Promise.all([firstCall, secondCall]);
+
+  assert.deepEqual(order, ["start:1", "finish:1", "start:2", "finish:2"], "the second write must only begin after the first one has fully finished - the two must never overlap");
+});
+
 test("clampWorkerTabCount passes through an in-range integer unchanged", () => {
   const { clampWorkerTabCount } = freshBackground();
 

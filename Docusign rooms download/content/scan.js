@@ -93,11 +93,31 @@ function getRoomCardsAndLinks() {
 
     const roomId = getRoomIdFromUrl(documentsUrl);
 
+    // Both required, not optional, for a row to count as read at all -
+    // a documented real risk with scraping infinite-scroll/virtualized
+    // lists under a framework that batches its DOM updates (confirmed
+    // against how other scrapers hit this same class of bug): a row can
+    // exist in the DOM - <tr> present, link present - a few render passes
+    // before its own child content (name, date) has actually painted in.
+    // The previous version fell back to a placeholder name and a null
+    // date for a row caught in that state, which is far worse than it
+    // looks: autoScrollAndCollectRooms() dedupes by documentsUrl the
+    // *first* time a room is ever seen, so a room read mid-render got
+    // permanently marked "already seen" right then - it would never be
+    // re-read later once its real date actually rendered, and a null
+    // createdDate fails the final date-range filter, so the room just
+    // silently vanished from the export entirely. Returning null here
+    // instead - exactly like the "no link yet" case above already did -
+    // means a not-yet-rendered row is simply skipped *this* iteration and
+    // picked up again on a later one, once getRoomCardsAndLinks() re-runs
+    // and finds it fully populated (the whole reason this function is
+    // re-called after every scroll instead of once).
     const nameEl = row.querySelector('strong[data-qa="room-name"]');
-    const roomName = nameEl?.getAttribute("title") || `Docusign Room ${roomId}`;
-
     const dateEl = row.querySelector('strong[data-qa="room-date"]');
-    const createdDate = dateEl ? new Date(dateEl.textContent.trim()) : null;
+    if (!nameEl || !dateEl) return null;
+
+    const roomName = nameEl.getAttribute("title") || `Docusign Room ${roomId}`;
+    const createdDate = new Date(dateEl.textContent.trim());
 
     return { roomId, roomName: cleanName(roomName), documentsUrl, createdDate };
   }).filter(Boolean);

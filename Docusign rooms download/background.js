@@ -206,35 +206,77 @@ function logWorkerEvent(type, detail = {}) {
 // resetting STATE.running), leaving the run permanently stuck and any
 // still-running sibling workers orphaned. A missed checkpoint write is
 // a much smaller problem than that - worth degrading gracefully for.
-async function persistJob() {
-  if (!STATE.queue.length) {
-    await clearPersistedJob();
-    return;
-  }
+//
+// Every call - from persistJob() or clearPersistedJob() directly - is
+// serialized through this one shared chain rather than issued the moment
+// it's called. Confirmed directly, not assumed: chrome.storage's own
+// documentation and the Chromium extensions team both describe it as "a
+// relatively simple asynchronous key-value store... wasn't designed to
+// be ACID compliant," with no ordering guarantee of its own for
+// concurrent set() calls to the same key. Multiple worker tabs genuinely
+// do call persistJob() at effectively the same time in real operation -
+// each reaches its own call via an independently-timed chain of awaits
+// inside processRoom() (page loads, the 90s room-processing bound,
+// download-start polling), so two calls overlapping in flight is the
+// normal case at real concurrency, not an edge case. Without this, a
+// write that happens to *complete* later - even though it was *issued*
+// earlier, reflecting an older, less-complete snapshot - could silently
+// overwrite a newer one purely by timing, discarding whichever worker's
+// result lost that race from the *persisted* copy (STATE itself, in
+// memory, is never affected either way - only what chrome.storage.local
+// would resume from after a crash). Chaining every call onto
+// `persistChain` - the same pattern already proven for panel.js's
+// confirmDialogChain - means writes are never actually concurrent at the
+// chrome.storage API level at all, so correctness no longer depends on
+// an implementation detail this project has no control over and no way
+// to verify stays stable across Chrome versions.
+let persistChain = Promise.resolve();
 
-  try {
-    await chrome.storage.local.set({
-      [PERSIST_KEY]: {
-        queue: STATE.queue,
-        results: STATE.results,
-        paused: STATE.paused,
-        startedAt: STATE.startedAt,
-        workerEvents: STATE.workerEvents,
-        workerTabCount: STATE.workerTabCount,
-        runDateRangeLabel: STATE.runDateRangeLabel
+function persistJob() {
+  const run = async () => {
+    if (!STATE.queue.length) {
+      try {
+        await chrome.storage.local.remove(PERSIST_KEY);
+      } catch (e) {
+        console.warn("persistJob: chrome.storage.local.remove failed", e);
       }
-    });
-  } catch (e) {
-    console.warn("persistJob: chrome.storage.local.set failed, continuing without this checkpoint", e);
-  }
+      return;
+    }
+
+    try {
+      await chrome.storage.local.set({
+        [PERSIST_KEY]: {
+          queue: STATE.queue,
+          results: STATE.results,
+          paused: STATE.paused,
+          startedAt: STATE.startedAt,
+          workerEvents: STATE.workerEvents,
+          workerTabCount: STATE.workerTabCount,
+          runDateRangeLabel: STATE.runDateRangeLabel
+        }
+      });
+    } catch (e) {
+      console.warn("persistJob: chrome.storage.local.set failed, continuing without this checkpoint", e);
+    }
+  };
+
+  const next = persistChain.then(run);
+  persistChain = next;
+  return next;
 }
 
-async function clearPersistedJob() {
-  try {
-    await chrome.storage.local.remove(PERSIST_KEY);
-  } catch (e) {
-    console.warn("clearPersistedJob: chrome.storage.local.remove failed", e);
-  }
+function clearPersistedJob() {
+  const run = async () => {
+    try {
+      await chrome.storage.local.remove(PERSIST_KEY);
+    } catch (e) {
+      console.warn("clearPersistedJob: chrome.storage.local.remove failed", e);
+    }
+  };
+
+  const next = persistChain.then(run);
+  persistChain = next;
+  return next;
 }
 
 // Two different rooms can share the same cleaned name (confirmed live:
@@ -1819,6 +1861,17 @@ chrome.downloads.onChanged.addListener(delta => {
       }
     }
 
+    // Not strictly load-bearing for final correctness - a crash between
+    // this event and the run's own natural end would still leave this
+    // room correctly upgraded to "Downloaded" by verifySuccessAttemptedResults()
+    // when the run finishes (it checks Chrome's own download history
+    // directly, not just whatever was last persisted). Checkpointed here
+    // anyway so the on-disk resume snapshot reflects reality as closely
+    // to real time as reasonably possible, not just at each room's
+    // *initial* result - this is the one place a room's status can
+    // change *after* processRoom() already returned and persisted its
+    // first (pre-download-completion) result.
+    persistJob();
     broadcastStatus();
   }
 
@@ -1835,6 +1888,7 @@ chrome.downloads.onChanged.addListener(delta => {
       }
     }
 
+    persistJob();
     broadcastStatus();
   }
 });
@@ -2084,6 +2138,9 @@ if (typeof module !== "undefined" && module.exports) {
     matchVerifiedDownloads,
     withTimeout,
     SCAN_WATCHDOG_ALARM,
-    SCAN_STALL_THRESHOLD_MS
+    SCAN_STALL_THRESHOLD_MS,
+    persistJob,
+    clearPersistedJob,
+    PERSIST_KEY
   };
 }

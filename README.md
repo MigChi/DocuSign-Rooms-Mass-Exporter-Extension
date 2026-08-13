@@ -318,6 +318,7 @@ summary of it, not a second copy that can drift.
 | 5u. `chrome.power` keep-awake, and a silent-empty-scan gap it exposed | Fix the computer's lock screen turning on despite the user's own OS sleep settings being disabled, reported directly alongside another scan stopping short | Done | The first stop traced to `content/scan.js`'s sort-order guard returning `[]` (not throwing) when the page wasn't in the expected state - indistinguishable downstream from a genuine "zero rooms in this range" result, most likely caused by the Docusign tab being logged out or reset after sitting backgrounded through the lock-screen interruption. Fixed by throwing instead, routing through the existing `DS_SCAN_FAILED` path for a real, visible reason instead of a silently unhelpful empty CSV. The lock screen itself can't be fixed by re-checking OS settings that had apparently already failed to hold (reset by an update, a battery-profile switch, a device policy) - added `chrome.power.requestKeepAwake("display")` instead, a direct OS-level request independent of the user's own settings, called after all twelve places `STATE.running`/`STATE.scanning` change so it can never drift out of sync with what's actually active. Not a complete guarantee (a closed laptop lid is a common exception on most OSes), so the existing manual OS-setting guidance in `HOW_TO_USE.md` stays as a first line of defense, with this as a second, code-level one. Verified with 3 new regression tests confirming the keep-awake lock is requested and released correctly across a normal run, a crashed run, and a failed scan. Full suite: 109/109. See `DESIGN.md` Decision 36. |
 | 5v. Real tab crash on a large account - DOM trimming, checkpointed progress, a stall watchdog | Fix the browser tab itself crashing ("Aw, Snap!") partway through a large scan, plus verify the download-run side survives the same class of failure | Done | Root cause: Docusign's Rooms list never recycles DOM rows as you scroll past them, and a scan always starts from the account's very first room - by the time it reached a large enough point in a big account's history, the tab ran out of memory. Fixed with `trimOldRoomRows()`, removing all but the most recent ~500 rendered rows every loop iteration; safe only because results are now accumulated into a JS-side array (`seenUrls`/`collected`) as the scan progresses instead of being read back out of the DOM at the end. Also added periodic checkpoint CSV saves (every 1,000 new rooms) directly requested alongside the crash report ("is there a way to actively write a file while rooms are being scanned?"), and a `chrome.alarms`-driven watchdog for the one case still invisible to every existing signal - a crashed-but-not-closed tab, which `chrome.tabs.onRemoved`/`onUpdated` structurally can't detect. Separately verified (not assumed) that the *download-run* side already survives the same crash class, via its own architecture (every room gets a fresh page load, unlike scanning's one continuous session) plus the existing 90s `withTimeout()` bound - proven with a real end-to-end test simulating a crashed worker tab, confirming the room is marked Failed and persisted, the run continues to the next room, and a real Download Report CSV still gets written. Along the way, found and fixed a genuine resource leak in `withTimeout()` itself - its internal timer was never cleared on the fast path, discovered because a new test's run pushed the whole suite from ~4s to over 90s; fixed by clearing the timer once the race settles, confirmed by the same suite dropping straight back to ~4s. Full suite: 114/114. See `DESIGN.md` Decision 37. |
 | 5w. A second way a scan could silently report "0 rooms" | Fix a scan reporting a misleadingly "successful" empty export, reported directly right after phase 5v shipped | Done | The panel showed "Exported 0 rooms" - the success-path message, not the failure one phase 5v's sort-order fix would have produced - on an account/range already confirmed to hold 7,000+ real rooms. No checkpoint file existed for this scan, confirming it never accumulated even 1,000 rooms - ruling out data loss in the checkpoint system itself, which was separately re-verified end-to-end on request and found correct. Root cause: a second, distinct way `autoScrollAndCollectRooms()` could return an empty result successfully - the sort dropdown can be correctly set while the room-list table itself never renders a single row for the whole no-new-rooms window, which the sort-order check doesn't catch since the sort itself is fine. Fixed by throwing specifically when the loop ends via no-new-rooms *and* zero rooms were ever collected - a case that's never a legitimate empty-range answer, since even an out-of-range room would still render and be caught by the date check instead. The (common, legitimate) case of finding some rooms and then genuinely running out was left untouched. See `DESIGN.md` Decision 38. |
+| 5x. Research-grounded audit - stale-DOM read, a storage race, a "high-risk areas" map | Proactively audit the codebase against how comparable systems are documented to fail, not just react to the next reported symptom | Done | Researched real failure modes in similar systems (MV3 service workers, infinite-scroll scrapers, worker-pool task queues) before reading code, then verified every finding against this codebase directly rather than assuming the research applied. Confirmed all 7 of `background.js`'s top-level listeners are correctly synchronous (a real, documented MV3 pitfall - checked and found not to apply here). Found and fixed a genuine stale-DOM read in `getRoomCardsAndLinks()`: a room row caught mid-render (link present, name/date not yet rendered - React batches DOM updates) got marked "seen" permanently on that first, incomplete read, then silently vanished from the export forever once its null date failed the range filter - fixed by treating a not-yet-rendered row the same as a not-yet-rendered link, retried on a later scroll instead of lost. Found and fixed a real, documented storage race: `chrome.storage.local` provides no ordering guarantee for concurrent writes to the same key, and multiple worker tabs genuinely call `persistJob()` at effectively the same time - now serialized through a shared promise chain so writes can never overlap. A first version of the regression test for this had a flawed premise and was corrected after it failed, rather than the failure being papered over. Added a permanent "High-Risk Areas" reference section to `DESIGN.md`, organized by function/area instead of chronologically, so a future pass can quickly tell which parts of the codebase have needed real fixes more than once and what to check before touching them again. Full suite: 115/115. See `DESIGN.md` Decision 39. |
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
 build-log framing) — this table exists so you don't have to read either in
@@ -1198,6 +1199,45 @@ here for the full story.
   date check instead. The common, legitimate case - finding some rooms
   and then genuinely running out - was left exactly as it already
   correctly worked. Full reasoning in `DESIGN.md`'s Decision 38.
+
+#### Phase 5x: A Research-Grounded Audit
+
+- **Proactively audited the codebase against how comparable systems are
+  documented to fail**, rather than reacting to the next reported
+  symptom - requested directly: "research similar projects... verify
+  with tests that represent accurate real world scenarios." Researched
+  real failure modes in MV3 service workers, infinite-scroll scrapers,
+  and worker-pool task queues first, then checked every finding
+  against this codebase directly instead of assuming it applied.
+  Confirmed all 7 of `background.js`'s top-level listeners are
+  correctly synchronous (a real, documented MV3 pitfall that turned
+  out not to apply here - worth recording as checked, not left
+  unverified).
+- **Found and fixed a genuine stale-DOM read** in
+  `getRoomCardsAndLinks()` - a room row caught mid-render (link
+  present, name/date not yet rendered, since React batches DOM
+  updates) got marked "seen" permanently on that first, incomplete
+  read, then silently vanished from the export forever once its null
+  date failed the range filter. Fixed by treating a not-yet-rendered
+  row the same as a not-yet-rendered link: skipped this iteration,
+  correctly retried on a later scroll once fully rendered.
+- **Found and fixed a real, documented storage race** - `chrome.storage.local`
+  provides no ordering guarantee for concurrent writes to the same
+  key (confirmed against the Chromium extensions team's own
+  description, not assumed), and multiple worker tabs genuinely call
+  `persistJob()` at effectively the same moment during a real run.
+  Serialized every write through a shared promise chain so two writes
+  can never actually overlap. The first version of the regression test
+  for this had a flawed premise and failed - corrected rather than
+  papered over, and documented as an example of the verification this
+  audit was asked to apply to itself, not just to the code.
+- **Added a permanent "High-Risk Areas" reference** to `DESIGN.md`,
+  organized by function/area instead of chronologically - a quick way
+  for a future pass to tell which parts of the codebase have needed
+  real fixes more than once (`content/scan.js`'s scan loop most of
+  all: five separate fixes in this session alone) and exactly what to
+  check before touching them again. Full suite: 115/115. Full
+  reasoning in `DESIGN.md`'s Decision 39.
 
 ---
 
