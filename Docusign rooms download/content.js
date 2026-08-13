@@ -459,9 +459,9 @@
         // respond" apart from "still legitimately working" except a
         // timeout (see withTimeout() there) - without this try/catch, one
         // room hitting an unexpected DOM issue would silently stall that
-        // room for a full 90s instead of failing immediately with a real
-        // reason, and do so on every single room where it happens across a
-        // whole run.
+        // room for the full room-processing bound (180s) instead of
+        // failing immediately with a real reason, and do so on every
+        // single room where it happens across a whole run.
         try {
           const result = await processCurrentRoom(message);
           sendResponse(result);

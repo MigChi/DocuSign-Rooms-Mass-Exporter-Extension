@@ -232,7 +232,7 @@ function logWorkerEvent(type, detail = {}) {
 // concurrent set() calls to the same key. Multiple worker tabs genuinely
 // do call persistJob() at effectively the same time in real operation -
 // each reaches its own call via an independently-timed chain of awaits
-// inside processRoom() (page loads, the 90s room-processing bound,
+// inside processRoom() (page loads, the room-processing bound,
 // download-start polling), so two calls overlapping in flight is the
 // normal case at real concurrency, not an edge case. Without this, a
 // write that happens to *complete* later - even though it was *issued*
@@ -577,8 +577,9 @@ function withTimeout(promise, timeoutMs, timeoutValue) {
   // fast/common path (`promise` resolves well before `timeoutMs`), Node
   // still keeps this timer alive and pending for the *entire* `timeoutMs`
   // regardless, since Promise.race() never cancels its losing entries on
-  // its own. Left unfixed, that's one dangling 90-second timer
-  // accumulating per room processed - across an 8000-room run split over
+  // its own. Left unfixed, that's one dangling timer (currently up to
+  // 180s, see the DS_PROCESS_ROOM caller below) accumulating per room
+  // processed - across an 8000-room run split over
   // several workers, potentially hundreds pending at once, real
   // memory/event-loop pressure in a service worker whose ephemeral
   // lifecycle already has enough of that to contend with.
@@ -967,21 +968,31 @@ async function processRoom(tabId, room) {
       // onMessage listener actually being attached.
       await sleep(500);
 
-      // Bounded to 90s - comfortably above processCurrentRoom()'s own
-      // worst-case legitimate duration (up to 45s waiting for the
-      // documents list, plus up to ~22s more across selecting/clicking
-      // Download, see content.js) - so a genuinely slow page is never
-      // mistaken for a stuck one, while a truly stuck one can't hang the
-      // rest of the run. See withTimeout()'s own comment for why this,
-      // specifically, was the one unbounded wait in this whole pipeline.
+      // Bounded to 180s (was 90s - confirmed live as too tight for a real,
+      // unusually large room: 180 documents/~144MB, one genuine timeout on
+      // its first attempt, succeeded on retry). The original 90s figure
+      // was sized against processCurrentRoom()'s *fixed* waits (up to 45s
+      // for the documents list, up to ~22s more across selecting/clicking
+      // Download) - it never accounted for content.js's selectAllDocuments()
+      // clicking every single document's checkbox in a plain for-loop, one
+      // dispatched click event at a time, each potentially costing Docusign's
+      // own React app a real re-render. That cost scales with document
+      // count and was invisible in the original budget, which implicitly
+      // assumed a small, roughly constant-time selection step. Doubled
+      // rather than finely tuned to this one data point - comfortably
+      // covers a room several times larger than the one that triggered
+      // this, while a truly stuck room (not just a large one) still can't
+      // hang the rest of the run indefinitely. See withTimeout()'s own
+      // comment for why this, specifically, was the one unbounded wait in
+      // this whole pipeline.
       const response = await withTimeout(
         chrome.tabs.sendMessage(tabId, {
           type: "DS_PROCESS_ROOM",
           roomId,
           documentsUrl
         }).catch(err => ({ ok: false, reason: err.message || "Could not message room tab" })),
-        90000,
-        { ok: false, reason: "Room processing timed out - no response from the room tab after 90s" }
+        180000,
+        { ok: false, reason: "Room processing timed out - no response from the room tab after 180s" }
       );
 
       const finalRoomName = cleanName(response?.roomName || guessedRoomName);

@@ -61,6 +61,7 @@ This document walks through the problem in the order it was actually solved: wha
 - [Decision 46: Replacing the Scan Entirely - Reading Docusign's Own Internal Rooms API Directly Instead of Scrolling the Page](#decision-46-replacing-the-scan-entirely---reading-docusigns-own-internal-rooms-api-directly-instead-of-scrolling-the-page)
 - [Decision 47: Stale "In Progress" Checkpoint Files Left Behind After a Successful Scan](#decision-47-stale-in-progress-checkpoint-files-left-behind-after-a-successful-scan)
 - [Decision 48: A Full Codebase and Documentation Audit - a Real Mutual-Exclusion Gap, a Narrow Message-Wording Race, and Cross-Document Cleanup](#decision-48-a-full-codebase-and-documentation-audit---a-real-mutual-exclusion-gap-a-narrow-message-wording-race-and-cross-document-cleanup)
+- [Decision 49: A Real Room-Processing Timeout, Traced to a 180-Document Room the Original Budget Never Accounted For](#decision-49-a-real-room-processing-timeout-traced-to-a-180-document-room-the-original-budget-never-accounted-for)
 - [Engineering Concepts Demonstrated](#engineering-concepts-demonstrated)
 - [Development Process: Human-Authored, AI-Guided](#development-process-human-authored-ai-guided)
 
@@ -987,6 +988,22 @@ A direct browser navigation to that exact URL failed with `{"message":"Could not
 **Full audit result on everything else checked:** no dead code, no orphaned/unhandled message types (every `DS_*` type sent has a matching handler and vice versa, verified exhaustively), no remaining references anywhere in `background.js`/`content.js` to the deleted DOM-scan internals (`getScrollContainer`, `trimOldRoomRows`, `everIncompleteUrls`, etc. - these only appear, correctly, as explicit historical context in `content/scan.js`'s own header and `DESIGN.md`), no weak/trivial/duplicate tests, and no coverage gaps - every exported function has direct tests, and Decision 47's checkpoint-cleanup logic has dedicated tests for all of its branches. `DESIGN.md`'s High-Risk Areas section and both documents' Tables of Contents/Development Phases tables were confirmed complete and accurate against the current code.
 
 **Tested with 1 new regression test** (`DS_START_QUEUE` refusing to start while `STATE.scanning` is true), verified via revert-confirm-restore. Full suite: **159/159 passing** (158 prior + 1 new).
+
+---
+
+## Decision 49: A Real Room-Processing Timeout, Traced to a 180-Document Room the Original Budget Never Accounted For
+
+**Problem, reported directly from a real Download Report:** a room ("Elizabeth Nunez - Buyer", room ID 6574729) showed `Failed - Room processing timed out - no response from the room tab after 90s`, but the user confirmed directly that the room genuinely has a working download option - this wasn't a room the automation could never handle, something just took too long.
+
+**Investigated with real evidence, not assumption.** Grepped the actual Download Report CSV: this was the *only* timeout in a ~7,900-room run, every neighboring room downloaded normally - ruling out a systemic problem (a dead worker tab, a network outage, a bug in the automation sequence itself) and pointing at something specific to this one room. Re-uploading the same report to retry (per this project's standing design - a `Failed` room is always safely re-queued on resume) succeeded on the second attempt. Checked the actual downloaded file: **180 documents, ~144MB** - confirmed by unzipping it and counting, not guessed.
+
+**Traced to a real gap in the original timeout budget's own reasoning (Decision 34).** The 90s bound on `processRoom()`'s `chrome.tabs.sendMessage()` call was sized against `processCurrentRoom()`'s *fixed* waits - up to 45s for the documents list, up to ~22s more across selecting/clicking Download - a budget that implicitly assumed the "select all documents" step takes roughly constant time regardless of room size. It doesn't: `content.js`'s `selectAllDocuments()` clicks every single document's checkbox in a plain `for` loop, one dispatched click event at a time, each one potentially costing Docusign's own React app a real re-render. That cost scales with document count and was completely invisible in the original 90s budget's math - a room with 180 documents pays for that loop 180 times over, something a typical smaller room never would have exposed.
+
+**Fixed by doubling the bound to 180s**, not by finely tuning it to this one data point - deliberately generous rather than precisely calculated, the same reasoning Decision 37's checkpoint-interval choice used: comfortably covers a room several times larger than the one that actually triggered this, while a room that's genuinely stuck (not just large) still can't hang the rest of the run indefinitely. Also updated `withTimeout()`'s own neighboring comment and `content.js`'s matching comment, both of which cited the old 90s figure as current behavior rather than history.
+
+**Deliberately not built: a timeout that scales with document count.** This would be a more precisely "correct" fix, but `background.js` doesn't know a room's document count until `content.js` reports it *after* processing starts - scaling the bound in advance would need a two-phase message protocol (report count, then process) that doesn't exist today. A flat, generous constant solves the actual reported problem without that added complexity, consistent with this project's standing preference for the simplest fix that actually closes the gap found, not the most theoretically complete one.
+
+**No test changes needed** - no existing test asserted the literal `90000`/"90s" value (the `withTimeout()` unit tests use their own small literal deadlines), so the bump required no test updates; the full suite's unchanged pass count is itself confirmation nothing broke. Full suite: **159/159 passing** (no change from Decision 48).
 
 ---
 
