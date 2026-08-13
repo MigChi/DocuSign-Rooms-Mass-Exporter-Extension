@@ -31,7 +31,11 @@ function makeChromeStub() {
     // persisted job and returns immediately - most tests don't care about
     // resume behavior and shouldn't have to stub around it.
     get: async () => ({}),
-    set: async () => {},
+    // Every call recorded (not just a no-op) so a test can assert real
+    // persistence happened - e.g. that a crashed room's result actually
+    // made it into a saved snapshot, not just STATE in memory.
+    setCalls: [],
+    set: async (...args) => { storageLocal.setCalls.push(args); },
     // Calls recorded in `removeCalls` (not just a no-op) so a test can
     // assert a persisted job was deliberately left alone - e.g. runQueue()'s
     // crash path, which must NOT clear it so a later resume can still pick
@@ -40,14 +44,20 @@ function makeChromeStub() {
     remove: async (...args) => { storageLocal.removeCalls.push(args); }
   };
 
+  const downloads = {
+    onDeterminingFilename: { addListener() {} },
+    onChanged: { addListener() {} },
+    // Every call recorded (not just a no-op) so a test can assert on
+    // exactly what filename/conflictAction a download - a checkpoint
+    // save, a real export, a room ZIP's routing - actually requested.
+    downloadCalls: [],
+    download: async options => { downloads.downloadCalls.push(options); return {}; },
+    search: async () => []
+  };
+
   return {
     runtime,
-    downloads: {
-      onDeterminingFilename: { addListener() {} },
-      onChanged: { addListener() {} },
-      download: async () => ({}),
-      search: async () => []
-    },
+    downloads,
     storage: {
       local: storageLocal
     },
@@ -80,6 +90,21 @@ function makeChromeStub() {
       calls: [],
       requestKeepAwake(level) { this.calls.push(`request:${level}`); },
       releaseKeepAwake() { this.calls.push("release"); }
+    },
+    // The scan-stall watchdog (see SCAN_WATCHDOG_ALARM in background.js)
+    // creates a real chrome.alarms alarm rather than a JS timer, so it
+    // survives a service-worker restart - onAlarm's listener is captured
+    // the same way onMessage/onRemoved/onUpdated are, letting a test fire
+    // it directly to simulate the alarm's periodic check without waiting
+    // on a real 1-minute interval. create()/clear() calls are recorded so
+    // a test can confirm the watchdog is actually being armed and disarmed
+    // at the right points, not just trust the alarm fires eventually.
+    alarms: {
+      onAlarm: { addListener(fn) { this._listener = fn; } },
+      createCalls: [],
+      clearCalls: [],
+      create(name, info) { this.createCalls.push({ name, info }); },
+      clear(name) { this.clearCalls.push(name); }
     }
   };
 }

@@ -107,6 +107,19 @@ const STATE = {
   scanTabId: null,
   scanMode: null,
   scanDateRangeLabel: null,
+  // Stable filename reused across every DS_SCAN_CHECKPOINT write for the
+  // current scan (see that handler's own comment) - computed once when the
+  // scan starts, not per-checkpoint, so repeated checkpoint saves actually
+  // overwrite the same file instead of each getting its own timestamp.
+  scanCheckpointFilename: null,
+  // Timestamp of the most recent sign of life from an active scan
+  // (DS_SCAN_PROGRESS or DS_SCAN_CHECKPOINT arriving) - what the
+  // chrome.alarms-driven watchdog below compares against to detect a
+  // scan tab that's gone silent (crashed - "Aw, Snap!" - or hung) without
+  // ever being closed or navigated away from, the one case
+  // chrome.tabs.onRemoved/onUpdated structurally can't catch, since the
+  // tab itself never changes state in either of those observable ways.
+  lastScanActivityAt: null,
   // Keyed by tabId - was a single STATE.currentRoom object before
   // concurrency, since only one room was ever in flight at a time. Now
   // there's one entry per active worker tab.
@@ -132,6 +145,19 @@ const STATE = {
 
 const PERSIST_KEY = "dsJob";
 const MAX_WORKER_EVENTS = 300;
+
+// Name for the chrome.alarms-driven scan-stall watchdog (see its own
+// listener, near the tab-lifecycle listeners below) and how long a scan
+// can go without any sign of life (a DS_SCAN_PROGRESS or
+// DS_SCAN_CHECKPOINT message) before it's treated as stalled. 2 minutes
+// is comfortably longer than any single legitimate step in the scan loop
+// (a scroll+wait cycle is ~1.5-2s; even the slowest normal operation -
+// waiting for the sort-order popover at scan start - is bounded well
+// under a minute), so a silence this long is a strong, safe signal
+// something is genuinely wrong, not a false positive from an unusually
+// slow page.
+const SCAN_WATCHDOG_ALARM = "scanStallWatchdog";
+const SCAN_STALL_THRESHOLD_MS = 2 * 60 * 1000;
 
 // Console-logs immediately (visible in the SERVICE WORKER console) and
 // appends to STATE.workerEvents, trimmed to the most recent
@@ -488,10 +514,21 @@ async function waitForTabLoaded(tabId, timeoutMs = 60000) {
 // resolving - the entire run hangs forever, not just one room, even with
 // every other worker tab long done.
 function withTimeout(promise, timeoutMs, timeoutValue) {
-  return Promise.race([
-    promise,
-    new Promise(resolve => setTimeout(() => resolve(timeoutValue), timeoutMs))
-  ]);
+  // Explicitly cleared once the race settles, whichever side wins -
+  // confirmed as a real resource leak, not just a theoretical one: on the
+  // fast/common path (`promise` resolves well before `timeoutMs`), Node
+  // still keeps this timer alive and pending for the *entire* `timeoutMs`
+  // regardless, since Promise.race() never cancels its losing entries on
+  // its own. Left unfixed, that's one dangling 90-second timer
+  // accumulating per room processed - across an 8000-room run split over
+  // several workers, potentially hundreds pending at once, real
+  // memory/event-loop pressure in a service worker whose ephemeral
+  // lifecycle already has enough of that to contend with.
+  let timer;
+  const timeout = new Promise(resolve => {
+    timer = setTimeout(() => resolve(timeoutValue), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 // Verifies any previously-known worker tabs are still alive (survives a
@@ -1119,6 +1156,41 @@ async function runQueue() {
   }
 }
 
+// Shared by handleExportScanList() below and the DS_SCAN_CHECKPOINT
+// handler - both need the exact same "Room #, Room Name, Room ID,
+// Documents URL, Created Date" CSV shape, just under different filenames
+// and conflictAction policies (a real export gets a unique, final
+// filename; a checkpoint overwrites the same in-progress one every time).
+// Factored out rather than duplicated so the two can never quietly drift
+// apart on column order or formatting.
+function buildScanListCsvDataUrl(rooms) {
+  const roomsArr = Array.isArray(rooms) ? rooms : [];
+
+  const rows = [
+    ["Room #", "Room Name", "Room ID", "Documents URL", "Created Date"]
+  ];
+
+  roomsArr.forEach((r, idx) => {
+    rows.push([
+      idx + 1,
+      r.roomName || "",
+      r.roomId || "",
+      r.documentsUrl || "",
+      // Was `String(r.createdDate || "").slice(0, 10)` - looks
+      // plausible but is wrong for any non-UTC timezone: Date's default
+      // toString() isn't an ISO string, so slicing its first 10
+      // characters produces something like "Sun Jan 03" (no year, and
+      // a calendar day off from the real date) rather than
+      // "2021-01-04". formatCreatedDateForCsv() (content/utils.js)
+      // uses toISOString() instead, which this format actually needs.
+      formatCreatedDateForCsv(r.createdDate)
+    ]);
+  });
+
+  const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
+  return "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
+}
+
 // Builds and downloads the Scan List CSV. A plain function, not a message
 // handler - this used to be DS_EXPORT_SCAN_LIST's entire body, but once
 // scanning moved behind the DS_RUN_SCAN relay (see the panel-window
@@ -1134,30 +1206,7 @@ async function runQueue() {
 async function handleExportScanList(rooms, dateRangeLabel) {
   try {
     const roomsArr = Array.isArray(rooms) ? rooms : [];
-
-    const rows = [
-      ["Room #", "Room Name", "Room ID", "Documents URL", "Created Date"]
-    ];
-
-    roomsArr.forEach((r, idx) => {
-      rows.push([
-        idx + 1,
-        r.roomName || "",
-        r.roomId || "",
-        r.documentsUrl || "",
-        // Was `String(r.createdDate || "").slice(0, 10)` - looks
-        // plausible but is wrong for any non-UTC timezone: Date's default
-        // toString() isn't an ISO string, so slicing its first 10
-        // characters produces something like "Sun Jan 03" (no year, and
-        // a calendar day off from the real date) rather than
-        // "2021-01-04". formatCreatedDateForCsv() (content/utils.js)
-        // uses toISOString() instead, which this format actually needs.
-        formatCreatedDateForCsv(r.createdDate)
-      ]);
-    });
-
-    const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
-    const dataUrl = "data:text/csv;charset=utf-8," + safeEncodeURIComponent(csv);
+    const dataUrl = buildScanListCsvDataUrl(roomsArr);
     const label = typeof dateRangeLabel === "string" ? dateRangeLabel : null;
     const filename = `Docusign Rooms/_Scan Lists/${labeledFilename("Scan List", label)}.csv`;
 
@@ -1451,6 +1500,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         STATE.scanTabId = targetTab.id;
         STATE.scanMode = message.mode;
         STATE.scanDateRangeLabel = typeof message.dateRangeLabel === "string" ? message.dateRangeLabel : null;
+        // Computed once here, not per-checkpoint - see the field's own
+        // comment on STATE for why a stable filename is what makes
+        // repeated checkpoint saves actually overwrite each other instead
+        // of piling up a new timestamped file every time.
+        STATE.scanCheckpointFilename = `Docusign Rooms/_Scan Lists/Scan List${STATE.scanDateRangeLabel ? ` (${cleanName(STATE.scanDateRangeLabel)})` : ""} (in progress - partial).csv`;
+        STATE.lastScanActivityAt = Date.now();
+        // Periodic alarm (minimum period Chrome allows for chrome.alarms is
+        // 1 minute) - the watchdog listener below fires on this, checking
+        // whether STATE.lastScanActivityAt has gone stale. Recreated on
+        // every scan start rather than left running from a previous one -
+        // chrome.alarms.create() with the same name replaces any existing
+        // alarm outright, so this can never end up with two running.
+        chrome.alarms.create(SCAN_WATCHDOG_ALARM, { periodInMinutes: 1 });
 
         // Only acknowledging that the scan *started* - the actual result
         // arrives later via DS_SCAN_COMPLETE below, since a scan can run
@@ -1464,18 +1526,61 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         STATE.scanTabId = null;
         STATE.scanMode = null;
         STATE.scanDateRangeLabel = null;
+        STATE.scanCheckpointFilename = null;
+        // Only actually pending if the throw happened after
+        // chrome.alarms.create() above ran - clearing an alarm that was
+        // never created is a harmless no-op, not an error.
+        chrome.alarms.clear(SCAN_WATCHDOG_ALARM);
         sendResponse({ ok: false, reason: "Could not reach the Docusign tab - try refreshing it and make sure you're on the Rooms list page." });
       }
       return;
     }
 
     if (message.type === "DS_SCAN_PROGRESS") {
+      // Doubles as the scan-stall watchdog's sign-of-life signal (see
+      // SCAN_STALL_THRESHOLD_MS/the chrome.alarms listener below) - this
+      // fires on every scroll iteration under normal conditions (~every
+      // 1.5-2s), so a real gap here is a strong signal something's wrong,
+      // not just a coincidence of message timing.
+      STATE.lastScanActivityAt = Date.now();
+
       // Relay only - content scripts can't reach the standalone panel
       // window directly (chrome.tabs.sendMessage only targets tabs; the
       // panel is an extension page, not a tab). chrome.runtime.sendMessage
       // (no tabId - a broadcast) is what reaches it, same as
       // broadcastStatus() below.
       chrome.runtime.sendMessage({ type: "DS_SCAN_PROGRESS", text: message.text }).catch(() => {});
+      return;
+    }
+
+    // Sent periodically by content/scan.js's autoScrollAndCollectRooms()
+    // during a long scan, not just at the very end - added directly in
+    // response to a real tab crash mid-scan on a large account, and the
+    // question that followed it: "is there a way to actively write a file
+    // while rooms are being scanned?" Reuses handleExportScanList()'s own
+    // CSV-building logic (buildScanListCsvDataUrl()) but with
+    // conflictAction: "overwrite" against the one stable filename computed
+    // once at scan start (STATE.scanCheckpointFilename), so repeated
+    // checkpoints replace the same in-progress file instead of piling up a
+    // new one every few minutes. `.catch()`'d rather than awaited plainly -
+    // a failed checkpoint write must never be allowed to break the scan
+    // itself, which is still running independently in the content script
+    // regardless of whether this particular save succeeds.
+    if (message.type === "DS_SCAN_CHECKPOINT") {
+      const rooms = Array.isArray(message.rooms) ? message.rooms : [];
+      if (!rooms.length || !STATE.scanCheckpointFilename) return;
+
+      const dataUrl = buildScanListCsvDataUrl(rooms);
+      pendingReportFilenames.set(dataUrl, STATE.scanCheckpointFilename);
+      chrome.downloads.download({
+        url: dataUrl,
+        filename: STATE.scanCheckpointFilename,
+        saveAs: false,
+        conflictAction: "overwrite"
+      }).catch(err => {
+        console.warn("[DSBD] checkpoint CSV write failed", err);
+        logWorkerEvent("scan_checkpoint_failed", { error: err?.message || String(err) });
+      });
       return;
     }
 
@@ -1487,6 +1592,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const dateRangeLabel = STATE.scanDateRangeLabel;
       STATE.scanMode = null;
       STATE.scanDateRangeLabel = null;
+      STATE.scanCheckpointFilename = null;
+      chrome.alarms.clear(SCAN_WATCHDOG_ALARM);
 
       // content.js sets this when autoScrollAndCollectRooms() itself threw
       // (see its DS_BEGIN_SCAN handler) - state is already cleaned up above
@@ -1751,6 +1858,8 @@ chrome.tabs.onRemoved.addListener(tabId => {
   STATE.scanTabId = null;
   STATE.scanMode = null;
   STATE.scanDateRangeLabel = null;
+  STATE.scanCheckpointFilename = null;
+  chrome.alarms.clear(SCAN_WATCHDOG_ALARM);
 
   logWorkerEvent("scan_tab_closed", { tabId });
   chrome.runtime.sendMessage({ type: "DS_SCAN_FAILED", reason: "The Docusign tab was closed while scanning." }).catch(() => {});
@@ -1776,9 +1885,49 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   STATE.scanTabId = null;
   STATE.scanMode = null;
   STATE.scanDateRangeLabel = null;
+  STATE.scanCheckpointFilename = null;
+  chrome.alarms.clear(SCAN_WATCHDOG_ALARM);
 
   logWorkerEvent("scan_tab_navigated", { tabId });
   chrome.runtime.sendMessage({ type: "DS_SCAN_FAILED", reason: "The Docusign tab was reloaded or navigated away while scanning." }).catch(() => {});
+});
+
+// The two listeners above catch a scan tab that's closed or navigated away
+// - both real, observable tab-lifecycle events. A tab that crashes
+// ("Aw, Snap!") is neither: Chrome leaves it in place, showing its own
+// error page, with no dedicated chrome.tabs event for "this tab's renderer
+// died" - confirmed there's genuinely no direct signal available for this
+// specific case, unlike the two above. This alarm-driven watchdog is the
+// only way to detect it: if a scan is active and DS_SCAN_PROGRESS/
+// DS_SCAN_CHECKPOINT (both update STATE.lastScanActivityAt) haven't
+// arrived in over SCAN_STALL_THRESHOLD_MS, something is almost certainly
+// wrong - reported the same way as the two structurally-detectable cases
+// above, through DS_SCAN_FAILED, rather than leaving the panel frozen
+// indefinitely waiting for a tab that will never respond again. Uses
+// chrome.alarms rather than setInterval specifically because MV3 service
+// workers are ephemeral - an alarm survives the worker being killed and
+// restarted (Chrome wakes it back up when the alarm fires), where a
+// setInterval timer would simply be gone the moment the worker was.
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name !== SCAN_WATCHDOG_ALARM) return;
+  if (!STATE.scanning || !STATE.lastScanActivityAt) return;
+
+  const idleMs = Date.now() - STATE.lastScanActivityAt;
+  if (idleMs < SCAN_STALL_THRESHOLD_MS) return;
+
+  STATE.scanning = false;
+  updateKeepAwake();
+  STATE.scanTabId = null;
+  STATE.scanMode = null;
+  STATE.scanDateRangeLabel = null;
+  STATE.scanCheckpointFilename = null;
+  chrome.alarms.clear(SCAN_WATCHDOG_ALARM);
+
+  logWorkerEvent("scan_watchdog_stalled", { idleMs });
+  chrome.runtime.sendMessage({
+    type: "DS_SCAN_FAILED",
+    reason: "The scan appears to have stopped responding (no progress for over 2 minutes) - the Docusign tab may have crashed. Check that tab, close or reload it, and try again. If a checkpoint was saved, you'll find it in Downloads / Docusign Rooms / _Scan Lists (filename ending \"in progress - partial\")."
+  }).catch(() => {});
 });
 
 // Module-level, not STATE - a live browser resource (a window either
@@ -1933,6 +2082,8 @@ if (typeof module !== "undefined" && module.exports) {
     safeEncodeURIComponent,
     waitForInFlightDownloadsToSettle,
     matchVerifiedDownloads,
-    withTimeout
+    withTimeout,
+    SCAN_WATCHDOG_ALARM,
+    SCAN_STALL_THRESHOLD_MS
   };
 }

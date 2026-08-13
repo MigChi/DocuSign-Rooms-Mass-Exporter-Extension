@@ -316,6 +316,7 @@ summary of it, not a second copy that can drift.
 | 5s. Full codebase audit for the same silent-hang bug class, in the actual download-running path | Audit every feature for anything that could make it "just stop," before sending this to other market centers | Done | Decision 33 covered the scan relay; this pass read every remaining file end-to-end and found the same failure shape twice more, this time in the higher-stakes download-running path: (1) `runQueue()` had no top-level try/catch, and both its call sites (`DS_START_QUEUE`, the startup-resume IIFE) invoke it fire-and-forget - an uncaught throw anywhere inside it (most plausibly `ensureWorkerTabs()`'s unguarded `chrome.tabs.create()`) would skip every cleanup step, leaving `STATE.running` stuck `true` forever with no report and no error shown; (2) `processRoom()`'s `chrome.tabs.sendMessage()` call to the worker tab was the one wait in the entire pipeline with no timeout - Chrome's messaging API leaves that promise pending forever if `sendResponse()` is never called, which a thrown error in `content.js`'s `DS_PROCESS_ROOM` handler (also previously unguarded) could cause on any single room, hanging the *entire run*, not just that room, since `runQueue()`'s `Promise.all()` can't resolve until every worker's loop exits. Fixed both: `runQueue()` now catches its own failures, resets state, writes a best-effort partial report, and broadcasts a new `DS_RUN_FAILED` message so the panel shows a real crash instead of reading it as a normal "Done"; a new `withTimeout()` helper bounds the room-messaging call to 90s, and `content.js`'s handler now reports a real error immediately instead of risking the full 90s wait. Verified with 5 new regression tests, including two that drive a full `DS_START_QUEUE` message through the real listener with `chrome.tabs.create` mocked to throw, confirming the crash path resets state, broadcasts correctly, and deliberately leaves the persisted job intact for a later resume. Full suite: 106/106. See `DESIGN.md` Decision 34. |
 | 5t. Removed the scroll-count safety cap entirely | Fix a scan silently stopping partway through a large date range, reported directly with the exact room count and date it happened at | Done | Checked against the account's own real Scan List CSVs: two independent scan runs, same date range, both stopped at the *exact same room* (2913 found, room ID `8659058`, `2023-06-10`) - that reproducibility points at a deterministic cap, not the timing-dependent no-new-rooms condition. `content/scan.js`'s `totalScrolls < 400` loop guard was a circuit-breaker against a genuinely infinite loop, never meant to be a real ceiling, but at this account's observed ~7.3 rooms/scroll, 400 scrolls covered only ~2900 rooms - far short of the 10,000+-room scale this project is built for. First raised 25x to 10,000, then reconsidered as still just a bigger arbitrary number with the same failure mode at large enough scale - removed as a stopping condition entirely, since the loop already has a real signal for "done": `outOfRangeStreak` (several consecutive rooms confirmed past the requested end date, valid because the list is sorted oldest-first). `noNewRoomAttempts`'s threshold also widened (7 → 15) since the two real runs stopped at different rooms, suggesting real timing variance worth a wider margin. The scroll count is still tracked and now shown in the periodic status line instead of discarded, so a long scan reads as active rather than possibly frozen. See `DESIGN.md` Decision 35. |
 | 5u. `chrome.power` keep-awake, and a silent-empty-scan gap it exposed | Fix the computer's lock screen turning on despite the user's own OS sleep settings being disabled, reported directly alongside another scan stopping short | Done | The first stop traced to `content/scan.js`'s sort-order guard returning `[]` (not throwing) when the page wasn't in the expected state - indistinguishable downstream from a genuine "zero rooms in this range" result, most likely caused by the Docusign tab being logged out or reset after sitting backgrounded through the lock-screen interruption. Fixed by throwing instead, routing through the existing `DS_SCAN_FAILED` path for a real, visible reason instead of a silently unhelpful empty CSV. The lock screen itself can't be fixed by re-checking OS settings that had apparently already failed to hold (reset by an update, a battery-profile switch, a device policy) - added `chrome.power.requestKeepAwake("display")` instead, a direct OS-level request independent of the user's own settings, called after all twelve places `STATE.running`/`STATE.scanning` change so it can never drift out of sync with what's actually active. Not a complete guarantee (a closed laptop lid is a common exception on most OSes), so the existing manual OS-setting guidance in `HOW_TO_USE.md` stays as a first line of defense, with this as a second, code-level one. Verified with 3 new regression tests confirming the keep-awake lock is requested and released correctly across a normal run, a crashed run, and a failed scan. Full suite: 109/109. See `DESIGN.md` Decision 36. |
+| 5v. Real tab crash on a large account - DOM trimming, checkpointed progress, a stall watchdog | Fix the browser tab itself crashing ("Aw, Snap!") partway through a large scan, plus verify the download-run side survives the same class of failure | Done | Root cause: Docusign's Rooms list never recycles DOM rows as you scroll past them, and a scan always starts from the account's very first room - by the time it reached a large enough point in a big account's history, the tab ran out of memory. Fixed with `trimOldRoomRows()`, removing all but the most recent ~500 rendered rows every loop iteration; safe only because results are now accumulated into a JS-side array (`seenUrls`/`collected`) as the scan progresses instead of being read back out of the DOM at the end. Also added periodic checkpoint CSV saves (every 1,000 new rooms) directly requested alongside the crash report ("is there a way to actively write a file while rooms are being scanned?"), and a `chrome.alarms`-driven watchdog for the one case still invisible to every existing signal - a crashed-but-not-closed tab, which `chrome.tabs.onRemoved`/`onUpdated` structurally can't detect. Separately verified (not assumed) that the *download-run* side already survives the same crash class, via its own architecture (every room gets a fresh page load, unlike scanning's one continuous session) plus the existing 90s `withTimeout()` bound - proven with a real end-to-end test simulating a crashed worker tab, confirming the room is marked Failed and persisted, the run continues to the next room, and a real Download Report CSV still gets written. Along the way, found and fixed a genuine resource leak in `withTimeout()` itself - its internal timer was never cleared on the fast path, discovered because a new test's run pushed the whole suite from ~4s to over 90s; fixed by clearing the timer once the race settles, confirmed by the same suite dropping straight back to ~4s. Full suite: 114/114. See `DESIGN.md` Decision 37. |
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
 build-log framing) — this table exists so you don't have to read either in
@@ -1113,6 +1114,64 @@ here for the full story.
   keep-awake lock is requested and released correctly across a normal
   run, a crashed run, and a failed scan. Full suite: 109/109. Full
   reasoning in `DESIGN.md`'s Decision 36.
+
+#### Phase 5v: A Real Tab Crash on a Large Account - DOM Trimming, Checkpoints, a Stall Watchdog
+
+- **Fixed the browser tab itself crashing ("Aw, Snap!") partway
+  through a large scan** - reported directly: "the web page crashes
+  and it like reaches max to i believe 10/2024 i believe it cannot
+  handle so many rooms being loaded at once." Root cause confirmed:
+  Docusign's Rooms list never recycles DOM rows as you scroll past
+  them, and a scan always starts from the account's very first room -
+  by the time a large account's scan reached far enough into its
+  history, the tab ran out of memory holding every row it had ever
+  loaded. Fixed with `trimOldRoomRows()`, removing all but the most
+  recently-rendered ~500 room rows every loop iteration; safe only
+  because results are now accumulated into a JS-side array
+  (`seenUrls`/`collected`) as the scan progresses instead of being read
+  back out of the DOM at the very end, which trimming would otherwise
+  make unreliable.
+- **Added periodic checkpoint saves during a long scan** - raised
+  directly, in the same breath as the crash report: "is there a way to
+  actively write a file while rooms are being scanned?" Every 1,000
+  newly-collected rooms, the scan now saves everything found so far to
+  a stable, overwritten-in-place CSV (`Docusign Rooms/_Scan Lists/...
+  (in progress - partial).csv`), so an interruption loses at most a
+  few minutes of progress instead of the whole scan.
+- **Added a `chrome.alarms`-driven watchdog for a crashed-but-not-closed
+  tab** - the one failure mode still invisible to every existing
+  signal even after the fixes above. `chrome.tabs.onRemoved`/
+  `onUpdated` (Decision 33) catch a tab being closed or navigated; a
+  crash is neither, since Chrome leaves the tab in place showing its
+  own error page. If a scan goes more than 2 minutes with no progress
+  or checkpoint message, it's now treated as stalled and reported the
+  same way the other two cases already are, instead of leaving the
+  panel frozen indefinitely.
+- **Verified (not assumed) that the download-*run* side already
+  survives the same class of crash** - asked directly, with the
+  priority being that the CSV always gets written no matter what, so a
+  run can always be resumed. Traced the full path: each room gets a
+  fully fresh page load, unlike scanning's one continuous session, so
+  a crashed worker tab self-heals on the very next room's navigation;
+  and if the crash happens mid-room, the existing 90-second
+  `withTimeout()` bound (Decision 34) already catches it, marking that
+  room Failed with a real reason instead of hanging. Proved this with
+  a real end-to-end test simulating a crashed worker tab's message
+  channel failing outright - confirming the crashed room is marked
+  Failed and actually persisted to `chrome.storage.local`, the run
+  continues to the next room, and a real Download Report CSV still
+  gets written at the end.
+- **Found and fixed a genuine resource leak in `withTimeout()` along
+  the way** - its internal timer was never cleared once the race
+  settled via the other branch, so even on the fast, common path
+  (a real response arriving well before the 90-second bound), Node
+  kept that timer alive and pending for the full 90 seconds regardless.
+  Not just a theoretical concern: discovered because a new test's run
+  pushed the entire suite from ~4 seconds to over 90; fixed by
+  capturing and clearing the timer once the race settles, confirmed by
+  the same suite dropping straight back to ~4 seconds with all tests
+  still passing. Full suite: 114/114. Full reasoning in `DESIGN.md`'s
+  Decision 37.
 
 ---
 

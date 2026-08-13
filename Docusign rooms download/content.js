@@ -217,6 +217,17 @@
           chrome.runtime.sendMessage({ type: "DS_SCAN_PROGRESS", text }).catch(() => {});
         };
 
+        // Lets background.js save real progress to a checkpoint CSV during
+        // a long scan - added alongside content/scan.js's DOM-trimming fix
+        // for a real tab crash on a large account, raised at the same time
+        // as this exact question: "is there a way to actively write a file
+        // while rooms are being scanned?" A crash or interruption now loses
+        // at most one checkpoint interval's worth of progress, not
+        // everything back to the start of the scan.
+        const reportCheckpoint = rooms => {
+          chrome.runtime.sendMessage({ type: "DS_SCAN_CHECKPOINT", rooms }).catch(() => {});
+        };
+
         // Re-wrapped in `new Date(...)` defensively rather than trusted
         // as-is - structured clone (what chrome.runtime/tabs.sendMessage
         // use) preserves real Date objects across a message hop, and this
@@ -244,7 +255,7 @@
         // `message.error` and forwards it as DS_SCAN_FAILED, the same path
         // already used when the scan tab gets closed mid-scan.
         try {
-          const rooms = await autoScrollAndCollectRooms(reportProgress, dateRange, scanControl);
+          const rooms = await autoScrollAndCollectRooms(reportProgress, dateRange, scanControl, reportCheckpoint);
           chrome.runtime.sendMessage({ type: "DS_SCAN_COMPLETE", rooms }).catch(() => {});
         } catch (error) {
           chrome.runtime.sendMessage({

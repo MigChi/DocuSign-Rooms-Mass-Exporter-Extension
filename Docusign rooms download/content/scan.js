@@ -117,6 +117,33 @@ function getRoomCardsAndLinks() {
 }
 
 /**
+ * Removes all but the most recently-rendered `keepLastN` room rows from
+ * the DOM. Docusign's Rooms list is a plain infinite-scroll page - every
+ * room ever loaded stays in the DOM forever, nothing is recycled as you
+ * scroll past it. Confirmed live as a real, serious bug: on a large
+ * account, the tab itself crashes (or hangs unresponsive) partway through
+ * a long scan, once enough rooms have piled up that the browser can't
+ * keep holding and re-rendering all of them - not tied to any specific
+ * date, just to how much has accumulated by that point. Safe to call
+ * mid-scan because autoScrollAndCollectRooms() below has already copied
+ * anything it needs out of the DOM into its own JS-side accumulator
+ * before this ever runs, so nothing is lost by removing a row here.
+ * Removes from the *start* of the list (the oldest-loaded rows, furthest
+ * above the viewport, since the list is sorted oldest-first and new rows
+ * always load at the bottom) - `keepLastN` is a generous buffer meant to
+ * stay well clear of whatever Docusign's own infinite-scroll trigger is
+ * watching near the bottom of the rendered list, which this code has no
+ * way to inspect directly. If a scan ever seems to stall out right after
+ * a trim (rather than for a genuine end-of-data reason - see
+ * noNewRoomAttempts below), that buffer is the first thing to widen.
+ */
+function trimOldRoomRows(keepLastN) {
+  const rows = [...document.querySelectorAll('tr[data-qa="room-list-row"]')];
+  if (rows.length <= keepLastN) return;
+  rows.slice(0, rows.length - keepLastN).forEach(row => row.remove());
+}
+
+/**
  * Spin-waits while `scanControl.paused` is true (mirrors background.js's
  * waitIfPausedOrStopped() for the download-run phase - same pattern, this
  * is the scan-phase equivalent). Returns false once `scanControl.stopped`
@@ -160,7 +187,7 @@ async function waitIfScanPausedOrStopped(scanControl, updateStatus) {
  * Forces List View via ensureListView() first (Grid View has no readable
  * rows for getRoomCardsAndLinks()), then attempts to set the sort to
  * "Created (Oldest)" via ensureOldestSort(). Still refuses to run
- * (returns []) if that didn't stick - checked via getSortLabel() - since
+ * (throws) if that didn't stick - checked via getSortLabel() - since
  * the whole skip/collect/stop algorithm below depends on ascending order
  * and a UI change could silently break the auto-select without breaking
  * the safety check. Otherwise repeatedly scrolls the container found by
@@ -168,16 +195,24 @@ async function waitIfScanPausedOrStopped(scanControl, updateStatus) {
  * no new rooms appear for several tries (noNewRoomAttempts), or several
  * consecutive rooms are found past dateRange.end (outOfRangeStreak) -
  * valid as a stop signal only because the list is confirmed ascending by
- * this point. Deliberately has no scroll-count ceiling - a hard cap here
- * (400, later 10,000) was confirmed live to cut real scans short well
- * before the account's actual date range was exhausted, on an account
- * whose true size just didn't fit under whatever fixed number was picked;
- * outOfRangeStreak is the one signal that actually means "done," so it's
- * the only thing that gets to end the loop under normal conditions - Stop
- * is always available if a scan genuinely needs to be cut off by hand.
- * Returns the final list, filtered to [dateRange.start, dateRange.end].
+ * this point. Deliberately has no scroll-count ceiling (see DESIGN.md
+ * Decision 35) - `outOfRangeStreak` is the one signal that actually means
+ * "done." Periodically trims already-seen rows out of the DOM (see
+ * trimOldRoomRows()) so a large account's tab doesn't crash under its own
+ * weight - confirmed live as a real, serious failure ("Aw, Snap!") on a
+ * ~13,000-room scan - which is why results are now accumulated into a
+ * JS-side array as the scan progresses instead of only ever being read
+ * back out of the DOM at the very end; the DOM can no longer be trusted
+ * to still hold everything once trimming is in play. `onCheckpoint`
+ * (optional) is called periodically with everything collected so far,
+ * filtered to the requested range - lets the caller save real progress to
+ * disk during a long scan rather than only at the very end, so an
+ * interruption doesn't lose hours of work the way a tab crash otherwise
+ * would (this session's own next real request, raised alongside the
+ * crash report). Returns the final list, filtered to
+ * [dateRange.start, dateRange.end].
  */
-async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = null) {
+async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = null, onCheckpoint = null) {
     ensureListView();
     await sleep(500);
 
@@ -208,36 +243,35 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
 
     const scrollContainer = getScrollContainer();
 
-    let lastCount = 0;
+    // Accumulated independently of the live DOM, not read back out of it
+    // at the end the way this used to work - trimOldRoomRows() below means
+    // the DOM can no longer be trusted to still hold everything that's
+    // ever been seen. `seenUrls` is what makes trimming safe: a room
+    // that's already been recorded and then removed from the DOM won't be
+    // mistaken for "new" the next time getRoomCardsAndLinks() reads
+    // whatever's currently rendered.
+    const seenUrls = new Set();
+    const collected = [];
+    let roomsSinceCheckpoint = 0;
+
     let noNewRoomAttempts = 0;
     let totalScrolls = 0;
     let outOfRangeStreak = 0
     let stoppedEarly = false;
 
-    // No longer a loop-terminating condition - confirmed live as a real
-    // bug, not a hypothetical: a hard `totalScrolls < 400` cap (added
-    // purely as a circuit breaker against a genuinely infinite loop, never
-    // meant to be a real ceiling) silently cut real scans short - two
-    // separate runs on a real account, requesting 2023-01-01 to 2024-12-31,
-    // both stopped at the exact same room (2913 found, room ID 8659058,
-    // created 2023-06-10) out of a much larger range still remaining. The
-    // reproducibility across two independent runs is what pinned this on
-    // `totalScrolls` specifically, not `noNewRoomAttempts` (a
-    // timing-dependent condition that wouldn't land on the identical room
-    // twice) - 2913 rooms / 400 scrolls is ~7.3 rooms loaded per scroll on
-    // this account. Raising the number (first tried: 400 -> 10,000) is
-    // still just picking a different arbitrary ceiling - there's no scroll
-    // count that's provably enough for every account, so any hard cap here
-    // remains a real risk of the exact same bug at a large enough account.
-    // The loop already has the actual correct signal for "really done":
-    // `outOfRangeStreak` below, which only stops once several consecutive
-    // rooms are confirmed *past* the requested date range - meaningful
-    // specifically because the list is sorted oldest-first (enforced
-    // before this loop even starts). `totalScrolls` is still tracked, just
-    // no longer able to cut a legitimate scan short - `noNewRoomAttempts`
-    // (the account has genuinely stopped producing new rows) is the only
-    // other way the loop can end without a real stop signal, and Stop is
-    // always available as a manual override if something truly runs away.
+    // Keeps the DOM from ever growing much past this many rendered room
+    // rows, regardless of how many the scan has collected in total by
+    // that point - see trimOldRoomRows()'s own comment for why, and why
+    // this specific number is a generous-but-arbitrary buffer rather than
+    // a value confirmed safe against Docusign's own scroll-trigger logic.
+    const DOM_TRIM_KEEP = 500;
+    // How many newly-collected rooms trigger a checkpoint save. Chosen so
+    // a crash loses at most a few minutes of progress (~1000 rooms at this
+    // account's observed ~7.3 rooms/scroll is roughly 137 scrolls, ~3-4
+    // minutes) without checkpointing so often that it floods the Downloads
+    // folder / downloads shelf with saves on a long scan.
+    const CHECKPOINT_EVERY = 1000;
+
     while (noNewRoomAttempts < 15) {
       if (!(await waitIfScanPausedOrStopped(scanControl, updateStatus))) {
         updateStatus?.("Scan stopped.");
@@ -245,17 +279,20 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
         break;
       }
 
-      const rooms = getRoomCardsAndLinks();
-      const currentCount = rooms.length;
+      const domRooms = getRoomCardsAndLinks();
+      const newRooms = domRooms.filter(room => !seenUrls.has(room.documentsUrl));
 
       // Includes the scroll count now that nothing bounds how long this
       // loop can legitimately run for a large account - without it, a
       // scan still working through scroll #4000 looks identical, from the
       // status line alone, to one that's silently frozen.
-      updateStatus?.(`Loading rooms... found ${currentCount} (scroll ${totalScrolls})`);
+      updateStatus?.(`Loading rooms... found ${collected.length + newRooms.length} total (scroll ${totalScrolls})`);
 
-      const newRooms = rooms.slice(lastCount);
       for (const room of newRooms) {
+        seenUrls.add(room.documentsUrl);
+        collected.push(room);
+        roomsSinceCheckpoint++;
+
         if (room.createdDate && room.createdDate > dateEnd) {
           outOfRangeStreak++;
         } else {
@@ -269,12 +306,18 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
         break;
       }
 
-      if (currentCount > lastCount) {
-        lastCount = currentCount;
+      if (newRooms.length > 0) {
         noNewRoomAttempts = 0;
       } else {
         noNewRoomAttempts++;
       }
+
+      if (roomsSinceCheckpoint >= CHECKPOINT_EVERY) {
+        roomsSinceCheckpoint = 0;
+        onCheckpoint?.(collected.filter(room => room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd));
+      }
+
+      trimOldRoomRows(DOM_TRIM_KEEP);
 
       scrollContainer.scrollTo({
         top: scrollContainer.scrollHeight,
@@ -291,14 +334,12 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
     // new rooms to load indistinguishable, from the panel's perspective,
     // from one that just stopped updating for no visible reason - exactly
     // the kind of thing worth surfacing explicitly rather than leaving the
-    // user to guess whether something went wrong. (The old second branch
-    // here, for hitting the scroll-count cap, is gone along with the cap
-    // itself - `totalScrolls` can no longer be why the loop ends.)
+    // user to guess whether something went wrong.
     if (!stoppedEarly && noNewRoomAttempts >= 15) {
-      updateStatus?.(`Finished scrolling: no new rooms loaded after ${noNewRoomAttempts} attempts (${lastCount} found so far).`);
+      updateStatus?.(`Finished scrolling: no new rooms loaded after ${noNewRoomAttempts} attempts (${collected.length} found so far).`);
     }
 
-    return getRoomCardsAndLinks().filter(room => {
+    return collected.filter(room => {
         return room.createdDate && room.createdDate >= dateStart && room.createdDate <= dateEnd;
     });
 }

@@ -647,6 +647,172 @@ test("DS_RUN_SCAN requests keep-awake, and a failed scan (no Docusign tab open) 
   assert.deepEqual(global.chrome.power.calls, ["request:display", "release"]);
 });
 
+test("DS_RUN_SCAN computes a stable scanCheckpointFilename, and DS_SCAN_CHECKPOINT reuses it to overwrite the same file every time (regression: 'is there a way to actively write a file while rooms are being scanned?' - a real tab crash mid-scan lost hours of progress that was never saved anywhere until the very end - see DESIGN.md)", async () => {
+  const { STATE } = freshBackground();
+  global.chrome.tabs.query = async () => [{ id: 42 }];
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_RUN_SCAN",
+      dateRange: { start: "2024-01-01", end: "2024-12-31" },
+      dateRangeLabel: "2024-01-01 to 2024-12-31",
+      mode: "start"
+    },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => STATE.scanCheckpointFilename !== null);
+  const filename = STATE.scanCheckpointFilename;
+  assert.match(filename, /_Scan Lists\/Scan List \(2024-01-01 to 2024-12-31\) \(in progress - partial\)\.csv$/);
+
+  const room = n => ({
+    roomId: String(n),
+    roomName: `Room ${n}`,
+    documentsUrl: `https://rooms.docusign.com/rooms/${n}/documents`,
+    createdDate: "2024-01-01"
+  });
+
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_CHECKPOINT", rooms: [room(1)] },
+    {},
+    () => {}
+  );
+  global.chrome.runtime.onMessage._listener(
+    { type: "DS_SCAN_CHECKPOINT", rooms: [room(1), room(2)] },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => global.chrome.downloads.downloadCalls.length >= 2);
+
+  const [first, second] = global.chrome.downloads.downloadCalls;
+  assert.equal(first.filename, filename, "every checkpoint should target the same stable filename");
+  assert.equal(second.filename, filename);
+  assert.equal(first.conflictAction, "overwrite", "checkpoints must overwrite, not uniquify into a new file each time");
+  assert.equal(second.conflictAction, "overwrite");
+});
+
+test("DS_SCAN_CHECKPOINT is a no-op when no scan is actually in progress", async () => {
+  freshBackground();
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_SCAN_CHECKPOINT",
+      rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" }]
+    },
+    {},
+    () => {}
+  );
+
+  await flushAsync();
+  assert.equal(global.chrome.downloads.downloadCalls.length, 0, "no checkpoint filename means nothing should be written");
+});
+
+test("the scan-stall watchdog fires DS_SCAN_FAILED and resets state when a scan goes silent past the threshold (regression: a tab that crashes - \"Aw, Snap!\" - without ever being closed or navigated is invisible to chrome.tabs.onRemoved/onUpdated, the two existing signals - see DESIGN.md)", async () => {
+  const { STATE, SCAN_WATCHDOG_ALARM, SCAN_STALL_THRESHOLD_MS } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.scanMode = "start";
+  STATE.scanCheckpointFilename = "Docusign Rooms/_Scan Lists/Scan List (in progress - partial).csv";
+  STATE.lastScanActivityAt = Date.now() - (SCAN_STALL_THRESHOLD_MS + 5000);
+
+  global.chrome.alarms.onAlarm._listener({ name: SCAN_WATCHDOG_ALARM });
+  await flushAsync();
+
+  assert.equal(STATE.scanning, false);
+  assert.equal(STATE.scanCheckpointFilename, null);
+
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.ok(failed, "expected a DS_SCAN_FAILED broadcast");
+  assert.match(failed.reason, /stopped responding/);
+
+  assert.ok(global.chrome.alarms.clearCalls.includes(SCAN_WATCHDOG_ALARM), "expected the alarm to be disarmed once the stall is reported");
+});
+
+test("the scan-stall watchdog does nothing while a scan is genuinely still active (recent activity, under the threshold)", async () => {
+  const { STATE, SCAN_WATCHDOG_ALARM } = freshBackground();
+
+  STATE.scanning = true;
+  STATE.scanTabId = 7;
+  STATE.lastScanActivityAt = Date.now();
+
+  global.chrome.alarms.onAlarm._listener({ name: SCAN_WATCHDOG_ALARM });
+  await flushAsync();
+
+  assert.equal(STATE.scanning, true, "recent activity should not be treated as a stall");
+  const failed = global.chrome.runtime.sentMessages.find(m => m.type === "DS_SCAN_FAILED");
+  assert.equal(failed, undefined);
+});
+
+test("a worker tab's message channel failing on one room - simulating a crashed tab (\"Aw, Snap!\") - doesn't hang the run: that room is marked Failed and persisted, the run continues past it to completion, and a real Download Report CSV still gets written (regression: directly requested - confirm persistence and CSV generation survive a crashed worker tab, not just a crashed scan tab - see DESIGN.md)", async () => {
+  const { STATE } = freshBackground();
+
+  // processRoom() only reaches the DS_PROCESS_ROOM message at all once
+  // waitForTabLoaded() sees the tab as "complete" - the stub's default
+  // tabs.get() returns null, which waitForTabLoaded() treats as "never
+  // loaded," short-circuiting the room as Failed before it ever gets this
+  // far. Overridden here so the test actually exercises the messaging
+  // step it's meant to be testing, not a different, earlier Failed path.
+  global.chrome.tabs.get = async () => ({ status: "complete" });
+
+  let processRoomCalls = 0;
+  global.chrome.tabs.sendMessage = async (tabId, message) => {
+    if (message.type !== "DS_PROCESS_ROOM") return {};
+    processRoomCalls++;
+    if (processRoomCalls === 1) {
+      // The real error Chrome gives when messaging a tab whose content
+      // script is gone - a crashed renderer looks exactly like this from
+      // the extension's side, since chrome.tabs.get() alone can't tell
+      // "crashed" apart from "healthy" (the tab object still exists).
+      throw new Error("Could not establish connection. Receiving end does not exist.");
+    }
+    // `empty: true` deliberately, not a real triggered-download response -
+    // processRoom() skips waitForDownloadStart()'s real 15s-max poll only
+    // for an empty room (nothing to wait for); a non-empty "ok" response
+    // would otherwise burn a genuine 15 real seconds here, since nothing
+    // in this stub ever populates STATE.downloads to satisfy it early.
+    // Irrelevant to what this test is actually verifying (that the run
+    // survives one room's crashed tab and keeps going), so sidestepped
+    // rather than modeled.
+    return { ok: true, empty: true, roomId: message.roomId, roomName: `Room ${message.roomId}`, reason: "Room is empty (0 documents)" };
+  };
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_START_QUEUE",
+      rooms: [
+        { roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" },
+        { roomId: "2", roomName: "Beta", documentsUrl: "https://rooms.docusign.com/rooms/2/documents", createdDate: "2024-01-02" }
+      ],
+      priorResults: [],
+      workerTabCount: 1
+    },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => STATE.running === false && STATE.finishedAt !== null, 10000);
+
+  const crashedResult = STATE.results.find(r => r.roomId === "1");
+  assert.ok(crashedResult, "expected a result for the room whose tab communication failed");
+  assert.equal(crashedResult.status, "Failed");
+  assert.match(crashedResult.reason, /Could not establish connection/);
+
+  const recoveredResult = STATE.results.find(r => r.roomId === "2");
+  assert.ok(recoveredResult, "expected the next room to still be processed, not stuck behind the crashed one");
+  assert.equal(recoveredResult.status, "Complete (Empty)");
+
+  const persistedCrashedRoom = global.chrome.storage.local.setCalls.some(
+    ([data]) => data?.dsJob?.results?.some(r => r.roomId === "1" && r.status === "Failed")
+  );
+  assert.ok(persistedCrashedRoom, "expected the crashed room's Failed result to actually be checkpointed to chrome.storage.local, not just held in memory");
+
+  const reportCall = global.chrome.downloads.downloadCalls.find(c => c.filename.includes("_Download Reports"));
+  assert.ok(reportCall, "expected a Download Report CSV to still be written after the run finished, even though one room's tab communication failed mid-run");
+});
+
 test("clampWorkerTabCount passes through an in-range integer unchanged", () => {
   const { clampWorkerTabCount } = freshBackground();
 
