@@ -853,6 +853,40 @@ test("persistJob() serializes concurrent calls so chrome.storage.local.set() is 
   assert.deepEqual(order, ["start:1", "finish:1", "start:2", "finish:2"], "the second write must only begin after the first one has fully finished - the two must never overlap");
 });
 
+test("createReport() never silently drops a queued room, even one that never got a result at all (regression: directly requested - \"we cannot tolerate a room being glossed over\" - proves the download side's existing guarantee: the report is built by walking STATE.queue, the full original list, not STATE.results, which only gets an entry once a room is actually processed - a room claimed right as Stop was clicked, between processRoom()'s waitIfPausedOrStopped() check and ever pushing a result, is exactly this case in real operation)", async () => {
+  const { STATE, createReport } = freshBackground();
+
+  STATE.queue = [
+    { roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01" },
+    { roomId: "2", roomName: "Beta", documentsUrl: "https://rooms.docusign.com/rooms/2/documents", createdDate: "2024-01-02" },
+    { roomId: "3", roomName: "Gamma", documentsUrl: "https://rooms.docusign.com/rooms/3/documents", createdDate: "2024-01-03" }
+  ];
+  // Room "2" deliberately has no entry here at all - simulating Stop
+  // being clicked in the exact window processRoom() itself documents:
+  // claimed, but interrupted before a result was ever pushed.
+  STATE.results = [
+    { roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", status: "Downloaded", reason: "Download completed", downloadedFilename: "", downloadId: "1", time: "2026-01-01T00:00:00.000Z" },
+    { roomId: "3", roomName: "Gamma", documentsUrl: "https://rooms.docusign.com/rooms/3/documents", status: "Failed", reason: "Bulk download button was not found", downloadedFilename: "", downloadId: "", time: "2026-01-01T00:00:00.000Z" }
+  ];
+
+  await createReport();
+
+  const call = global.chrome.downloads.downloadCalls.find(c => c.filename.includes("_Download Reports"));
+  assert.ok(call, "expected a Download Report CSV to be written");
+
+  const csvText = decodeURIComponent(call.url.replace("data:text/csv;charset=utf-8,", ""));
+  const lines = csvText.split("\n");
+
+  // Every one of the 3 queued rooms must appear as its own row - the
+  // header plus exactly 3 data rows, not 2 (which is what STATE.results
+  // alone would have produced).
+  assert.equal(lines.length, 4, "expected a header row plus one row per queued room, including the one with no result");
+
+  assert.match(lines[1], /"Alpha".*"Downloaded"/, "room 1 should show its real Downloaded result");
+  assert.match(lines[2], /"Beta".*"Waiting"/, "room 2 - claimed but never given a result - must still appear, marked Waiting, not silently omitted");
+  assert.match(lines[3], /"Gamma".*"Failed"/, "room 3 should show its real Failed result");
+});
+
 test("clampWorkerTabCount passes through an in-range integer unchanged", () => {
   const { clampWorkerTabCount } = freshBackground();
 

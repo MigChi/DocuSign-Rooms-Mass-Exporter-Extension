@@ -76,13 +76,31 @@ async function ensureOldestSort() {
 /**
  * Core scraper for the Rooms LIST page. Reads every currently-rendered
  * tr[data-qa="room-list-row"], pulls {roomId, roomName, documentsUrl,
- * createdDate} out of each, dedupes by documentsUrl, and returns the
- * array. Only sees rows that have loaded into the DOM so far - that's
- * why autoScrollAndCollectRooms() below calls this again after every
- * scroll, not just once.
+ * createdDate} out of each fully-rendered one, dedupes by documentsUrl,
+ * and returns { ready, incompleteUrls }: `ready` is that array; `incompleteUrls`
+ * lists the documentsUrl of every row that has a real link but is still
+ * missing its name/date content this pass (see the inline comment where
+ * that's checked) - `autoScrollAndCollectRooms()` below tracks these
+ * across the whole scan to detect a room that never finishes rendering
+ * before the scan itself ends, not just to retry it silently. Only sees
+ * rows that have loaded into the DOM so far - that's why
+ * autoScrollAndCollectRooms() calls this again after every scroll, not
+ * just once.
  */
 function getRoomCardsAndLinks() {
   const rows = [...document.querySelectorAll('tr[data-qa="room-list-row"]')];
+
+  // Every row with a real link that this pass could NOT read as a
+  // complete room - name/date element missing, or present but still
+  // empty (see below). Deliberately kept even though rows here are
+  // expected to be picked up again on a later call once they finish
+  // rendering: autoScrollAndCollectRooms() unions this across the whole
+  // scan and, at the very end, checks whether any of these URLs *never*
+  // made it into a real result - a room that stays stuck incomplete for
+  // the entire rest of the scan is exactly the silent-loss scenario a
+  // per-iteration retry alone can't catch, and it needs to be reported,
+  // not just quietly retried forever.
+  const incompleteUrls = [];
 
   const rooms = rows.map(row => {
     const link = row.querySelector('a[href]');
@@ -114,10 +132,23 @@ function getRoomCardsAndLinks() {
     // re-called after every scroll instead of once).
     const nameEl = row.querySelector('strong[data-qa="room-name"]');
     const dateEl = row.querySelector('strong[data-qa="room-date"]');
-    if (!nameEl || !dateEl) return null;
+    // dateEl *existing* isn't enough on its own - a React element can be
+    // created before its own text child paints in, so an empty-but-present
+    // date element is just as much "not ready yet" as a missing one.
+    // new Date("") is an Invalid Date, which is a real object (truthy) -
+    // it would slip straight past a plain `!dateEl` check and then fail
+    // every comparison in the final range filter silently, indistinguishable
+    // from a room that's legitimately out of range. Checked here, at the
+    // source, instead of trusting every downstream comparison to happen
+    // to handle Invalid Date correctly.
+    const dateText = dateEl?.textContent?.trim();
+    if (!nameEl || !dateText) {
+      if (documentsUrl) incompleteUrls.push(documentsUrl);
+      return null;
+    }
 
     const roomName = nameEl.getAttribute("title") || `Docusign Room ${roomId}`;
-    const createdDate = new Date(dateEl.textContent.trim());
+    const createdDate = new Date(dateText);
 
     return { roomId, roomName: cleanName(roomName), documentsUrl, createdDate };
   }).filter(Boolean);
@@ -133,7 +164,7 @@ function getRoomCardsAndLinks() {
     }
   }
 
-  return unique;
+  return { ready: unique, incompleteUrls };
 }
 
 /**
@@ -235,8 +266,14 @@ async function waitIfScanPausedOrStopped(scanControl, updateStatus) {
  * disk during a long scan rather than only at the very end, so an
  * interruption doesn't lose hours of work the way a tab crash otherwise
  * would (this session's own next real request, raised alongside the
- * crash report). Returns the final list, filtered to
- * [dateRange.start, dateRange.end].
+ * crash report). Before returning, reconciles every room ever glimpsed
+ * as an incomplete row (a real link, but name/date never finished
+ * rendering - see getRoomCardsAndLinks()) against what actually made it
+ * into the final result, and throws if any never resolved - explicitly
+ * requested after the fact: "we cannot tolerate a room being glossed
+ * over." A per-iteration retry alone only handles a room that *later*
+ * completes; this is the check that catches one that never does.
+ * Returns the final list, filtered to [dateRange.start, dateRange.end].
  */
 async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = null, onCheckpoint = null) {
     ensureListView();
@@ -277,6 +314,14 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
     // mistaken for "new" the next time getRoomCardsAndLinks() reads
     // whatever's currently rendered.
     const seenUrls = new Set();
+    // Every documentsUrl ever seen as an incomplete row (a real link, but
+    // name/date not yet rendered) across the *whole* scan, not just the
+    // current iteration - see getRoomCardsAndLinks()'s own comment. A row
+    // that's incomplete on one pass is expected to complete on a later
+    // one; a room whose URL is still in here but never made it into
+    // `seenUrls` by the time the scan ends is the residual case that
+    // matters - checked explicitly right before returning, below.
+    const everIncompleteUrls = new Set();
     const collected = [];
     let roomsSinceCheckpoint = 0;
 
@@ -305,7 +350,8 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
         break;
       }
 
-      const domRooms = getRoomCardsAndLinks();
+      const { ready: domRooms, incompleteUrls } = getRoomCardsAndLinks();
+      incompleteUrls.forEach(url => everIncompleteUrls.add(url));
       const newRooms = domRooms.filter(room => !seenUrls.has(room.documentsUrl));
 
       // Includes the scroll count now that nothing bounds how long this
@@ -384,6 +430,23 @@ async function autoScrollAndCollectRooms(updateStatus, dateRange, scanControl = 
         throw new Error("No rooms loaded after scrolling for a while - the Rooms list table may not have finished loading. Make sure you're logged into Docusign and on the Rooms list page, then try again.");
       }
       updateStatus?.(`Finished scrolling: no new rooms loaded after ${noNewRoomAttempts} attempts (${collected.length} found so far).`);
+    }
+
+    // Final reconciliation, not just a per-iteration retry - a room stuck
+    // incomplete (real link, but name/date never finished rendering) on
+    // every single pass for the rest of the scan is exactly the silent-
+    // loss shape of bug this project has already shipped once (see
+    // getRoomCardsAndLinks()'s own comment) and was asked directly not to
+    // let happen again: "we cannot tolerate a room being glossed over."
+    // Thrown, not just warned about in a status line that the next
+    // updateStatus() call would immediately overwrite - this routes
+    // through the same DS_SCAN_FAILED path every other real scan failure
+    // does, and any checkpoint already saved (see onCheckpoint above)
+    // still holds everything collected up to the last 1,000-room
+    // milestone, so this isn't a full loss even when it fires.
+    const neverCompleted = [...everIncompleteUrls].filter(url => !seenUrls.has(url));
+    if (neverCompleted.length > 0) {
+      throw new Error(`${neverCompleted.length} room${neverCompleted.length === 1 ? "" : "s"} could not be fully read before the scan ended (found a link, but the room's name/date never finished loading) - re-run the scan; if this keeps happening, try a smaller date range. Affected room URL${neverCompleted.length === 1 ? "" : "s"}: ${neverCompleted.slice(0, 5).join(", ")}${neverCompleted.length > 5 ? ` (+${neverCompleted.length - 5} more)` : ""}`);
     }
 
     return collected.filter(room => {

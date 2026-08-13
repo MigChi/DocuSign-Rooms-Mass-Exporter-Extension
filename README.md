@@ -319,6 +319,7 @@ summary of it, not a second copy that can drift.
 | 5v. Real tab crash on a large account - DOM trimming, checkpointed progress, a stall watchdog | Fix the browser tab itself crashing ("Aw, Snap!") partway through a large scan, plus verify the download-run side survives the same class of failure | Done | Root cause: Docusign's Rooms list never recycles DOM rows as you scroll past them, and a scan always starts from the account's very first room - by the time it reached a large enough point in a big account's history, the tab ran out of memory. Fixed with `trimOldRoomRows()`, removing all but the most recent ~500 rendered rows every loop iteration; safe only because results are now accumulated into a JS-side array (`seenUrls`/`collected`) as the scan progresses instead of being read back out of the DOM at the end. Also added periodic checkpoint CSV saves (every 1,000 new rooms) directly requested alongside the crash report ("is there a way to actively write a file while rooms are being scanned?"), and a `chrome.alarms`-driven watchdog for the one case still invisible to every existing signal - a crashed-but-not-closed tab, which `chrome.tabs.onRemoved`/`onUpdated` structurally can't detect. Separately verified (not assumed) that the *download-run* side already survives the same crash class, via its own architecture (every room gets a fresh page load, unlike scanning's one continuous session) plus the existing 90s `withTimeout()` bound - proven with a real end-to-end test simulating a crashed worker tab, confirming the room is marked Failed and persisted, the run continues to the next room, and a real Download Report CSV still gets written. Along the way, found and fixed a genuine resource leak in `withTimeout()` itself - its internal timer was never cleared on the fast path, discovered because a new test's run pushed the whole suite from ~4s to over 90s; fixed by clearing the timer once the race settles, confirmed by the same suite dropping straight back to ~4s. Full suite: 114/114. See `DESIGN.md` Decision 37. |
 | 5w. A second way a scan could silently report "0 rooms" | Fix a scan reporting a misleadingly "successful" empty export, reported directly right after phase 5v shipped | Done | The panel showed "Exported 0 rooms" - the success-path message, not the failure one phase 5v's sort-order fix would have produced - on an account/range already confirmed to hold 7,000+ real rooms. No checkpoint file existed for this scan, confirming it never accumulated even 1,000 rooms - ruling out data loss in the checkpoint system itself, which was separately re-verified end-to-end on request and found correct. Root cause: a second, distinct way `autoScrollAndCollectRooms()` could return an empty result successfully - the sort dropdown can be correctly set while the room-list table itself never renders a single row for the whole no-new-rooms window, which the sort-order check doesn't catch since the sort itself is fine. Fixed by throwing specifically when the loop ends via no-new-rooms *and* zero rooms were ever collected - a case that's never a legitimate empty-range answer, since even an out-of-range room would still render and be caught by the date check instead. The (common, legitimate) case of finding some rooms and then genuinely running out was left untouched. See `DESIGN.md` Decision 38. |
 | 5x. Research-grounded audit - stale-DOM read, a storage race, a "high-risk areas" map | Proactively audit the codebase against how comparable systems are documented to fail, not just react to the next reported symptom | Done | Researched real failure modes in similar systems (MV3 service workers, infinite-scroll scrapers, worker-pool task queues) before reading code, then verified every finding against this codebase directly rather than assuming the research applied. Confirmed all 7 of `background.js`'s top-level listeners are correctly synchronous (a real, documented MV3 pitfall - checked and found not to apply here). Found and fixed a genuine stale-DOM read in `getRoomCardsAndLinks()`: a room row caught mid-render (link present, name/date not yet rendered - React batches DOM updates) got marked "seen" permanently on that first, incomplete read, then silently vanished from the export forever once its null date failed the range filter - fixed by treating a not-yet-rendered row the same as a not-yet-rendered link, retried on a later scroll instead of lost. Found and fixed a real, documented storage race: `chrome.storage.local` provides no ordering guarantee for concurrent writes to the same key, and multiple worker tabs genuinely call `persistJob()` at effectively the same time - now serialized through a shared promise chain so writes can never overlap. A first version of the regression test for this had a flawed premise and was corrected after it failed, rather than the failure being papered over. Added a permanent "High-Risk Areas" reference section to `DESIGN.md`, organized by function/area instead of chronologically, so a future pass can quickly tell which parts of the codebase have needed real fixes more than once and what to check before touching them again. Full suite: 115/115. See `DESIGN.md` Decision 39. |
+| 5y. Closing the rest of the stale-DOM gap, proving neither side glosses over a room | Directly challenged: "we cannot tolerate a room being glossed over like the bug you described" - verify scanning and downloading, don't just assert they're fixed | Done | Found a second variant of phase 5x's stale-DOM bug: `getRoomCardsAndLinks()` checked that the date *element* existed but not that it had *text* yet - a present-but-empty element produces an Invalid Date, which is truthy (slides past an existence check) and fails every comparison silently, indistinguishable from a legitimately out-of-range room. Fixed the same way as before (treated as not-yet-rendered, retried). Then built a standing safeguard instead of just a second patch: the scan now tracks every room ever glimpsed as incomplete across the *whole* scan and reconciles that against what actually completed right before returning - if any room was seen but never resolved, for *any* reason (not just these two specific timing gaps), the scan now fails loudly instead of silently exporting an incomplete list. Traced by hand that this also correctly catches a room trimmed out of the DOM while still incomplete (Decision 37's DOM trimming) - a case neither original fix anticipated. On the download side, verified (rather than assumed) that `createReport()` already fully covers the equivalent risk - it walks the full original queue, not just recorded results, so a room interrupted between being claimed and given a result still gets a row, correctly marked "Waiting" - proved this with a new test that seeds a queue with a deliberately missing result and confirms the real CSV output includes it anyway. Full suite: 116/116. See `DESIGN.md` Decision 40. |
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
 build-log framing) — this table exists so you don't have to read either in
@@ -1238,6 +1239,42 @@ here for the full story.
   all: five separate fixes in this session alone) and exactly what to
   check before touching them again. Full suite: 115/115. Full
   reasoning in `DESIGN.md`'s Decision 39.
+
+#### Phase 5y: Closing the Rest of the Stale-DOM Gap, Proving Neither Side Glosses Over a Room
+
+- **Found a second variant of the previous phase's stale-DOM bug** -
+  directly challenged: "we cannot tolerate a room being glossed over
+  like the bug you described... i need the download and scan to be
+  verified." `getRoomCardsAndLinks()` checked that the date *element*
+  existed but not that it had *text* in it yet - a present-but-empty
+  element produces an Invalid Date, which is truthy (so it slides past
+  an existence check) and fails every comparison silently, exactly
+  mimicking a legitimately out-of-range room. Fixed the same way as
+  the first variant: treated as not-yet-rendered, retried on a later
+  scroll instead of lost.
+- **Built a standing safeguard instead of stopping at a second patch** -
+  the scan now tracks every room ever glimpsed as an incomplete row
+  across the *entire* scan and reconciles that against what actually
+  completed, right before returning. If any room was seen but never
+  resolved, for *any* reason, the scan now fails loudly - routed
+  through the same real-failure path every other scan error already
+  uses - instead of silently exporting a list that looks complete but
+  isn't. Traced by hand that this also correctly catches a room
+  trimmed out of the DOM while still incomplete (interacting with the
+  DOM-trimming fix from two phases ago) - a case neither original fix
+  was written with in mind, caught anyway because the safeguard is
+  general, not narrowly patched to the one scenario first observed.
+- **Verified, rather than assumed, that the download side already had
+  the equivalent guarantee.** Traced the one place a claimed room
+  could plausibly vanish without a result - Stop clicked in the exact
+  window between claiming a room and giving it one - and confirmed
+  `createReport()` was already built to walk the full original queue,
+  not just recorded results, specifically so an un-resulted room still
+  gets a row, correctly marked "Waiting." Proved this directly with a
+  new test: seeds a 3-room queue with only 2 results, calls the real
+  report-building code, decodes the actual CSV output, and confirms
+  all 3 rooms are present. Full suite: 116/116. Full reasoning in
+  `DESIGN.md`'s Decision 40.
 
 ---
 

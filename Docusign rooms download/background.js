@@ -2141,6 +2141,7 @@ if (typeof module !== "undefined" && module.exports) {
     SCAN_STALL_THRESHOLD_MS,
     persistJob,
     clearPersistedJob,
-    PERSIST_KEY
+    PERSIST_KEY,
+    createReport
   };
 }
