@@ -332,6 +332,7 @@ summary of it, not a second copy that can drift.
 | 5af. Stale "in progress" checkpoint files left behind after a successful scan | "it finally completed but it left a lot of inprogress scans is that meant to happen?" - reported right after the first real large scan under the new API-based scanner | Done | Traced to a real gap: nothing anywhere ever deleted a scan's checkpoint CSV once the scan actually finished. Worse for the tool's normal "Start" flow (scan then download) specifically - it never wrote any other Scan List CSV at all, so the checkpoint file, permanently named "in progress - partial," was the *only* record left behind even after both the scan and the full download run that followed had genuinely completed. Fixed by tracking the checkpoint file's real download ID and removing it from disk once its scan is confirmed to have finished successfully - unconditionally for "Start" mode, only after a real final export is confirmed written for "Export Scan List" mode, and never on an actual scan failure, where the checkpoint is the only surviving record of whatever progress was made. Found along the way: the test stub for `chrome.downloads.download()` resolved with a placeholder object instead of a real download ID, harmless until this fix needed to read that value - fixed alongside it. 6 new tests, each verified against its own regression via revert-confirm-restore. Full suite: 158/158. See `DESIGN.md` Decision 47. |
 | 5ag. A full codebase and documentation audit | "clean up documentation and tests and the codebase and audit" | Done | Split into a code audit (`background.js`/`content.js` against the API-based scan and the checkpoint-cleanup fix) and a documentation/test audit (`DESIGN.md`, README, `HOW_TO_USE.md`/`.txt`, the full test suite), each verified directly rather than trusted. Found and fixed a real mutual-exclusion gap: `DS_START_QUEUE` never checked `STATE.scanning` the way `DS_RUN_SCAN` already checked both flags, so uploading a CSV while a scan was still active would start a full download run in the same Docusign tab a scan was still reading from - fixed server-side and with a matching client-side guard on the CSV-upload button. Found a real but narrow race (a slow scan fetch past the 8-second forced-Stop timeout can make a genuinely-still-running scan's completion look like a service-worker restart) and gave it an honest fix - reworded the resulting message to name both real possible causes instead of confidently asserting the wrong one, deliberately not building a full scan-attempt-token system disproportionate to how narrow the window actually is. Cleaned up several stale docs found along the way: README's Features list still described deleted DOM-scan mechanics, `HOW_TO_USE.txt` (a plain-text mirror of `HOW_TO_USE.md`) had fallen out of sync with the `.md` file's own already-fixed scan description, two comments referenced a "Roadmap" section that was renamed to "Status" (which now says nothing further is planned), and a test-count mismatch between README and DESIGN.md for Decision 46 was reconciled. Everything else audited came back clean - no dead code, no orphaned message types, no weak or missing test coverage. 1 new regression test. Full suite: 159/159. See `DESIGN.md` Decision 48. |
 | 5ah. A real room-processing timeout, traced to a 180-document room | A real Download Report showed one room "Failed - timed out" that the user confirmed genuinely had a working download option | Done | Checked the actual report: this was the only timeout in a ~7,900-room run, every neighboring room succeeded - ruling out a systemic problem. Re-uploading the report to retry succeeded on the second attempt. Checked the downloaded file directly: 180 documents, ~144MB - a genuinely large room. Traced to a real gap in the original 90-second budget's own math: it was sized against the automation's fixed waits, but never accounted for `selectAllDocuments()` clicking every document's checkbox one at a time in a loop, a cost that scales with document count and was invisible for a typical smaller room. Fixed by doubling the bound to 180 seconds - deliberately generous rather than finely tuned to this one data point, covering a room several times larger than the one that triggered this. No test changes needed - nothing asserted the literal old value. Full suite: 159/159 (unchanged). See `DESIGN.md` Decision 49. |
+| 5ai. A stale uploaded CSV can redownload an already-downloaded room | "when i reuploaded the csv from the previous download it went ahead and downloaded some rooms that were already downloaded" - plus a direct follow-up to confirm the CSV updates after each download and that a fresh upload re-checks first | Done | Found 3,050 duplicate ZIP files across 16,755 room folders on real disk evidence - most unattributable to this codebase (some carried a reason string and product name that don't exist anywhere in this repository's history, likely residue from an earlier, different tool). One case was fully traceable within this session's own reports and reproduced the exact symptom: a room marked "Failed" succeeded on the very next resume, then got redownloaded a second time once an older, stale CSV still showing "Failed" was uploaded again. Root cause: the CSV-upload "verify against Chrome's download history before reprocessing" check deliberately excluded "Failed" rooms, on the reasoning that a failed attempt never has a real file - true within one continuous run, not true across separate sessions where a CSV can go stale relative to a later run that already succeeded. Fixed by widening the check to include "Failed" too, at effectively zero added cost. Confirmed directly: no, the extension cannot literally read the local folder (no filesystem access from an extension) - `chrome.downloads.search()`'s own "does Chrome still have this on disk" check is the closest available proxy, and it's exactly what got widened. Separately confirmed the CSV already does update in near-real-time as each download completes, unaffected by this fix. 2 new regression tests. Full suite: 161/161. See `DESIGN.md` Decision 50. |
 Every issue above is one line here and a full paragraph in either
 `DESIGN.md` (the reasoning and the fix) or Version History below (the
 build-log framing) — this table exists so you don't have to read either in
@@ -1675,6 +1676,45 @@ here for the full story.
   literal value, so the full suite's unchanged pass count is itself
   the confirmation nothing broke. Full suite: 159/159 (unchanged).
   Full reasoning in `DESIGN.md`'s Decision 49.
+
+#### Phase 5ai: A Stale Uploaded CSV Can Redownload an Already-Downloaded Room
+
+- **Reported directly, with a concrete symptom and a direct follow-up
+  request**: re-uploading a CSV to resume a run "went ahead and
+  downloaded some rooms that were already downloaded" - plus, asked
+  directly afterward, to confirm the CSV genuinely updates after each
+  download finishes, and that a fresh upload re-checks before
+  reprocessing anything.
+- **Checked real disk evidence before touching any code** - found
+  3,050 duplicate ZIP files across 16,755 room folders. Most of that
+  couldn't be attributed to this codebase at all (some carried a
+  reason string and product name that don't match anything in this
+  project's own history) - reported honestly as unexplained rather
+  than folded into this fix's claimed scope.
+- **One case was fully traceable and reproduced the exact symptom**:
+  a room marked "Failed" succeeded cleanly on the very next resume,
+  then got downloaded a second time - producing a real duplicate file
+  - once an older, already-stale CSV (one still showing the room as
+  "Failed" from before it ever succeeded) got uploaded again.
+- **Root cause**: the safety check that verifies a room against
+  Chrome's own download history before re-processing it deliberately
+  skipped "Failed" rooms, on the reasoning that a failed attempt never
+  has a real file - true within one continuous run, but not true
+  across separate sessions, where an uploaded CSV can go stale
+  relative to a later run that already succeeded.
+- **Fixed by widening that check to include "Failed" rooms too**, at
+  effectively no added cost - the same underlying check was already
+  running regardless of which rooms it's asked about.
+- **Answered the platform question honestly**: no, this extension
+  cannot literally read the local folder - browser extensions have no
+  general filesystem access. Chrome's own "is this download still on
+  disk" check is the closest real equivalent, and it's exactly what
+  this fix widened. Separately confirmed the CSV already does update
+  in close to real time as each download finishes, unaffected by this
+  fix.
+- **2 new regression tests**, verified the same revert-confirm-restore
+  way as every fix in this project. Full suite: 161/161. Full
+  reasoning in `DESIGN.md`'s Decision 50.
 
 ---
 

@@ -1196,6 +1196,74 @@ test("processRoom() gives a room whose documents are all confirmed 0 bytes its o
   assert.equal(result.reason, "Every document in this room is 0 bytes");
 });
 
+test("DS_START_QUEUE verifies a 'Failed' room against Chrome's download history before re-processing it, skipping the re-download entirely when a real file is already found there (regression: confirmed live - a room genuinely marked 'Failed - Bulk download button was not found' succeeded on the very next resume, then got re-triggered a second time, producing a genuine duplicate file, once a stale, older CSV still showing 'Failed' was uploaded again - 'Failed' used to be deliberately excluded from this check on the reasoning that a failed attempt never has a real file, which doesn't hold once a CSV can go stale relative to a later, separate run)", async () => {
+  const { STATE } = freshBackground();
+
+  let processRoomCalls = 0;
+  global.chrome.tabs.sendMessage = async (tabId, message) => {
+    if (message.type !== "DS_PROCESS_ROOM") return {};
+    processRoomCalls++;
+    return { ok: true, roomId: message.roomId, roomName: `Room ${message.roomId}`, reason: "Select All and Download clicked" };
+  };
+  global.chrome.downloads.search = async () => [
+    { id: 999, filename: "/Users/x/Downloads/Docusign Rooms/2022/Alpha/Alpha.zip", url: "https://rooms.docusign.com/rooms/1/documents", finalUrl: "", referrer: "" }
+  ];
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_START_QUEUE",
+      rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01", status: "Failed" }],
+      priorResults: [],
+      workerTabCount: 1
+    },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => STATE.running === false && STATE.finishedAt !== null, 10000);
+
+  assert.equal(processRoomCalls, 0, "must never re-click a room Chrome's own history already confirms is downloaded");
+
+  const result = STATE.results.find(r => r.roomId === "1");
+  assert.ok(result);
+  assert.equal(result.status, "Downloaded");
+  assert.match(result.reason, /already on disk/);
+  assert.equal(result.downloadId, "999");
+});
+
+test("DS_START_QUEUE still re-processes a 'Failed' room normally when nothing matches in Chrome's download history (regression: the widened Failed check must not skip a room that's genuinely still failed, only one Chrome's history actually proves is already downloaded)", async () => {
+  const { STATE } = freshBackground();
+
+  global.chrome.tabs.get = async () => ({ status: "complete" });
+  let processRoomCalls = 0;
+  global.chrome.tabs.sendMessage = async (tabId, message) => {
+    if (message.type !== "DS_PROCESS_ROOM") return {};
+    processRoomCalls++;
+    // empty: true sidesteps the real 15s-max waitForDownloadStart() poll
+    // (nothing in this stub ever populates STATE.downloads to satisfy it
+    // early) - irrelevant to what this test actually verifies (that the
+    // room gets re-attempted at all), same reasoning as the crashed-tab
+    // test below.
+    return { ok: true, empty: true, roomId: message.roomId, roomName: `Room ${message.roomId}`, reason: "Room is empty (0 documents)" };
+  };
+  global.chrome.downloads.search = async () => []; // nothing found - a genuinely still-failed room
+
+  global.chrome.runtime.onMessage._listener(
+    {
+      type: "DS_START_QUEUE",
+      rooms: [{ roomId: "1", roomName: "Alpha", documentsUrl: "https://rooms.docusign.com/rooms/1/documents", createdDate: "2024-01-01", status: "Failed" }],
+      priorResults: [],
+      workerTabCount: 1
+    },
+    {},
+    () => {}
+  );
+
+  await waitUntil(() => STATE.running === false && STATE.finishedAt !== null, 10000);
+
+  assert.equal(processRoomCalls, 1, "a genuinely still-failed room (nothing in history) must still be re-attempted normally");
+});
+
 test("a worker tab's message channel failing on one room - simulating a crashed tab (\"Aw, Snap!\") - doesn't hang the run: that room is marked Failed and persisted, the run continues past it to completion, and a real Download Report CSV still gets written (regression: directly requested - confirm persistence and CSV generation survive a crashed worker tab, not just a crashed scan tab - see DESIGN.md)", async () => {
   const { STATE } = freshBackground();
 

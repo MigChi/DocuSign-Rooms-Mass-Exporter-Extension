@@ -404,8 +404,12 @@ function matchVerifiedDownloads(existingItems, rooms) {
 // "Success/Attempted" only - "Waiting" can't appear there) right before
 // the report is written, and DS_START_QUEUE checks rooms coming off an
 // uploaded CSV before queueing them for reprocessing (catches older
-// reports predating the first
-// check, or where the gap was never caught the first time). One bulk
+// reports predating the first check, where the gap was never caught the
+// first time, or - confirmed live as a real gap - a stale, older CSV
+// re-uploaded after the room it still shows as "Failed" already
+// succeeded in a later run; see DS_START_QUEUE's own comment for why
+// "Failed" is included in that caller's check too, not just
+// "Success/Attempted"/"Waiting"). One bulk
 // search, not one per room - chrome.downloads history can be large, and
 // a native call per room would add up needlessly. Never throws: a
 // failed/unavailable search just means nothing gets verified, degrading
@@ -1470,8 +1474,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }));
 
         // Before queueing anything for real DOM reprocessing, check whether
-        // a "Success/Attempted" or "Waiting" room already has a real file
-        // sitting in Chrome's download history - see
+        // a "Success/Attempted," "Waiting," or "Failed" room already has a
+        // real file sitting in Chrome's download history - see
         // findVerifiedExistingDownloads()'s own comment for why this
         // happens and why re-clicking Download for it risks a real
         // duplicate. "Waiting" widened in alongside "Success/Attempted"
@@ -1481,11 +1485,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // Confirmed directly against this account's real data: of the
         // non-Downloaded rooms found already sitting at their correct
         // location, the large majority were at Waiting, not Success/
-        // Attempted. Still excludes "Failed" - a genuinely failed attempt
-        // (page didn't load, button not found) is a different signal than
-        // "never touched," and Failed rooms were deliberately left out of
-        // this check per an earlier, explicit decision.
-        const unconfirmedRooms = normalized.filter(r => r.status === "Success/Attempted" || r.status === "Waiting");
+        // Attempted.
+        //
+        // "Failed" widened in later, reversing an earlier, explicit
+        // decision to exclude it - confirmed live as a real gap, not a
+        // hypothetical: a room genuinely marked "Failed - Bulk download
+        // button was not found" succeeded cleanly on the very next resume
+        // attempt minutes later, then got re-triggered a *second* time
+        // (producing a genuine duplicate file, "... (1).pdf") once a
+        // stale, older CSV - one still showing the room as "Failed" from
+        // before it ever succeeded - was uploaded again. The original
+        // reasoning ("a genuinely failed attempt is a different signal
+        // than 'never touched'") holds fine *within* one continuous run,
+        // where a fresh "Failed" result really does mean nothing was ever
+        // triggered moments ago - but it breaks down across separate
+        // sessions and uploaded CSVs, which can go stale relative to a
+        // later run that already succeeded. A room that's actually still
+        // failed (the dominant real-world case - see HOW_TO_USE.md's own
+        // note that most Failed rooms simply have no Bulk Download button
+        // to click at all) still won't match anything in Chrome's history
+        // and falls straight through to stillNeedsProcessing below,
+        // unchanged - this only ever skips re-processing when Chrome's own
+        // download history proves a complete, still-on-disk file already
+        // exists for that exact room.
+        const unconfirmedRooms = normalized.filter(r => r.status === "Success/Attempted" || r.status === "Waiting" || r.status === "Failed");
         const verifiedMatches = await findVerifiedExistingDownloads(unconfirmedRooms);
 
         const stillNeedsProcessing = [];
